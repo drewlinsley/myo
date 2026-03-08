@@ -1,0 +1,11 @@
+base: base.yaml
+experiment_name: unet_2d_imagenet
+
+model:
+  dims: 2d
+  encoder_weights: imagenet
+  time_kernel: null
+
+training:
+  batch_size: 8
+  checkpoint_dir: ckpts/unet_2d_imagenet

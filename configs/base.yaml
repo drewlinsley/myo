@@ -1,0 +1,41 @@
+seed: 42
+
+data:
+  nd2_dir: ../fixed_tissues
+  data_dir: data
+  manifest: data/manifest.json
+  val_fraction: 0.15
+  percentile_clip: [0.5, 99.5]
+  cache_volumes: true
+  crop_size: 256
+  patches_per_volume: 32
+  patch_depth: 32
+
+model:
+  dims: 3d
+  arch: unet
+  encoder: resnext50_32x4d
+  encoder_weights: imagenet
+  in_channels: 1
+  out_channels: 1
+  time_kernel: [1, 1, 1]
+
+training:
+  epochs: 300
+  batch_size: 2
+  lr: 0.0005
+  weight_decay: 0.01
+  scheduler: cosine
+  warmup_epochs: 10
+  grad_accumulation_steps: 4
+  mixed_precision: true
+  losses:
+    mse: 1.0
+    l1: 0.1
+  num_workers: 4
+  checkpoint_dir: ckpts/default
+  save_every: 25
+
+inference:
+  overlap: [16, 128, 128]
+  batch_size: 4

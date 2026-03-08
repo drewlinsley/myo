@@ -1,0 +1,5 @@
+base: base.yaml
+experiment_name: unet_3d_imagenet
+
+training:
+  checkpoint_dir: ckpts/unet_3d_imagenet

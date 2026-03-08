@@ -1,0 +1,30 @@
+#!/bin/bash
+# Run all 4 experiments sequentially.
+# Usage: bash scripts/run_experiments.sh
+
+set -e
+
+echo "=== Experiment 1: 2D U-Net + ImageNet ==="
+python train.py -c configs/unet_2d_imagenet.yaml
+python predict.py -c configs/unet_2d_imagenet.yaml --checkpoint ckpts/unet_2d_imagenet/best.pth --output_dir predictions/unet_2d_imagenet
+python evaluate.py --pred_dir predictions/unet_2d_imagenet --data_dir data --output_dir results/unet_2d_imagenet
+
+echo "=== Experiment 2: 2D U-Net + Random ==="
+python train.py -c configs/unet_2d_random.yaml
+python predict.py -c configs/unet_2d_random.yaml --checkpoint ckpts/unet_2d_random/best.pth --output_dir predictions/unet_2d_random
+python evaluate.py --pred_dir predictions/unet_2d_random --data_dir data --output_dir results/unet_2d_random
+
+echo "=== Experiment 3: 3D U-Net + ImageNet ==="
+python train.py -c configs/unet_3d_imagenet.yaml
+python predict.py -c configs/unet_3d_imagenet.yaml --checkpoint ckpts/unet_3d_imagenet/best.pth --output_dir predictions/unet_3d_imagenet
+python evaluate.py --pred_dir predictions/unet_3d_imagenet --data_dir data --output_dir results/unet_3d_imagenet
+
+echo "=== Experiment 4: 3D U-Net + Random ==="
+python train.py -c configs/unet_3d_random.yaml
+python predict.py -c configs/unet_3d_random.yaml --checkpoint ckpts/unet_3d_random/best.pth --output_dir predictions/unet_3d_random
+python evaluate.py --pred_dir predictions/unet_3d_random --data_dir data --output_dir results/unet_3d_random
+
+echo "=== Comparison ==="
+python evaluate.py --compare results/unet_2d_imagenet results/unet_2d_random results/unet_3d_imagenet results/unet_3d_random
+
+echo "All experiments complete!"
