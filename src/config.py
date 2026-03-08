@@ -37,6 +37,30 @@ def load_config(config_path):
 
 def validate_config(cfg):
     """Check for contradictions and required fields."""
+    arch = cfg.get("model", {}).get("arch", "unet")
+
+    # pix2pix_turbo has its own model structure; skip U-Net-specific checks
+    if arch == "pix2pix_turbo":
+        errors = []
+        required = [
+            "data.data_dir",
+            "training.epochs",
+            "training.batch_size",
+            "training.lr",
+            "training.checkpoint_dir",
+        ]
+        for path in required:
+            parts = path.split(".")
+            obj = cfg
+            for part in parts:
+                if not isinstance(obj, dict) or part not in obj:
+                    errors.append(f"Missing required config key: {path}")
+                    break
+                obj = obj[part]
+        if errors:
+            raise ValueError("Config validation errors:\n  " + "\n  ".join(errors))
+        return cfg
+
     errors = []
 
     dims = cfg.get("model", {}).get("dims")
