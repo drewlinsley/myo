@@ -1,4 +1,3 @@
-from . import datasets
 from . import encoders
 from . import decoders
 from . import losses
@@ -6,16 +5,9 @@ from . import metrics
 
 from .decoders.unet import Unet
 from .decoders.unetplusplus import UnetPlusPlus
-from .decoders.manet import MAnet
-from .decoders.linknet import Linknet
-from .decoders.fpn import FPN
-from .decoders.pspnet import PSPNet
-from .decoders.deeplabv3 import DeepLabV3, DeepLabV3Plus
-from .decoders.pan import PAN
 
 from .__version__ import __version__
 
-# some private imports for create_model function
 from typing import Optional as _Optional
 import torch as _torch
 
@@ -35,13 +27,6 @@ def create_model(
     archs = [
         Unet,
         UnetPlusPlus,
-        MAnet,
-        Linknet,
-        FPN,
-        PSPNet,
-        DeepLabV3,
-        DeepLabV3Plus,
-        PAN,
     ]
     archs_dict = {a.__name__.lower(): a for a in archs}
     try:

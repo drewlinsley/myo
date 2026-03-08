@@ -1,0 +1,53 @@
+maintainer: Drew Linsley
+version: 0.1
+
+data:
+  # Directories containing paired .npy stacks
+  # Each brightfield file should have a matching fluorescence file with the same name
+  brightfield_dir: /path/to/brightfield_npys
+  fluorescence_dir: /path/to/fluorescence_npys
+  file_pattern: "*.npy"  # glob pattern for finding files
+
+  # Train/val split
+  val_fraction: 0.1  # fraction of files held out for validation
+
+  # Preprocessing
+  timesteps: 32       # frames per training sample
+  hw: 384             # spatial crop size (H == W)
+  pre_hw: 416         # resize before crop (hw + 32 for augmentation headroom)
+
+model:
+  arch: unet           # {unet, unetplusplus}
+  encoder: resnext50_32x4d
+  in_channels: 1       # single-channel brightfield input
+  out_channels: 1      # single-channel fluorescence prediction (regression)
+  time_kernel: [32, 1, 1]
+  encoder_weights: imagenet  # pretrained backbone
+
+training:
+  epochs: 500
+  batch_size: 4
+  lr: 0.001
+  weight_decay: 0.01
+  optimizer: adamw
+  scheduler: cosine    # {cosine, none}
+  warmup_epochs: 5
+
+  # Loss: weighted combination of MSE + L1
+  loss_mse_weight: 1.0
+  loss_l1_weight: 0.1
+
+  # Checkpointing
+  checkpoint_dir: ckpts/myotube
+  save_every: 50       # save checkpoint every N epochs (in addition to best)
+
+  # Workers
+  num_workers: 4
+
+  # Mixed precision
+  mixed_precision: false
+
+inference:
+  checkpoint: ckpts/myotube/best.pth
+  output_dir: predictions/
+  batch_size: 4
