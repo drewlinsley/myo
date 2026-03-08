@@ -1,0 +1,32 @@
+base: base.yaml
+experiment_name: pix2pix_turbo
+
+model:
+  dims: 2d
+  arch: pix2pix_turbo
+  encoder: null
+  encoder_weights: null
+  pretrained_model: stabilityai/sd-turbo
+  lora_rank_unet: 8
+  lora_rank_vae: 4
+
+data:
+  crop_size: 512
+
+training:
+  batch_size: 2
+  lr: 5.0e-6
+  epochs: 50
+  losses:
+    l2: 1.0
+    lpips: 5.0
+    gan: 0.5
+  checkpoint_dir: ckpts/pix2pix_turbo
+  gradient_checkpointing: true
+  enable_xformers: true
+  grad_accumulation_steps: 2
+  save_every: 10
+
+inference:
+  tile_size: 512
+  tile_overlap: 128
