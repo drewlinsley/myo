@@ -11,7 +11,7 @@ import pytest
 def synthetic_volume():
     """Small synthetic volume (8, 32, 32) uint16 with realistic range."""
     rng = np.random.RandomState(42)
-    vol = rng.randint(100, 10000, size=(8, 32, 32), dtype=np.uint16)
+    vol = rng.randint(100, 10000, size=(32, 32, 32), dtype=np.uint16)
     return vol
 
 
@@ -40,8 +40,8 @@ def temp_data_dir(synthetic_volume, synthetic_stats):
         # Create two volumes
         for name in ["vol_001", "vol_002"]:
             rng = np.random.RandomState(hash(name) % 2**31)
-            bf = rng.randint(100, 10000, size=(8, 32, 32), dtype=np.uint16)
-            gfp = rng.randint(100, 10000, size=(8, 32, 32), dtype=np.uint16)
+            bf = rng.randint(100, 10000, size=(32, 32, 32), dtype=np.uint16)
+            gfp = rng.randint(100, 10000, size=(32, 32, 32), dtype=np.uint16)
             np.save(os.path.join(bf_dir, f"{name}.npy"), bf)
             np.save(os.path.join(gfp_dir, f"{name}.npy"), gfp)
             with open(os.path.join(stats_dir, f"{name}.json"), "w") as f:
@@ -97,8 +97,8 @@ def config_3d(temp_data_dir):
         "data": {
             "data_dir": temp_data_dir,
             "val_fraction": 0.5,
-            "crop_size": 16,
-            "patch_depth": 8,
+            "crop_size": 32,
+            "patch_depth": 32,
             "patches_per_volume": 2,
             "cache_volumes": False,
         },

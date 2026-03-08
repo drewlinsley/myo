@@ -59,8 +59,8 @@ def test_3d_model_forward():
     )
     model.eval()
 
-    # BCHWD format
-    x = torch.randn(1, 1, 16, 16, 8)
+    # BCHWD format — all dims must be divisible by 32
+    x = torch.randn(1, 1, 32, 32, 32)
     with torch.no_grad():
         y = model(x)
 
@@ -90,7 +90,7 @@ def test_model_factory_3d(config_3d):
 
     model = build_model(config_3d)
 
-    x = torch.randn(1, 1, 16, 16, 8)
+    x = torch.randn(1, 1, 32, 32, 32)
     model.eval()
     with torch.no_grad():
         y = model(x)
