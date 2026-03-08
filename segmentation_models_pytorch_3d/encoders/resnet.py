@@ -321,7 +321,7 @@ class ResNetEncoder(ResNet, EncoderMixin):
 
     def load_state_dict(self, state_dict, **kwargs):
         # from segmentation_models_pytorch_3d.utils.convert_weights import convert_2d_weights_to_3d
-        from src.convert_weights import convert_2d_weights_to_3d
+        from segmentation_models_pytorch_3d.utils.convert_weights import convert_2d_weights_to_3d
         state_dict.pop("fc.bias", None)
         state_dict.pop("fc.weight", None)
         state_dict = convert_2d_weights_to_3d(state_dict)
