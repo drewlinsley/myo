@@ -92,6 +92,8 @@ class Pix2Pix_Turbo(nn.Module):
             for k in sd["state_dict_unet"]:
                 _sd_unet[k] = sd["state_dict_unet"][k]
             unet.load_state_dict(_sd_unet)
+            self.target_modules_vae = sd["vae_lora_target_modules"]
+            self.target_modules_unet = sd["unet_lora_target_modules"]
         else:
             # Initialize skip convs to near-zero so they start as no-ops
             nn.init.constant_(vae.decoder.skip_conv_1.weight, 1e-5)
@@ -166,6 +168,10 @@ class Pix2Pix_Turbo(nn.Module):
         Returns:
             output image tensor (B, 3, H, W) in [-1, 1]
         """
+        # Ensure scheduler tensors are on the correct device
+        if self.sched.alphas_cumprod.device != c_t.device:
+            self.sched.alphas_cumprod = self.sched.alphas_cumprod.to(c_t.device)
+
         caption_enc = self.text_encoder(prompt_tokens)[0]
         encoded_control = (
             self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor

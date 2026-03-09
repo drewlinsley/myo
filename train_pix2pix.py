@@ -91,7 +91,9 @@ def main(config_path, resume_from=None):
     lora_rank_unet = mcfg.get("lora_rank_unet", 8)
     lora_rank_vae = mcfg.get("lora_rank_vae", 4)
 
-    pretrained_path = resume_from if resume_from and resume_from.endswith(".pkl") else None
+    pretrained_path = None
+    if resume_from and resume_from.endswith(".pkl"):
+        pretrained_path = resume_from
     accelerator.print(f"Loading SD-Turbo backbone from {pretrained_model}...")
     net = Pix2Pix_Turbo(
         pretrained_path=pretrained_path,
@@ -193,12 +195,23 @@ def main(config_path, resume_from=None):
     # Resume epoch counter
     start_epoch = 0
     best_val_loss = float("inf")
-    if resume_from and resume_from.endswith(".json"):
-        with open(resume_from) as f:
-            meta = json.load(f)
-        start_epoch = meta.get("epoch", 0) + 1
-        best_val_loss = meta.get("val_loss", float("inf"))
-        accelerator.print(f"Resuming from epoch {start_epoch}")
+    if resume_from:
+        # Find the meta JSON: either passed directly, or auto-discover from .pkl path
+        meta_path = None
+        if resume_from.endswith(".json"):
+            meta_path = resume_from
+        elif resume_from.endswith(".pkl"):
+            # latest.pkl -> latest_meta.json, best.pkl -> best_meta.json
+            base = resume_from.rsplit(".", 1)[0]
+            candidate = base + "_meta.json"
+            if os.path.exists(candidate):
+                meta_path = candidate
+        if meta_path and os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            start_epoch = meta.get("epoch", 0) + 1
+            best_val_loss = meta.get("val_loss", float("inf"))
+            accelerator.print(f"Resuming from epoch {start_epoch}")
 
     # CSV logger
     csv_path = os.path.join(ckpt_dir, "log.csv")
@@ -236,7 +249,7 @@ def main(config_path, resume_from=None):
 
                 loss_l2 = F.mse_loss(pred, target)
                 loss_lp = lpips_fn(pred, target).mean()
-                loss_gan_g = disc(pred, for_real=True).mean() * (-1)  # fool disc
+                loss_gan_g = disc(pred, for_real=True).mean()  # minimize → fool disc
                 loss_gen = w_l2 * loss_l2 + w_lpips * loss_lp + w_gan * loss_gan_g
 
                 accelerator.backward(loss_gen / grad_accum)
