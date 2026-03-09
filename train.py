@@ -28,6 +28,14 @@ from src.data.datasets import SliceDataset, VolumeDataset
 from src.data import transforms as T
 
 
+def _rescale_for_display(img, apply_timm):
+    """Undo TIMM normalization and clamp to [0,1] for display."""
+    if apply_timm:
+        from src.data.normalization import TIMM_MEAN, TIMM_STD
+        img = img * TIMM_STD + TIMM_MEAN
+    return np.clip(img, 0, 1)
+
+
 def save_val_montages(model, val_loader, epoch, ckpt_dir, cfg, accelerator, n_samples=4):
     """Save montages of validation predictions on new best loss.
 
@@ -35,6 +43,7 @@ def save_val_montages(model, val_loader, epoch, ckpt_dir, cfg, accelerator, n_sa
     For 3D: same layout but shows 5 evenly-spaced Z slices per sample.
     """
     dims = cfg["model"]["dims"]
+    apply_timm = cfg["model"].get("encoder_weights") is not None
     montage_dir = os.path.join(ckpt_dir, "montages")
     os.makedirs(montage_dir, exist_ok=True)
 
@@ -45,10 +54,9 @@ def save_val_montages(model, val_loader, epoch, ckpt_dir, cfg, accelerator, n_sa
     with torch.no_grad():
         for bf, fl in val_loader:
             pred = model(bf)
-            # Move to CPU numpy
             bf_np = bf.cpu().numpy()
             gt_np = fl.cpu().numpy()
-            pred_np = pred.cpu().numpy()
+            pred_np = np.clip(pred.cpu().numpy(), 0, 1)
 
             for i in range(bf_np.shape[0]):
                 if collected >= n_samples:
@@ -70,12 +78,12 @@ def save_val_montages(model, val_loader, epoch, ckpt_dir, cfg, accelerator, n_sa
         if n == 1:
             axes = axes[np.newaxis]
         for i in range(n):
-            bf_img = bf_list[i][0]
+            bf_img = _rescale_for_display(bf_list[i][0], apply_timm)
             gt_img = gt_list[i][0]
             pr_img = pred_list[i][0]
             err = np.abs(gt_img - pr_img)
 
-            axes[i, 0].imshow(bf_img, cmap="gray")
+            axes[i, 0].imshow(bf_img, cmap="gray", vmin=0, vmax=1)
             axes[i, 0].set_title("BF" if i == 0 else "")
             axes[i, 1].imshow(gt_img, cmap="gray", vmin=0, vmax=1)
             axes[i, 1].set_title("GT GFP" if i == 0 else "")
@@ -86,22 +94,23 @@ def save_val_montages(model, val_loader, epoch, ckpt_dir, cfg, accelerator, n_sa
             for ax in axes[i]:
                 ax.axis("off")
     else:
-        # Each is (1, H, W, D) — pick 5 Z slices from first sample
-        n = min(len(bf_list), 2)  # show up to 2 volumes for 3D
+        # Each is (1, H, W, D) — pick 5 Z slices per sample
+        n = min(len(bf_list), 2)
         n_z = 5
         fig, axes = plt.subplots(n * 4, n_z, figsize=(4 * n_z, 4 * n * 4))
         if n * 4 == 4:
             axes = axes[np.newaxis] if axes.ndim == 1 else axes
         for vi in range(n):
-            # (1, H, W, D) -> (D, H, W)
-            bf_vol = bf_list[vi][0].transpose(2, 0, 1)
+            # (1, H, W, D)[0] -> (H, W, D) -> (D, H, W)
+            bf_vol = _rescale_for_display(
+                bf_list[vi][0].transpose(2, 0, 1), apply_timm)
             gt_vol = gt_list[vi][0].transpose(2, 0, 1)
             pr_vol = pred_list[vi][0].transpose(2, 0, 1)
             D = bf_vol.shape[0]
             z_idx = np.linspace(0, D - 1, n_z, dtype=int)
             row_base = vi * 4
             for j, zi in enumerate(z_idx):
-                axes[row_base + 0, j].imshow(bf_vol[zi], cmap="gray")
+                axes[row_base + 0, j].imshow(bf_vol[zi], cmap="gray", vmin=0, vmax=1)
                 if j == 0:
                     axes[row_base + 0, j].set_ylabel("BF")
                 axes[row_base + 1, j].imshow(gt_vol[zi], cmap="gray", vmin=0, vmax=1)
