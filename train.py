@@ -15,6 +15,9 @@ from glob import glob
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from src.config import load_config, validate_config
 from src.utils import set_seed, prepare_env, save_checkpoint, load_checkpoint, make_train_val_split, get_git_hash
@@ -23,6 +26,105 @@ from src.losses import build_loss
 from src.metrics import psnr as compute_psnr
 from src.data.datasets import SliceDataset, VolumeDataset
 from src.data import transforms as T
+
+
+def save_val_montages(model, val_loader, epoch, ckpt_dir, cfg, accelerator, n_samples=4):
+    """Save montages of validation predictions on new best loss.
+
+    For 2D: BF | GT | Pred | |Error| per sample.
+    For 3D: same layout but shows 5 evenly-spaced Z slices per sample.
+    """
+    dims = cfg["model"]["dims"]
+    montage_dir = os.path.join(ckpt_dir, "montages")
+    os.makedirs(montage_dir, exist_ok=True)
+
+    model.eval()
+    collected = 0
+    bf_list, gt_list, pred_list = [], [], []
+
+    with torch.no_grad():
+        for bf, fl in val_loader:
+            pred = model(bf)
+            # Move to CPU numpy
+            bf_np = bf.cpu().numpy()
+            gt_np = fl.cpu().numpy()
+            pred_np = pred.cpu().numpy()
+
+            for i in range(bf_np.shape[0]):
+                if collected >= n_samples:
+                    break
+                bf_list.append(bf_np[i])
+                gt_list.append(gt_np[i])
+                pred_list.append(pred_np[i])
+                collected += 1
+            if collected >= n_samples:
+                break
+
+    if not bf_list:
+        return
+
+    if dims == "2d":
+        # Each is (1, H, W) — show as single row per sample
+        n = len(bf_list)
+        fig, axes = plt.subplots(n, 4, figsize=(16, 4 * n))
+        if n == 1:
+            axes = axes[np.newaxis]
+        for i in range(n):
+            bf_img = bf_list[i][0]
+            gt_img = gt_list[i][0]
+            pr_img = pred_list[i][0]
+            err = np.abs(gt_img - pr_img)
+
+            axes[i, 0].imshow(bf_img, cmap="gray")
+            axes[i, 0].set_title("BF" if i == 0 else "")
+            axes[i, 1].imshow(gt_img, cmap="gray", vmin=0, vmax=1)
+            axes[i, 1].set_title("GT GFP" if i == 0 else "")
+            axes[i, 2].imshow(pr_img, cmap="gray", vmin=0, vmax=1)
+            axes[i, 2].set_title("Predicted" if i == 0 else "")
+            axes[i, 3].imshow(err, cmap="hot", vmin=0, vmax=0.5)
+            axes[i, 3].set_title("|Error|" if i == 0 else "")
+            for ax in axes[i]:
+                ax.axis("off")
+    else:
+        # Each is (1, H, W, D) — pick 5 Z slices from first sample
+        n = min(len(bf_list), 2)  # show up to 2 volumes for 3D
+        n_z = 5
+        fig, axes = plt.subplots(n * 4, n_z, figsize=(4 * n_z, 4 * n * 4))
+        if n * 4 == 4:
+            axes = axes[np.newaxis] if axes.ndim == 1 else axes
+        for vi in range(n):
+            # (1, H, W, D) -> (D, H, W)
+            bf_vol = bf_list[vi][0].transpose(2, 0, 1)
+            gt_vol = gt_list[vi][0].transpose(2, 0, 1)
+            pr_vol = pred_list[vi][0].transpose(2, 0, 1)
+            D = bf_vol.shape[0]
+            z_idx = np.linspace(0, D - 1, n_z, dtype=int)
+            row_base = vi * 4
+            for j, zi in enumerate(z_idx):
+                axes[row_base + 0, j].imshow(bf_vol[zi], cmap="gray")
+                if j == 0:
+                    axes[row_base + 0, j].set_ylabel("BF")
+                axes[row_base + 1, j].imshow(gt_vol[zi], cmap="gray", vmin=0, vmax=1)
+                if j == 0:
+                    axes[row_base + 1, j].set_ylabel("GT")
+                axes[row_base + 2, j].imshow(pr_vol[zi], cmap="gray", vmin=0, vmax=1)
+                if j == 0:
+                    axes[row_base + 2, j].set_ylabel("Pred")
+                err = np.abs(gt_vol[zi] - pr_vol[zi])
+                axes[row_base + 3, j].imshow(err, cmap="hot", vmin=0, vmax=0.5)
+                if j == 0:
+                    axes[row_base + 3, j].set_ylabel("|Error|")
+                axes[row_base + 0, j].set_title(f"Z={zi}" if vi == 0 else "")
+                for r in range(4):
+                    axes[row_base + r, j].set_xticks([])
+                    axes[row_base + r, j].set_yticks([])
+
+    plt.suptitle(f"Epoch {epoch + 1} (best)", fontsize=14)
+    plt.tight_layout()
+    out_path = os.path.join(montage_dir, f"epoch_{epoch + 1:04d}.png")
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    accelerator.print(f"  -> Saved montage to {out_path}")
 
 
 def build_transforms(cfg, train=True):
@@ -310,6 +412,7 @@ def main(config_path, resume_from=None):
             accelerator.print(f"  -> New best val loss: {best_val_loss:.4f}")
             save_checkpoint(model, optimizer, epoch, best_val_loss, cfg,
                             os.path.join(ckpt_dir, "best.pth"), accelerator)
+            save_val_montages(model, val_loader, epoch, ckpt_dir, cfg, accelerator)
 
         # Periodic save
         save_every = tcfg.get("save_every", 25)
