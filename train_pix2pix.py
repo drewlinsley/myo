@@ -10,9 +10,13 @@ Usage:
 """
 
 import os
+import ssl
 import csv
 import json
 import shutil
+
+# Workaround for VMs with broken SSL certificate chains
+ssl._create_default_https_context = ssl._create_unverified_context
 import argparse
 from glob import glob
 
