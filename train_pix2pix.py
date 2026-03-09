@@ -17,6 +17,38 @@ import shutil
 
 # Workaround for VMs with broken SSL certificate chains
 ssl._create_default_https_context = ssl._create_unverified_context
+
+# Monkey-patch vision_aided_loss's bundled CLIP to skip network downloads.
+# It bundles its own CLIP at vision_aided_loss/CLIP/clip/clip.py.
+# We patch _download to use the local file directly.
+import vision_aided_loss.CLIP.clip.clip as _val_clip
+
+_original_download = _val_clip._download
+
+
+def _patched_download(url, root):
+    """Use local cached file if it exists, otherwise fall back to original."""
+    filename = os.path.basename(url)
+    # Check multiple locations
+    candidates = [
+        os.path.join(root, filename),                    # default cache dir
+        os.path.join(os.path.expanduser("~/.cache/clip"), filename),
+        os.path.join(os.getcwd(), filename),             # current working dir
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            # Copy to expected location if not already there
+            expected = os.path.join(root, filename)
+            if path != expected:
+                os.makedirs(root, exist_ok=True)
+                shutil.copy2(path, expected)
+            return expected
+    # Fall back to original download
+    return _original_download(url, root)
+
+
+_val_clip._download = _patched_download
+
 import argparse
 from glob import glob
 
@@ -75,7 +107,6 @@ def build_datasets(cfg, tokenizer):
 
 def main(config_path, resume_from=None):
     cfg = load_config(config_path)
-    # Skip standard validation (pix2pix_turbo doesn't use encoder/in_channels etc.)
     tcfg = cfg["training"]
     mcfg = cfg["model"]
     experiment_name = cfg.get("experiment_name", "pix2pix_turbo")
@@ -200,12 +231,10 @@ def main(config_path, resume_from=None):
     start_epoch = 0
     best_val_loss = float("inf")
     if resume_from:
-        # Find the meta JSON: either passed directly, or auto-discover from .pkl path
         meta_path = None
         if resume_from.endswith(".json"):
             meta_path = resume_from
         elif resume_from.endswith(".pkl"):
-            # latest.pkl -> latest_meta.json, best.pkl -> best_meta.json
             base = resume_from.rsplit(".", 1)[0]
             candidate = base + "_meta.json"
             if os.path.exists(candidate):
@@ -243,9 +272,9 @@ def main(config_path, resume_from=None):
         )
 
         for step, batch in enumerate(train_loader):
-            cond = batch["conditioning_pixel_values"]  # (B, 3, H, W) [-1, 1]
-            target = batch["output_pixel_values"]       # (B, 3, H, W) [-1, 1]
-            tokens = batch["input_ids"]                 # (B, seq_len)
+            cond = batch["conditioning_pixel_values"]   # (B, 3, H, W) [-1, 1]
+            target = batch["output_pixel_values"]        # (B, 3, H, W) [-1, 1]
+            tokens = batch["input_ids"]                  # (B, seq_len)
 
             # --- Generator step ---
             with accelerator.accumulate(net):
@@ -253,7 +282,7 @@ def main(config_path, resume_from=None):
 
                 loss_l2 = F.mse_loss(pred, target)
                 loss_lp = lpips_fn(pred, target).mean()
-                loss_gan_g = disc(pred, for_real=True).mean()  # minimize → fool disc
+                loss_gan_g = disc(pred, for_real=True).mean()  # minimize -> fool disc
                 loss_gen = w_l2 * loss_l2 + w_lpips * loss_lp + w_gan * loss_gan_g
 
                 accelerator.backward(loss_gen / grad_accum)
@@ -311,7 +340,6 @@ def main(config_path, resume_from=None):
         mean_disc = np.mean(disc_losses)
         mean_val_l2 = np.mean(val_l2s)
         mean_val_lpips = np.mean(val_lpipss)
-        # Combined val metric (same weighting as training)
         mean_val = mean_val_l2 * w_l2 + mean_val_lpips * w_lpips
         current_lr = optimizer_gen.param_groups[0]["lr"]
 
