@@ -332,6 +332,10 @@ def main(config_path, resume_from=None):
     # Scheduler
     scheduler = build_scheduler(optimizer, cfg, len(train_loader))
 
+    # Early stopping
+    patience = tcfg.get("patience", 50)
+    epochs_without_improvement = 0
+
     # Resume
     start_epoch = 0
     best_val_loss = float("inf")
@@ -421,10 +425,16 @@ def main(config_path, resume_from=None):
         # Save best
         if mean_val < best_val_loss:
             best_val_loss = mean_val
+            epochs_without_improvement = 0
             accelerator.print(f"  -> New best val loss: {best_val_loss:.4f}")
             save_checkpoint(model, optimizer, epoch, best_val_loss, cfg,
                             os.path.join(ckpt_dir, "best.pth"), accelerator)
             save_val_montages(model, val_loader, epoch, ckpt_dir, cfg, accelerator)
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                accelerator.print(f"Early stopping: no improvement for {patience} epochs")
+                break
 
         # Periodic save
         save_every = tcfg.get("save_every", 25)

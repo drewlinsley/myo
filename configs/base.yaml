@@ -36,6 +36,7 @@ training:
     pearson: 0.5
   num_workers: 4
   checkpoint_dir: ckpts/default
+  patience: 20
   save_every: 25
 
 inference:
