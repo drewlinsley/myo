@@ -5,6 +5,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def pearson_corr_loss(pred, target):
+    """1 - Pearson correlation, computed on flattened tensors. Differentiable."""
+    pred_flat = pred.reshape(-1)
+    target_flat = target.reshape(-1)
+    pred_centered = pred_flat - pred_flat.mean()
+    target_centered = target_flat - target_flat.mean()
+    cov = (pred_centered * target_centered).sum()
+    pred_std = pred_centered.pow(2).sum().sqrt()
+    target_std = target_centered.pow(2).sum().sqrt()
+    corr = cov / (pred_std * target_std + 1e-8)
+    return 1.0 - corr
+
+
 class CombinedLoss(nn.Module):
     """Weighted combination of loss functions."""
 
@@ -27,6 +40,8 @@ class CombinedLoss(nn.Module):
                 total = total + weight * F.l1_loss(pred, target)
             elif name == "smooth_l1":
                 total = total + weight * F.smooth_l1_loss(pred, target)
+            elif name == "pearson":
+                total = total + weight * pearson_corr_loss(pred, target)
             else:
                 raise ValueError(f"Unknown loss: {name}")
         return total
