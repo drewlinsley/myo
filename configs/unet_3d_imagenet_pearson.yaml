@@ -1,0 +1,7 @@
+base: base.yaml
+experiment_name: unet_3d_imagenet_pearson
+
+training:
+  losses:
+    pearson: 1.0
+  checkpoint_dir: ckpts/unet_3d_imagenet_pearson
