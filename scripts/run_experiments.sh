@@ -11,7 +11,12 @@ python train.py -c configs/unet_2d_imagenet.yaml
 python predict.py -c configs/unet_2d_imagenet.yaml --checkpoint ckpts/unet_2d_imagenet/best.pth --output_dir predictions/unet_2d_imagenet
 python evaluate.py --pred_dir predictions/unet_2d_imagenet --data_dir data --output_dir results/unet_2d_imagenet --z_range $Z_RANGE
 
-echo "=== Experiment 2: 3D U-Net + ImageNet ==="
+echo "=== Experiment 2: 2D U-Net + ImageNet (Pearson only) ==="
+python train.py -c configs/unet_2d_imagenet_pearson.yaml
+python predict.py -c configs/unet_2d_imagenet_pearson.yaml --checkpoint ckpts/unet_2d_imagenet_pearson/best.pth --output_dir predictions/unet_2d_imagenet_pearson
+python evaluate.py --pred_dir predictions/unet_2d_imagenet_pearson --data_dir data --output_dir results/unet_2d_imagenet_pearson --z_range $Z_RANGE
+
+echo "=== Experiment 3: 3D U-Net + ImageNet ==="
 python train.py -c configs/unet_3d_imagenet.yaml
 python predict.py -c configs/unet_3d_imagenet.yaml --checkpoint ckpts/unet_3d_imagenet/best.pth --output_dir predictions/unet_3d_imagenet
 python evaluate.py --pred_dir predictions/unet_3d_imagenet --data_dir data --output_dir results/unet_3d_imagenet --z_range $Z_RANGE
@@ -32,6 +37,6 @@ python predict_pix2pix.py -c configs/pix2pix_turbo.yaml --checkpoint ckpts/pix2p
 python evaluate.py --pred_dir predictions/pix2pix_turbo --data_dir data --output_dir results/pix2pix_turbo --z_range $Z_RANGE
 
 echo "=== Comparison ==="
-python evaluate.py --compare results/unet_2d_imagenet results/unet_2d_random results/unet_3d_imagenet results/unet_3d_random results/pix2pix_turbo
+python evaluate.py --compare results/unet_2d_imagenet results/unet_2d_imagenet_pearson results/unet_3d_imagenet results/unet_2d_random results/unet_3d_random results/pix2pix_turbo
 
 echo "All experiments complete!"
