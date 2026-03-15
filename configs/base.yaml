@@ -1,12 +1,13 @@
 seed: 42
 
 data:
-  nd2_dir: ../fixed_tissues_cropped
+  nd2_dir: ../fixed_tissues
   data_dir: data
   manifest: data/manifest.json
   val_fraction: 0.15
   percentile_clip: [0.5, 99.5]
   cache_volumes: true
+  z_range: [70, 105]
   crop_size: 256
   patches_per_volume: 32
   patch_depth: 32

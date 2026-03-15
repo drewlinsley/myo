@@ -26,7 +26,7 @@ def evaluate_volume(pred, gt):
     }
 
 
-def evaluate_experiment(pred_dir, data_dir, output_dir):
+def evaluate_experiment(pred_dir, data_dir, output_dir, z_range=None):
     """Evaluate all predictions in a directory."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -51,6 +51,10 @@ def evaluate_experiment(pred_dir, data_dir, output_dir):
 
         # Load and normalize ground truth to [0,1]
         gt_raw = np.load(gt_path)
+        if z_range is not None:
+            z_lo = max(0, z_range[0])
+            z_hi = min(gt_raw.shape[0], z_range[1])
+            gt_raw = gt_raw[z_lo:z_hi]
         with open(stats_path) as f:
             stats = json.load(f)
         gt = normalize(gt_raw, stats["gfp"]["p_low"], stats["gfp"]["p_high"],
@@ -92,12 +96,12 @@ def evaluate_experiment(pred_dir, data_dir, output_dir):
               f"SSIM={summary['ssim_mean']:.4f}±{summary['ssim_std']:.4f}")
 
     # Save sample visualizations
-    save_montages(pred_dir, data_dir, output_dir, max_files=5)
+    save_montages(pred_dir, data_dir, output_dir, max_files=5, z_range=z_range)
 
     return results
 
 
-def save_montages(pred_dir, data_dir, output_dir, max_files=5):
+def save_montages(pred_dir, data_dir, output_dir, max_files=5, z_range=None):
     """Save prediction montages: BF | GT GFP | Predicted | |Error|."""
     try:
         import matplotlib
@@ -130,6 +134,13 @@ def save_montages(pred_dir, data_dir, output_dir, max_files=5):
         bf_raw = np.load(bf_path)
         gt_raw = np.load(gt_path)
         pred = np.load(pred_path)
+
+        if z_range is not None:
+            z_lo = max(0, z_range[0])
+            z_hi_bf = min(bf_raw.shape[0], z_range[1])
+            z_hi_gt = min(gt_raw.shape[0], z_range[1])
+            bf_raw = bf_raw[z_lo:z_hi_bf]
+            gt_raw = gt_raw[z_lo:z_hi_gt]
 
         bf = normalize(bf_raw, stats["bf"]["p_low"], stats["bf"]["p_high"], apply_timm=False)
         gt = normalize(gt_raw, stats["gfp"]["p_low"], stats["gfp"]["p_high"], apply_timm=False)
@@ -196,11 +207,14 @@ if __name__ == "__main__":
                         help="Output directory for results")
     parser.add_argument("--compare", nargs="+", type=str, default=None,
                         help="Compare multiple result directories")
+    parser.add_argument("--z_range", nargs=2, type=int, default=None,
+                        help="Z-slice range [lo, hi), e.g. --z_range 70 105")
     args = parser.parse_args()
 
     if args.compare:
         compare_experiments(args.compare)
     elif args.pred_dir:
-        evaluate_experiment(args.pred_dir, args.data_dir, args.output_dir)
+        evaluate_experiment(args.pred_dir, args.data_dir, args.output_dir,
+                            z_range=args.z_range)
     else:
         parser.print_help()

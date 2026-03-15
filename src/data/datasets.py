@@ -27,7 +27,7 @@ class BaseDataset(Dataset):
     """
 
     def __init__(self, bf_files, gfp_files, stats_dir, apply_timm=True,
-                 transform=None, cache_volumes=False):
+                 transform=None, cache_volumes=False, z_range=None):
         assert len(bf_files) == len(gfp_files)
         self.bf_files = bf_files
         self.gfp_files = gfp_files
@@ -35,6 +35,7 @@ class BaseDataset(Dataset):
         self.apply_timm = apply_timm
         self.transform = transform
         self.cache_volumes = cache_volumes
+        self.z_range = z_range  # e.g. [70, 105] means Z slices 70..104
         self._cache = {}
 
         # Load stats for all volumes
@@ -52,6 +53,13 @@ class BaseDataset(Dataset):
 
         bf_raw = np.load(self.bf_files[idx], mmap_mode=None if self.cache_volumes else "r")
         gfp_raw = np.load(self.gfp_files[idx], mmap_mode=None if self.cache_volumes else "r")
+
+        # Restrict Z range if specified
+        if self.z_range is not None:
+            z_lo = max(0, self.z_range[0])
+            z_hi = min(bf_raw.shape[0], self.z_range[1])
+            bf_raw = bf_raw[z_lo:z_hi]
+            gfp_raw = gfp_raw[z_lo:z_hi]
 
         st = self.stats[idx]
         bf = normalize(bf_raw, st["bf"]["p_low"], st["bf"]["p_high"],
@@ -73,17 +81,21 @@ class SliceDataset(BaseDataset):
     """
 
     def __init__(self, bf_files, gfp_files, stats_dir, apply_timm=True,
-                 transform=None, cache_volumes=False, crop_size=256):
+                 transform=None, cache_volumes=False, crop_size=256, z_range=None):
         super().__init__(bf_files, gfp_files, stats_dir, apply_timm,
-                         transform, cache_volumes)
+                         transform, cache_volumes, z_range=z_range)
         self.crop_size = crop_size
 
         # Build index: (file_idx, z_idx) for each sample
+        # z_idx is relative to the (possibly z-clipped) volume
         self.index_map = []
         for i, bf_path in enumerate(bf_files):
-            # Peek at shape to get Z count
             bf = np.load(bf_path, mmap_mode="r")
-            n_z = bf.shape[0]
+            n_z_total = bf.shape[0]
+            if z_range is not None:
+                n_z = min(n_z_total, z_range[1]) - max(0, z_range[0])
+            else:
+                n_z = n_z_total
             for z in range(n_z):
                 self.index_map.append((i, z))
 
@@ -122,9 +134,9 @@ class VolumeDataset(BaseDataset):
 
     def __init__(self, bf_files, gfp_files, stats_dir, apply_timm=True,
                  transform=None, cache_volumes=False,
-                 patch_depth=32, crop_size=256, patches_per_volume=32):
+                 patch_depth=32, crop_size=256, patches_per_volume=32, z_range=None):
         super().__init__(bf_files, gfp_files, stats_dir, apply_timm,
-                         transform, cache_volumes)
+                         transform, cache_volumes, z_range=z_range)
         self.patch_depth = patch_depth
         self.crop_size = crop_size
         self.patches_per_volume = patches_per_volume

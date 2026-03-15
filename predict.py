@@ -183,6 +183,11 @@ def main(config_path, checkpoint, output_dir):
 
             # Load and normalize
             bf_raw = np.load(bf_path)
+            z_range = cfg["data"].get("z_range", None)
+            if z_range is not None:
+                z_lo = max(0, z_range[0])
+                z_hi = min(bf_raw.shape[0], z_range[1])
+                bf_raw = bf_raw[z_lo:z_hi]
             bf = normalize(bf_raw, stats["bf"]["p_low"], stats["bf"]["p_high"],
                            apply_timm=apply_timm)
 

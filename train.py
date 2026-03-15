@@ -212,10 +212,13 @@ def build_datasets(cfg):
 
     DatasetClass = SliceDataset if dims == "2d" else VolumeDataset
 
+    z_range = dcfg.get("z_range", None)
+
     common_kwargs = dict(
         stats_dir=stats_dir,
         apply_timm=apply_timm,
         cache_volumes=cache,
+        z_range=z_range,
     )
 
     if dims == "2d":
