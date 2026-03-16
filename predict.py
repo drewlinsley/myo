@@ -49,8 +49,10 @@ def predict_2d(model, bf_vol, device):
 
 
 def predict_3d(model, bf_vol, device, patch_depth=32, overlap=(16, 128, 128),
-               batch_size=4):
+               batch_size=4, spatial_tile=256):
     """Predict GFP from BF volume using 3D sliding window with Gaussian blending.
+
+    Tiles in Z, H, and W to stay within GPU memory.
 
     Args:
         model: 3D U-Net model
@@ -59,6 +61,7 @@ def predict_3d(model, bf_vol, device, patch_depth=32, overlap=(16, 128, 128),
         patch_depth: depth of each 3D patch
         overlap: (z, h, w) overlap between patches
         batch_size: number of patches to process at once
+        spatial_tile: spatial patch size (H and W)
 
     Returns:
         (Z, H, W) predicted GFP volume
@@ -77,7 +80,7 @@ def predict_3d(model, bf_vol, device, patch_depth=32, overlap=(16, 128, 128),
 
     Zp, Hp, Wp = bf_padded.shape
 
-    # Build Gaussian weight map for blending
+    # Build Gaussian weight map for a single tile
     def gaussian_weight_3d(depth, height, width):
         gz = np.exp(-0.5 * ((np.linspace(-1, 1, depth)) ** 2))
         gh = np.exp(-0.5 * ((np.linspace(-1, 1, height)) ** 2))
@@ -85,53 +88,49 @@ def predict_3d(model, bf_vol, device, patch_depth=32, overlap=(16, 128, 128),
         weight = gz[:, None, None] * gh[None, :, None] * gw[None, None, :]
         return weight.astype(np.float32)
 
-    weight_map = gaussian_weight_3d(patch_depth, Hp, Wp)
+    # Generate sliding window coordinates for all 3 axes
+    def make_coords(total, tile, ovlp):
+        stride = max(1, tile - ovlp)
+        starts = list(range(0, max(1, total - tile + 1), stride))
+        if starts and starts[-1] + tile < total:
+            starts.append(total - tile)
+        return sorted(set(starts))
 
-    # Generate sliding window coordinates
-    stride_z = max(1, patch_depth - overlap[0])
-    stride_h = max(1, Hp - overlap[1]) if Hp <= overlap[1] + 32 else Hp  # full spatial
-    stride_w = max(1, Wp - overlap[2]) if Wp <= overlap[2] + 32 else Wp
+    z_coords = make_coords(Zp, patch_depth, overlap[0])
+    h_coords = make_coords(Hp, spatial_tile, overlap[1])
+    w_coords = make_coords(Wp, spatial_tile, overlap[2])
 
-    # For spatial, use full volume (no spatial tiling for now since volumes are small)
-    coords = []
-    for z_start in range(0, max(1, Zp - patch_depth + 1), stride_z):
-        z_end = min(z_start + patch_depth, Zp)
-        z_start = z_end - patch_depth  # snap back if needed
-        coords.append(z_start)
-
-    # Ensure we include the last window
-    if coords and coords[-1] + patch_depth < Zp:
-        coords.append(Zp - patch_depth)
-    coords = sorted(set(coords))
+    # Build all (z, h, w) tile coordinates
+    all_coords = [(zs, hs, ws)
+                  for zs in z_coords for hs in h_coords for ws in w_coords]
 
     predictions = np.zeros((Zp, Hp, Wp), dtype=np.float32)
     weights = np.zeros((Zp, Hp, Wp), dtype=np.float32)
 
     # Process in batches
-    for batch_start in range(0, len(coords), batch_size):
-        batch_coords = coords[batch_start:batch_start + batch_size]
+    for batch_start in range(0, len(all_coords), batch_size):
+        batch = all_coords[batch_start:batch_start + batch_size]
         patches = []
-        for zs in batch_coords:
-            patch = bf_padded[zs:zs + patch_depth]  # (D, H, W)
+        for zs, hs, ws in batch:
+            patch = bf_padded[zs:zs + patch_depth, hs:hs + spatial_tile, ws:ws + spatial_tile]
             # (D, H, W) -> (1, H, W, D) for model's BCHWD format
-            patches.append(patch.transpose(1, 2, 0)[np.newaxis])  # (1, H, W, D)
+            patches.append(patch.transpose(1, 2, 0)[np.newaxis])
 
-        inp = torch.from_numpy(np.stack(patches)).float().to(device)  # (B, 1, H, W, D)
-        preds = model(inp)  # (B, 1, H, W, D')
+        inp = torch.from_numpy(np.stack(patches)).float().to(device)
+        preds = model(inp)
 
-        for i, zs in enumerate(batch_coords):
-            pred = preds[i, 0].cpu().numpy()  # (H, W, D') or similar
-            # Handle potential temporal pooling
+        for i, (zs, hs, ws) in enumerate(batch):
+            pred = preds[i, 0].cpu().numpy()
             if pred.ndim == 3:
                 # pred is (H, W, D') — transpose to (D', H, W)
                 pred = pred.transpose(2, 0, 1)
-                pd = pred.shape[0]
-                w = gaussian_weight_3d(pd, Hp, Wp)
-                predictions[zs:zs + pd] += pred * w
-                weights[zs:zs + pd] += w
+                pd, ph, pw = pred.shape
+                w = gaussian_weight_3d(pd, ph, pw)
+                predictions[zs:zs + pd, hs:hs + ph, ws:ws + pw] += pred * w
+                weights[zs:zs + pd, hs:hs + ph, ws:ws + pw] += w
             elif pred.ndim == 2:
-                predictions[zs] += pred
-                weights[zs] += 1.0
+                predictions[zs, hs:hs + pred.shape[0], ws:ws + pred.shape[1]] += pred
+                weights[zs, hs:hs + pred.shape[0], ws:ws + pred.shape[1]] += 1.0
 
     # Normalize by weights
     mask = weights > 0
@@ -198,7 +197,9 @@ def main(config_path, checkpoint, output_dir):
                 patch_depth = cfg["data"].get("patch_depth", 32)
                 overlap = cfg.get("inference", {}).get("overlap", [16, 128, 128])
                 inf_batch = cfg.get("inference", {}).get("batch_size", 4)
-                pred = predict_3d(model, bf, device, patch_depth, overlap, inf_batch)
+                spatial_tile = cfg.get("inference", {}).get("spatial_tile", cfg["data"].get("crop_size", 256))
+                pred = predict_3d(model, bf, device, patch_depth, overlap, inf_batch,
+                                  spatial_tile=spatial_tile)
 
             # Save prediction (in [0,1] normalized space)
             out_path = os.path.join(output_dir, f"{stem}.npy")
