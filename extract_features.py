@@ -221,10 +221,10 @@ def main():
                         help="Save raw features as .npz")
     parser.add_argument("--batch_size", type=int, default=16,
                         help="Z-slices per forward pass")
-    parser.add_argument("--umap_neighbors", type=int, default=15,
-                        help="UMAP n_neighbors parameter")
-    parser.add_argument("--umap_min_dist", type=float, default=0.1,
-                        help="UMAP min_dist parameter")
+    parser.add_argument("--umap_neighbors", type=int, default=5,
+                        help="UMAP n_neighbors parameter (smaller=tighter clusters)")
+    parser.add_argument("--umap_min_dist", type=float, default=0.01,
+                        help="UMAP min_dist parameter (smaller=tighter clusters)")
     parser.add_argument("--pls_components", type=int, default=2,
                         help="Number of PLS components")
     args = parser.parse_args()
