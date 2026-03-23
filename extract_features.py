@@ -31,20 +31,26 @@ from src.models.factory import build_model
 from src.utils import load_checkpoint
 from src.data.normalization import normalize
 
-# Metadata columns to use as label sets (each gets its own scatter plot)
-LABEL_COLUMNS = ["Exercise", "Perturbation"]
+# Dataset column → which label column to use for that subset
+DATASET_LABEL_COL = {
+    "exercise": "Exercise",
+    "perurbation": "Perturbation",   # matches typo in metadata
+    "perturbation": "Perturbation",  # in case it gets fixed
+}
 
 
 def load_metadata(path):
     """Load metadata from .xlsx, .csv, or .tsv.
 
-    Expected columns include 'File', 'Exercise', 'Perturbation'.
+    Expected columns: File, Dataset, Exercise, Perturbation, ...
     Stems are derived by stripping the .nd2 extension from File.
 
     Returns:
-        dict {stem: {col: value, ...}} for each LABEL_COLUMNS entry
+        dict {stem: {"Dataset": str, "Exercise": str, "Perturbation": str}}
     """
     ext = os.path.splitext(path)[1].lower()
+    keep_cols = ["Dataset", "Exercise", "Perturbation"]
+
     if ext in (".xlsx", ".xls"):
         import openpyxl
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -64,7 +70,7 @@ def load_metadata(path):
     for row in data_rows:
         nd2_name = row["File"].strip()
         stem = os.path.splitext(nd2_name)[0]
-        mapping[stem] = {col: row[col].strip() for col in LABEL_COLUMNS}
+        mapping[stem] = {col: row[col].strip() for col in keep_cols}
     return mapping
 
 
@@ -119,8 +125,9 @@ def extract_encoder_features(model, bf_vol, device, layers, batch_size):
     return np.concatenate(all_features, axis=0)  # (Z, D_feat)
 
 
-def run_umap(features, label_dict, layer_str, output_dir, n_neighbors, min_dist):
-    """Fit UMAP once, then save a scatter plot per label column."""
+def run_umap(features, labels, dataset_name, label_col, layer_str, output_dir,
+             n_neighbors, min_dist):
+    """Fit UMAP on one dataset subset and save scatter plot."""
     try:
         from umap import UMAP
     except ImportError:
@@ -130,35 +137,37 @@ def run_umap(features, label_dict, layer_str, output_dir, n_neighbors, min_dist)
     reducer = UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=min_dist,
                    random_state=42)
     embedding = reducer.fit_transform(features)
+    _save_scatter(embedding, labels, "UMAP", dataset_name, label_col, layer_str,
+                  output_dir)
 
-    for col, labels in label_dict.items():
-        _save_scatter(embedding, labels, "UMAP", col, layer_str, output_dir)
 
-
-def run_pls(features, label_dict, layer_str, output_dir, n_components):
-    """Fit PLS separately per label column and save scatter plots."""
+def run_pls(features, labels, dataset_name, label_col, layer_str, output_dir,
+            n_components):
+    """Fit PLS on one dataset subset and save scatter plot."""
     from sklearn.cross_decomposition import PLSRegression
 
-    for col, labels in label_dict.items():
-        unique_vals = sorted(set(labels))
-        if len(unique_vals) < 2:
-            print(f"PLS ({col}): requires >=2 unique values, got {len(unique_vals)}. Skipping.")
-            continue
+    unique_vals = sorted(set(labels))
+    if len(unique_vals) < 2:
+        print(f"PLS ({dataset_name}): requires >=2 unique labels, "
+              f"got {len(unique_vals)}. Skipping.")
+        return
 
-        cond_to_int = {c: i for i, c in enumerate(unique_vals)}
-        y = np.array([cond_to_int[l] for l in labels], dtype=np.float64)
+    cond_to_int = {c: i for i, c in enumerate(unique_vals)}
+    y = np.array([cond_to_int[l] for l in labels], dtype=np.float64)
 
-        n_comp = min(n_components, len(unique_vals) - 1, features.shape[1])
-        pls = PLSRegression(n_components=n_comp)
-        embedding = pls.fit_transform(features, y)[0]  # X scores
+    n_comp = min(n_components, len(unique_vals) - 1, features.shape[1])
+    pls = PLSRegression(n_components=n_comp)
+    embedding = pls.fit_transform(features, y)[0]  # X scores
 
-        if embedding.shape[1] == 1:
-            embedding = np.column_stack([embedding, np.zeros(len(embedding))])
+    if embedding.shape[1] == 1:
+        embedding = np.column_stack([embedding, np.zeros(len(embedding))])
 
-        _save_scatter(embedding, labels, "PLS", col, layer_str, output_dir)
+    _save_scatter(embedding, labels, "PLS", dataset_name, label_col, layer_str,
+                  output_dir)
 
 
-def _save_scatter(embedding, labels, method, color_col, layer_str, output_dir):
+def _save_scatter(embedding, labels, method, dataset_name, label_col, layer_str,
+                  output_dir):
     """Create and save a labeled scatter plot."""
     unique_vals = sorted(set(labels))
     cmap = plt.cm.get_cmap("tab10", max(len(unique_vals), 1))
@@ -171,11 +180,11 @@ def _save_scatter(embedding, labels, method, color_col, layer_str, output_dir):
 
     ax.set_xlabel(f"{method} 1")
     ax.set_ylabel(f"{method} 2")
-    ax.set_title(f"{method} — layers {layer_str} — colored by {color_col}")
+    ax.set_title(f"{method} — {dataset_name} — layers {layer_str} — by {label_col}")
     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8, markerscale=2)
     fig.tight_layout()
 
-    fname = f"{method.lower()}_layers_{layer_str}_{color_col.lower()}.png"
+    fname = f"{method.lower()}_layers_{layer_str}_{dataset_name.lower()}.png"
     fig.savefig(os.path.join(output_dir, fname), dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {fname}")
@@ -252,11 +261,9 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    all_features = []
-    # Per-column label lists: {col_name: [label, label, ...]}
-    all_labels = {col: [] for col in LABEL_COLUMNS}
-    all_stems = []
-    all_z_indices = []
+    # Collect features per volume, keyed by stem
+    vol_features = {}   # stem → (N, D_feat) array
+    vol_meta = {}       # stem → metadata dict
 
     z_range = cfg["data"].get("z_range", None)
 
@@ -268,8 +275,8 @@ def main():
             if stem in metadata:
                 meta = metadata[stem]
             else:
-                warnings.warn(f"Stem '{stem}' not in metadata — labeling 'unknown'")
-                meta = {col: "unknown" for col in LABEL_COLUMNS}
+                warnings.warn(f"Stem '{stem}' not in metadata — skipping")
+                continue
 
             # Load stats
             stats_path = os.path.join(stats_dir, f"{stem}.json")
@@ -289,63 +296,71 @@ def main():
             feats = extract_encoder_features(
                 model, bf, device, args.layers, args.batch_size)
 
-            Z = feats.shape[0]
             if args.aggregate == "volume":
                 feats = feats.mean(axis=0, keepdims=True)  # (1, D_feat)
-                for col in LABEL_COLUMNS:
-                    all_labels[col].append(meta[col])
-                all_stems.append(stem)
-                all_z_indices.append(-1)
-            else:
-                for col in LABEL_COLUMNS:
-                    all_labels[col].extend([meta[col]] * Z)
-                all_stems.extend([stem] * Z)
-                z_start = z_range[0] if z_range else 0
-                all_z_indices.extend(list(range(z_start, z_start + Z)))
 
-            all_features.append(feats)
-            print(f"  {stem}: {Z} slices, Exercise={meta['Exercise']}, "
-                  f"Perturbation={meta['Perturbation']}")
+            vol_features[stem] = feats
+            vol_meta[stem] = meta
+            print(f"  {stem}: {feats.shape[0]} rows, Dataset={meta['Dataset']}")
 
-    features = np.concatenate(all_features, axis=0)  # (N, D_feat)
-    stems = all_stems
-    z_indices = np.array(all_z_indices)
+    layer_str = "_".join(str(l) for l in sorted(args.layers))
 
-    print(f"\nTotal samples: {features.shape[0]}, feature dim: {features.shape[1]}")
+    # ── Group volumes by Dataset, fit separately ────────────────────
+    # Gather unique dataset values
+    datasets_seen = sorted(set(m["Dataset"].lower() for m in vol_meta.values()))
+    print(f"\nDatasets found: {datasets_seen}")
 
-    for col in LABEL_COLUMNS:
-        counts = Counter(all_labels[col])
-        print(f"\n  {col}:")
+    for ds in datasets_seen:
+        label_col = DATASET_LABEL_COL.get(ds)
+        if label_col is None:
+            warnings.warn(f"Unknown dataset '{ds}' — no label column mapped. Skipping.")
+            continue
+
+        # Collect features + labels for this dataset subset
+        ds_features = []
+        ds_labels = []
+        ds_stems = []
+        for stem, meta in vol_meta.items():
+            if meta["Dataset"].lower() != ds:
+                continue
+            ds_features.append(vol_features[stem])
+            n = vol_features[stem].shape[0]
+            ds_labels.extend([meta[label_col]] * n)
+            ds_stems.extend([stem] * n)
+
+        if not ds_features:
+            continue
+
+        features = np.concatenate(ds_features, axis=0)
+        ds_name = ds.capitalize()
+
+        print(f"\n── {ds_name} ({label_col}) ──")
+        print(f"  Samples: {features.shape[0]}, feature dim: {features.shape[1]}")
+        counts = Counter(ds_labels)
         for val, n in sorted(counts.items()):
             print(f"    {val}: {n}")
 
-    # ── Layer string for filenames ──────────────────────────────────
-    layer_str = "_".join(str(l) for l in sorted(args.layers))
+        # Save features per dataset
+        if args.save_features:
+            npz_path = os.path.join(
+                args.output_dir, f"features_layers_{layer_str}_{ds}.npz")
+            np.savez(npz_path,
+                     features=features,
+                     labels=np.array(ds_labels),
+                     stems=np.array(ds_stems),
+                     layer_indices=np.array(args.layers))
+            print(f"  Saved {npz_path}")
 
-    # ── Save features ───────────────────────────────────────────────
-    if args.save_features:
-        npz_path = os.path.join(args.output_dir, f"features_layers_{layer_str}.npz")
-        save_dict = dict(
-            features=features,
-            stems=np.array(stems),
-            z_indices=z_indices,
-            layer_indices=np.array(args.layers),
-        )
-        for col in LABEL_COLUMNS:
-            save_dict[col.lower()] = np.array(all_labels[col])
-        np.savez(npz_path, **save_dict)
-        print(f"Saved features to {npz_path}")
+        # Dim reduction + plots
+        if "umap" in args.methods:
+            print(f"  Running UMAP ({ds_name})...")
+            run_umap(features, ds_labels, ds_name, label_col, layer_str,
+                     args.output_dir, args.umap_neighbors, args.umap_min_dist)
 
-    # ── Dimensionality reduction + plots ────────────────────────────
-    if "umap" in args.methods:
-        print("\nRunning UMAP...")
-        run_umap(features, all_labels, layer_str, args.output_dir,
-                 args.umap_neighbors, args.umap_min_dist)
-
-    if "pls" in args.methods:
-        print("\nRunning PLS...")
-        run_pls(features, all_labels, layer_str, args.output_dir,
-                args.pls_components)
+        if "pls" in args.methods:
+            print(f"  Running PLS ({ds_name})...")
+            run_pls(features, ds_labels, ds_name, label_col, layer_str,
+                    args.output_dir, args.pls_components)
 
     print("\nDone.")
 
