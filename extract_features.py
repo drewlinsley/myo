@@ -166,17 +166,26 @@ def run_pls(features, labels, dataset_name, label_col, layer_str, output_dir,
                   output_dir)
 
 
+COLORS = [
+    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#bfef45", "#fabed4", "#469990",
+    "#dcbeff", "#9A6324", "#800000", "#aaffc3", "#808000",
+    "#000075", "#a9a9a9",
+]
+
+
 def _save_scatter(embedding, labels, method, dataset_name, label_col, layer_str,
                   output_dir):
     """Create and save a labeled scatter plot."""
     unique_vals = sorted(set(labels))
-    cmap = plt.cm.get_cmap("tab10", max(len(unique_vals), 1))
 
     fig, ax = plt.subplots(figsize=(8, 6))
     for i, val in enumerate(unique_vals):
         mask = np.array([l == val for l in labels])
+        color = COLORS[i % len(COLORS)]
         ax.scatter(embedding[mask, 0], embedding[mask, 1],
-                   c=[cmap(i)], label=val, s=12, alpha=0.7)
+                   c=color, label=val, s=20, alpha=0.8, edgecolors="white",
+                   linewidths=0.3)
 
     ax.set_xlabel(f"{method} 1")
     ax.set_ylabel(f"{method} 2")
