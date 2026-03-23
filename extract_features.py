@@ -3,8 +3,8 @@
 Usage:
     python extract_features.py \
         -c configs/unet_2d_imagenet_pearson.yaml \
-        --checkpoint ckpts/unet_2d_imagenet_pearson/best.pth \
-        --conditions data/conditions.csv \
+        --checkpoint ckpts/unet_2d_imagenet_pearson/latest.pth \
+        --metadata data/metadata.tsv \
         --output_dir features/ \
         --layers 5 \
         --aggregate none \
@@ -25,23 +25,46 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from glob import glob
+from collections import Counter
 from src.config import load_config
 from src.models.factory import build_model
 from src.utils import load_checkpoint
 from src.data.normalization import normalize
 
+# Metadata columns to use as label sets (each gets its own scatter plot)
+LABEL_COLUMNS = ["Exercise", "Perturbation"]
 
-def load_conditions(csv_path):
-    """Load stem→condition mapping from CSV.
 
-    Expected columns: stem, condition
-    Returns dict {stem: condition}.
+def load_metadata(path):
+    """Load metadata from .xlsx, .csv, or .tsv.
+
+    Expected columns include 'File', 'Exercise', 'Perturbation'.
+    Stems are derived by stripping the .nd2 extension from File.
+
+    Returns:
+        dict {stem: {col: value, ...}} for each LABEL_COLUMNS entry
     """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xls"):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        rows = ws.iter_rows(values_only=True)
+        header = [str(c).strip() for c in next(rows)]
+        data_rows = [{header[i]: (str(v).strip() if v is not None else "")
+                      for i, v in enumerate(r)} for r in rows]
+        wb.close()
+    else:
+        delimiter = "," if ext == ".csv" else "\t"
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f, delimiter=delimiter)
+            data_rows = list(reader)
+
     mapping = {}
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            mapping[row["stem"]] = row["condition"]
+    for row in data_rows:
+        nd2_name = row["File"].strip()
+        stem = os.path.splitext(nd2_name)[0]
+        mapping[stem] = {col: row[col].strip() for col in LABEL_COLUMNS}
     return mapping
 
 
@@ -96,8 +119,8 @@ def extract_encoder_features(model, bf_vol, device, layers, batch_size):
     return np.concatenate(all_features, axis=0)  # (Z, D_feat)
 
 
-def run_umap(features, labels, layer_str, output_dir, n_neighbors, min_dist):
-    """Fit UMAP and save scatter plot."""
+def run_umap(features, label_dict, layer_str, output_dir, n_neighbors, min_dist):
+    """Fit UMAP once, then save a scatter plot per label column."""
     try:
         from umap import UMAP
     except ImportError:
@@ -107,51 +130,52 @@ def run_umap(features, labels, layer_str, output_dir, n_neighbors, min_dist):
     reducer = UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=min_dist,
                    random_state=42)
     embedding = reducer.fit_transform(features)
-    _save_scatter(embedding, labels, "UMAP", layer_str, output_dir)
+
+    for col, labels in label_dict.items():
+        _save_scatter(embedding, labels, "UMAP", col, layer_str, output_dir)
 
 
-def run_pls(features, labels, layer_str, output_dir, n_components):
-    """Fit PLS and save scatter plot."""
+def run_pls(features, label_dict, layer_str, output_dir, n_components):
+    """Fit PLS separately per label column and save scatter plots."""
     from sklearn.cross_decomposition import PLSRegression
 
-    unique_conditions = sorted(set(labels))
-    if len(unique_conditions) < 2:
-        print(f"PLS requires >=2 unique conditions, got {len(unique_conditions)}. Skipping.")
-        return
+    for col, labels in label_dict.items():
+        unique_vals = sorted(set(labels))
+        if len(unique_vals) < 2:
+            print(f"PLS ({col}): requires >=2 unique values, got {len(unique_vals)}. Skipping.")
+            continue
 
-    # Encode conditions as integers
-    cond_to_int = {c: i for i, c in enumerate(unique_conditions)}
-    y = np.array([cond_to_int[l] for l in labels], dtype=np.float64)
+        cond_to_int = {c: i for i, c in enumerate(unique_vals)}
+        y = np.array([cond_to_int[l] for l in labels], dtype=np.float64)
 
-    n_comp = min(n_components, len(unique_conditions) - 1, features.shape[1])
-    pls = PLSRegression(n_components=n_comp)
-    embedding = pls.fit_transform(features, y)[0]  # X scores
+        n_comp = min(n_components, len(unique_vals) - 1, features.shape[1])
+        pls = PLSRegression(n_components=n_comp)
+        embedding = pls.fit_transform(features, y)[0]  # X scores
 
-    if embedding.shape[1] == 1:
-        # Pad to 2D for plotting
-        embedding = np.column_stack([embedding, np.zeros(len(embedding))])
+        if embedding.shape[1] == 1:
+            embedding = np.column_stack([embedding, np.zeros(len(embedding))])
 
-    _save_scatter(embedding, labels, "PLS", layer_str, output_dir)
+        _save_scatter(embedding, labels, "PLS", col, layer_str, output_dir)
 
 
-def _save_scatter(embedding, labels, method, layer_str, output_dir):
+def _save_scatter(embedding, labels, method, color_col, layer_str, output_dir):
     """Create and save a labeled scatter plot."""
-    unique_conditions = sorted(set(labels))
-    cmap = plt.cm.get_cmap("tab10", max(len(unique_conditions), 1))
+    unique_vals = sorted(set(labels))
+    cmap = plt.cm.get_cmap("tab10", max(len(unique_vals), 1))
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    for i, cond in enumerate(unique_conditions):
-        mask = np.array([l == cond for l in labels])
+    for i, val in enumerate(unique_vals):
+        mask = np.array([l == val for l in labels])
         ax.scatter(embedding[mask, 0], embedding[mask, 1],
-                   c=[cmap(i)], label=cond, s=12, alpha=0.7)
+                   c=[cmap(i)], label=val, s=12, alpha=0.7)
 
     ax.set_xlabel(f"{method} 1")
     ax.set_ylabel(f"{method} 2")
-    ax.set_title(f"{method} — encoder layers {layer_str}")
+    ax.set_title(f"{method} — layers {layer_str} — colored by {color_col}")
     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8, markerscale=2)
     fig.tight_layout()
 
-    fname = f"{method.lower()}_layers_{layer_str}.png"
+    fname = f"{method.lower()}_layers_{layer_str}_{color_col.lower()}.png"
     fig.savefig(os.path.join(output_dir, fname), dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {fname}")
@@ -164,8 +188,8 @@ def main():
                         help="Path to experiment config YAML")
     parser.add_argument("--checkpoint", required=True,
                         help="Path to model checkpoint")
-    parser.add_argument("--conditions", required=True,
-                        help="CSV mapping stems to conditions (columns: stem, condition)")
+    parser.add_argument("--metadata", required=True,
+                        help="Tab-separated metadata file (columns: File, Exercise, Perturbation, ...)")
     parser.add_argument("--output_dir", default="features/",
                         help="Output directory for plots and features")
     parser.add_argument("--layers", type=int, nargs="+", default=[5],
@@ -196,7 +220,6 @@ def main():
 
     apply_timm = cfg["model"].get("encoder_weights") is not None
 
-    # Warn about stage 0 (identity / raw input)
     for li in args.layers:
         if li == 0:
             warnings.warn("Stage 0 returns the input channels (not very informative).")
@@ -216,9 +239,9 @@ def main():
     model = model.to(device)
     model.eval()
 
-    # ── Conditions ──────────────────────────────────────────────────
-    conditions = load_conditions(args.conditions)
-    print(f"Loaded {len(conditions)} condition entries from {args.conditions}")
+    # ── Metadata ────────────────────────────────────────────────────
+    metadata = load_metadata(args.metadata)
+    print(f"Loaded {len(metadata)} entries from {args.metadata}")
 
     # ── Data ────────────────────────────────────────────────────────
     data_dir = cfg["data"]["data_dir"]
@@ -230,7 +253,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     all_features = []
-    all_labels = []
+    # Per-column label lists: {col_name: [label, label, ...]}
+    all_labels = {col: [] for col in LABEL_COLUMNS}
     all_stems = []
     all_z_indices = []
 
@@ -240,12 +264,12 @@ def main():
         for bf_path in bf_files:
             stem = os.path.splitext(os.path.basename(bf_path))[0]
 
-            # Condition lookup
-            if stem in conditions:
-                cond = conditions[stem]
+            # Metadata lookup
+            if stem in metadata:
+                meta = metadata[stem]
             else:
-                warnings.warn(f"Stem '{stem}' not found in conditions CSV — labeling 'unknown'")
-                cond = "unknown"
+                warnings.warn(f"Stem '{stem}' not in metadata — labeling 'unknown'")
+                meta = {col: "unknown" for col in LABEL_COLUMNS}
 
             # Load stats
             stats_path = os.path.join(stats_dir, f"{stem}.json")
@@ -268,30 +292,32 @@ def main():
             Z = feats.shape[0]
             if args.aggregate == "volume":
                 feats = feats.mean(axis=0, keepdims=True)  # (1, D_feat)
-                all_labels.append(cond)
+                for col in LABEL_COLUMNS:
+                    all_labels[col].append(meta[col])
                 all_stems.append(stem)
                 all_z_indices.append(-1)
             else:
-                all_labels.extend([cond] * Z)
+                for col in LABEL_COLUMNS:
+                    all_labels[col].extend([meta[col]] * Z)
                 all_stems.extend([stem] * Z)
                 z_start = z_range[0] if z_range else 0
                 all_z_indices.extend(list(range(z_start, z_start + Z)))
 
             all_features.append(feats)
-            print(f"  {stem}: {Z} slices, condition={cond}")
+            print(f"  {stem}: {Z} slices, Exercise={meta['Exercise']}, "
+                  f"Perturbation={meta['Perturbation']}")
 
     features = np.concatenate(all_features, axis=0)  # (N, D_feat)
-    labels = all_labels
     stems = all_stems
     z_indices = np.array(all_z_indices)
 
     print(f"\nTotal samples: {features.shape[0]}, feature dim: {features.shape[1]}")
 
-    # Print per-condition counts
-    from collections import Counter
-    counts = Counter(labels)
-    for cond, n in sorted(counts.items()):
-        print(f"  {cond}: {n} samples")
+    for col in LABEL_COLUMNS:
+        counts = Counter(all_labels[col])
+        print(f"\n  {col}:")
+        for val, n in sorted(counts.items()):
+            print(f"    {val}: {n}")
 
     # ── Layer string for filenames ──────────────────────────────────
     layer_str = "_".join(str(l) for l in sorted(args.layers))
@@ -299,26 +325,29 @@ def main():
     # ── Save features ───────────────────────────────────────────────
     if args.save_features:
         npz_path = os.path.join(args.output_dir, f"features_layers_{layer_str}.npz")
-        np.savez(npz_path,
-                 features=features,
-                 labels=np.array(labels),
-                 stems=np.array(stems),
-                 z_indices=z_indices,
-                 layer_indices=np.array(args.layers))
+        save_dict = dict(
+            features=features,
+            stems=np.array(stems),
+            z_indices=z_indices,
+            layer_indices=np.array(args.layers),
+        )
+        for col in LABEL_COLUMNS:
+            save_dict[col.lower()] = np.array(all_labels[col])
+        np.savez(npz_path, **save_dict)
         print(f"Saved features to {npz_path}")
 
     # ── Dimensionality reduction + plots ────────────────────────────
     if "umap" in args.methods:
-        print("Running UMAP...")
-        run_umap(features, labels, layer_str, args.output_dir,
+        print("\nRunning UMAP...")
+        run_umap(features, all_labels, layer_str, args.output_dir,
                  args.umap_neighbors, args.umap_min_dist)
 
     if "pls" in args.methods:
-        print("Running PLS...")
-        run_pls(features, labels, layer_str, args.output_dir,
+        print("\nRunning PLS...")
+        run_pls(features, all_labels, layer_str, args.output_dir,
                 args.pls_components)
 
-    print("Done.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
