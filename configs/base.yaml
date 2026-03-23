@@ -6,6 +6,9 @@ data:
   manifest: data/manifest.json
   val_fraction: 0.15
   percentile_clip: [0.5, 99.5]
+  gfp_norm_mode: volume        # volume | per_z | per_patch
+  filter_empty_gfp: true
+  empty_gfp_threshold: 0.01   # mean normalized GFP below this → skip
   cache_volumes: true
   z_range: [70, 105]
   crop_size: 256

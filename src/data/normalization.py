@@ -42,6 +42,23 @@ def normalize(data, p_low, p_high, apply_timm=False):
     return data
 
 
+def normalize_auto(data, percentile_clip=(0.5, 99.5)):
+    """Compute percentiles on-the-fly and normalize to [0,1].
+
+    Args:
+        data: numpy array (any shape)
+        percentile_clip: (low_pct, high_pct) percentile bounds
+
+    Returns:
+        (normalized_data, p_low, p_high) — p_low/p_high are the computed
+        percentile values so callers can detect flat/empty data.
+    """
+    data = data.astype(np.float32)
+    p_low = float(np.percentile(data, percentile_clip[0]))
+    p_high = float(np.percentile(data, percentile_clip[1]))
+    return normalize(data, p_low, p_high, apply_timm=False), p_low, p_high
+
+
 def denormalize(data, p_low, p_high, applied_timm=False):
     """Exact inverse of normalize: recover original scale.
 

@@ -214,11 +214,20 @@ def build_datasets(cfg):
 
     z_range = dcfg.get("z_range", None)
 
+    gfp_norm_mode = dcfg.get("gfp_norm_mode", "volume")
+    filter_empty_gfp = dcfg.get("filter_empty_gfp", False)
+    empty_gfp_threshold = dcfg.get("empty_gfp_threshold", 0.01)
+    percentile_clip = tuple(dcfg.get("percentile_clip", [0.5, 99.5]))
+
     common_kwargs = dict(
         stats_dir=stats_dir,
         apply_timm=apply_timm,
         cache_volumes=cache,
         z_range=z_range,
+        gfp_norm_mode=gfp_norm_mode,
+        filter_empty_gfp=filter_empty_gfp,
+        empty_gfp_threshold=empty_gfp_threshold,
+        percentile_clip=percentile_clip,
     )
 
     if dims == "2d":
@@ -299,6 +308,11 @@ def main(config_path, resume_from=None):
     train_ds, val_ds, train_stems, val_stems = build_datasets(cfg)
     accelerator.print(f"Train: {len(train_ds)} samples ({len(train_stems)} volumes), "
                       f"Val: {len(val_ds)} samples ({len(val_stems)} volumes)")
+    accelerator.print(f"GFP norm mode: {cfg['data'].get('gfp_norm_mode', 'volume')}")
+    if hasattr(train_ds, "n_filtered"):
+        accelerator.print(f"  Filtered {train_ds.n_filtered} empty GFP slices from train")
+    if hasattr(val_ds, "n_filtered"):
+        accelerator.print(f"  Filtered {val_ds.n_filtered} empty GFP slices from val")
 
     # Save split info
     with open(os.path.join(ckpt_dir, "split.json"), "w") as f:
