@@ -271,9 +271,10 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Collect features per volume, keyed by stem
-    vol_features = {}   # stem → (N, D_feat) array
+    vol_features = {}   # stem → (N, D_feat) array  (includes nonzero-proportion)
     vol_meta = {}       # stem → metadata dict
 
+    gfp_dir = os.path.join(data_dir, "gfp")
     z_range = cfg["data"].get("z_range", None)
 
     with torch.no_grad():
@@ -292,7 +293,7 @@ def main():
             with open(stats_path) as f:
                 stats = json.load(f)
 
-            # Load and normalize
+            # Load and normalize BF
             bf_raw = np.load(bf_path)
             if z_range is not None:
                 z_lo = max(0, z_range[0])
@@ -301,16 +302,35 @@ def main():
             bf = normalize(bf_raw, stats["bf"]["p_low"], stats["bf"]["p_high"],
                            apply_timm=apply_timm)
 
+            # Load GFP for non-zero proportion covariate
+            gfp_path = os.path.join(gfp_dir, f"{stem}.npy")
+            gfp_raw = np.load(gfp_path)
+            if z_range is not None:
+                gfp_raw = gfp_raw[z_lo:z_hi]
+
             # Extract features: (Z, D_feat)
             feats = extract_encoder_features(
                 model, bf, device, args.layers, args.batch_size)
 
+            # Compute proportion of non-zero GFP pixels per slice: (Z, 1)
+            Z = feats.shape[0]
+            nonzero_prop = np.array(
+                [(gfp_raw[z] > 0).mean() for z in range(Z)],
+                dtype=np.float32,
+            ).reshape(-1, 1)
+
             if args.aggregate == "volume":
-                feats = feats.mean(axis=0, keepdims=True)  # (1, D_feat)
+                feats = feats.mean(axis=0, keepdims=True)        # (1, D_feat)
+                nonzero_prop = nonzero_prop.mean(axis=0, keepdims=True)  # (1, 1)
+
+            # Append non-zero proportion as extra feature column
+            feats = np.concatenate([feats, nonzero_prop], axis=1)
 
             vol_features[stem] = feats
             vol_meta[stem] = meta
-            print(f"  {stem}: {feats.shape[0]} rows, Dataset={meta['Dataset']}")
+            nzp = nonzero_prop.mean()
+            print(f"  {stem}: {feats.shape[0]} rows, Dataset={meta['Dataset']}, "
+                  f"nonzero_gfp={nzp:.3f}")
 
     layer_str = "_".join(str(l) for l in sorted(args.layers))
 
