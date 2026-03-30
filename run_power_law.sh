@@ -12,27 +12,35 @@
 set -e
 
 CONFIG="configs/unet_2d_imagenet_pearson.yaml"
-FRACTIONS="0.01 0.25 0.50 0.75 1.0"
 RESULTS_DIR="results/power_law"
 
 # Existing 100% model — reuse instead of retraining
 EXISTING_CKPT="ckpts/unet_2d_imagenet_pearson/latest.pth"
 
+# Hardcoded fraction → tag mapping (avoids bc dependency)
+FRAC_LIST="0.01 0.25 0.50 0.75 1.0"
+TAG_LIST="frac001 frac025 frac050 frac075 frac100"
+
 mkdir -p "$RESULTS_DIR"
 
+# Convert to arrays
+read -ra FRACS <<< "$FRAC_LIST"
+read -ra TAGS <<< "$TAG_LIST"
+
 # ── Train each fraction ─────────────────────────────────────────
-for FRAC in $FRACTIONS; do
-    FRAC_TAG=$(printf "frac%03d" "$(echo "$FRAC * 100" | bc | cut -d. -f1)")
+for i in "${!FRACS[@]}"; do
+    FRAC="${FRACS[$i]}"
+    FRAC_TAG="${TAGS[$i]}"
     CKPT_DIR="ckpts/unet_2d_imagenet_pearson_${FRAC_TAG}"
 
     # For 100%, symlink the existing checkpoint instead of retraining
     if [ "$FRAC" = "1.0" ]; then
-        if [ ! -d "$CKPT_DIR" ]; then
+        if [ ! -f "${CKPT_DIR}/best.pth" ]; then
             mkdir -p "$CKPT_DIR"
             ln -sf "$(realpath "$EXISTING_CKPT")" "${CKPT_DIR}/best.pth"
             echo "=== Linked existing 100% checkpoint to ${CKPT_DIR}/best.pth ==="
         else
-            echo "=== Skipping fraction 1.0 (${CKPT_DIR} exists) ==="
+            echo "=== Skipping fraction 1.0 (${CKPT_DIR}/best.pth exists) ==="
         fi
         continue
     fi
@@ -46,8 +54,9 @@ for FRAC in $FRACTIONS; do
 done
 
 # ── Evaluate each fraction ──────────────────────────────────────
-for FRAC in $FRACTIONS; do
-    FRAC_TAG=$(printf "frac%03d" "$(echo "$FRAC * 100" | bc | cut -d. -f1)")
+for i in "${!FRACS[@]}"; do
+    FRAC="${FRACS[$i]}"
+    FRAC_TAG="${TAGS[$i]}"
     CKPT_DIR="ckpts/unet_2d_imagenet_pearson_${FRAC_TAG}"
     OUT_JSON="${RESULTS_DIR}/${FRAC_TAG}.json"
 
