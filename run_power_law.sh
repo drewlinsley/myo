@@ -15,7 +15,7 @@ CONFIG="configs/unet_2d_imagenet_pearson.yaml"
 RESULTS_DIR="results/power_law"
 
 # Existing 100% model — reuse instead of retraining
-EXISTING_CKPT="ckpts/unet_2d_imagenet_pearson/latest.pth"
+EXISTING_CKPT="ckpts/unet_2d_imagenet_pearson/best.pth"
 
 # Hardcoded fraction → tag mapping (avoids bc dependency)
 FRAC_LIST="0.01 0.25 0.50 0.75 1.0"
