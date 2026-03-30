@@ -207,29 +207,59 @@ def main():
                             textcoords="offset points", xytext=(0, 10),
                             ha="center", fontsize=9)
 
-        # Log fit on trained points: y = a * ln(x) + b
-        # where x is the fraction (0.01 to 2.0)
+        # Pareto-front fit: only use points on the improving frontier
+        # so the fit is monotonically improving with more data.
         fit_fracs = fractions[trained_mask]
         fit_vals = values[trained_mask]
-        if len(fit_fracs) >= 2:
-            coeffs = np.polyfit(np.log(fit_fracs), fit_vals, 1)
+
+        # Sort by fraction (should already be, but be safe)
+        sort_idx = np.argsort(fit_fracs)
+        fit_fracs = fit_fracs[sort_idx]
+        fit_vals = fit_vals[sort_idx]
+
+        # Keep only Pareto-optimal points
+        pareto_mask = np.zeros(len(fit_fracs), dtype=bool)
+        if higher_better:
+            best = -np.inf
+            for i in range(len(fit_fracs)):
+                if fit_vals[i] >= best:
+                    best = fit_vals[i]
+                    pareto_mask[i] = True
+        else:
+            best = np.inf
+            for i in range(len(fit_fracs)):
+                if fit_vals[i] <= best:
+                    best = fit_vals[i]
+                    pareto_mask[i] = True
+
+        pareto_fracs = fit_fracs[pareto_mask]
+        pareto_vals = fit_vals[pareto_mask]
+
+        # Mark non-Pareto points with lighter color
+        non_pareto = ~pareto_mask
+        if non_pareto.any():
+            ax.plot(fit_fracs[non_pareto] * 100, fit_vals[non_pareto], "o",
+                    color="#4363d8", markersize=8, markeredgecolor="white",
+                    markeredgewidth=1.5, alpha=0.3, zorder=4)
+
+        # Log fit on Pareto front: y = a * ln(x) + b
+        if len(pareto_fracs) >= 2:
+            coeffs = np.polyfit(np.log(pareto_fracs), pareto_vals, 1)
             a, b = coeffs[0], coeffs[1]
-            x_fit = np.linspace(fit_fracs.min(), 2.0, 200)
+            x_fit = np.linspace(pareto_fracs.min(), 2.0, 200)
             y_fit = a * np.log(x_fit) + b
 
             ax.plot(x_fit * 100, y_fit, "--", color="#4363d8", alpha=0.4,
-                    linewidth=1.5, label="log fit")
+                    linewidth=1.5, label="log fit (Pareto)")
 
-            # Equation text
+            # Equation text + R^2
             a_sign = "+" if b >= 0 else "-"
             eq_str = f"y = {a:.4f} ln(x) {a_sign} {abs(b):.4f}"
-            # R^2
-            ss_res = np.sum((fit_vals - (a * np.log(fit_fracs) + b)) ** 2)
-            ss_tot = np.sum((fit_vals - fit_vals.mean()) ** 2)
+            ss_res = np.sum((pareto_vals - (a * np.log(pareto_fracs) + b)) ** 2)
+            ss_tot = np.sum((pareto_vals - pareto_vals.mean()) ** 2)
             r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-            eq_str += f"\n$R^2$ = {r2:.3f}"
+            eq_str += f"   ($R^2$ = {r2:.3f})"
 
-            # Place equation in upper-left or lower-left depending on trend
             eq_y = 0.95 if not higher_better else 0.05
             eq_va = "top" if not higher_better else "bottom"
             ax.text(0.03, eq_y, eq_str, transform=ax.transAxes,
@@ -243,7 +273,6 @@ def main():
             ax.plot(200, y_200, "*", color="#e6194b", markersize=14,
                     markeredgecolor="white", markeredgewidth=1, zorder=6)
 
-            # Label for 200%
             n_200_str = ""
             if n_train_100:
                 n_200_str = f"\n({n_train_100 * 2} volumes)"
