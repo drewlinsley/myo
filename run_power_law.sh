@@ -6,7 +6,7 @@
 #
 # Outputs:
 #   ckpts/unet_2d_imagenet_pearson_frac{001,025,050,075,100}/  — checkpoints
-#   results/power_law/frac{001,025,050,075,100}.json           — eval results
+#   results/power_law/frac{000,001,025,050,075,100}.json       — eval results
 #   results/power_law/power_law.png                            — plot
 
 set -e
@@ -18,8 +18,8 @@ RESULTS_DIR="results/power_law"
 EXISTING_CKPT="ckpts/unet_2d_imagenet_pearson/best.pth"
 
 # Hardcoded fraction → tag mapping (avoids bc dependency)
-FRAC_LIST="0.01 0.25 0.50 0.75 1.0"
-TAG_LIST="frac001 frac025 frac050 frac075 frac100"
+FRAC_LIST="0.0 0.01 0.25 0.50 0.75 1.0"
+TAG_LIST="frac000 frac001 frac025 frac050 frac075 frac100"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -32,6 +32,12 @@ for i in "${!FRACS[@]}"; do
     FRAC="${FRACS[$i]}"
     FRAC_TAG="${TAGS[$i]}"
     CKPT_DIR="ckpts/unet_2d_imagenet_pearson_${FRAC_TAG}"
+
+    # 0% — no training needed (untrained baseline)
+    if [ "$FRAC" = "0.0" ]; then
+        echo "=== Skipping fraction 0.0 (untrained baseline) ==="
+        continue
+    fi
 
     # For 100%, symlink the existing checkpoint instead of retraining
     if [ "$FRAC" = "1.0" ]; then
@@ -64,10 +70,17 @@ for i in "${!FRACS[@]}"; do
         echo "=== Skipping eval for ${FRAC} (${OUT_JSON} exists) ==="
     else
         echo "=== Evaluating fraction ${FRAC} ==="
-        python eval_masked_pearson.py \
-            -c "$CONFIG" \
-            --checkpoint "${CKPT_DIR}/best.pth" \
-            --output "$OUT_JSON"
+        if [ "$FRAC" = "0.0" ]; then
+            python eval_masked_pearson.py \
+                -c "$CONFIG" \
+                --no_checkpoint \
+                --output "$OUT_JSON"
+        else
+            python eval_masked_pearson.py \
+                -c "$CONFIG" \
+                --checkpoint "${CKPT_DIR}/best.pth" \
+                --output "$OUT_JSON"
+        fi
     fi
 done
 

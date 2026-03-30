@@ -1,6 +1,6 @@
 """Generate side-by-side prediction montages for each data fraction.
 
-For each val volume, saves a PNG with columns: BF | GT GFP | frac001 | frac025 | ... | frac100
+For each val volume, saves a PNG with columns: BF | GT GFP | 0% | 1% | ... | 100%
 Rows are evenly-spaced Z slices.
 
 Usage:
@@ -25,6 +25,7 @@ from src.utils import load_checkpoint, make_train_val_split
 from src.data.normalization import normalize
 
 FRACTIONS = [
+    ("frac000", "0%"),
     ("frac001", "1%"),
     ("frac025", "25%"),
     ("frac050", "50%"),
@@ -83,6 +84,15 @@ def main():
     # Load all fraction models
     models = {}
     for tag, label in FRACTIONS:
+        if tag == "frac000":
+            # Untrained model: ImageNet encoder + random decoder
+            model = build_model(cfg)
+            model = model.to(device)
+            model.eval()
+            models[tag] = (model, label)
+            print(f"Built untrained model for {label}")
+            continue
+
         ckpt_path = os.path.join(f"{ckpt_base}_{tag}", "best.pth")
         if not os.path.exists(ckpt_path):
             print(f"WARNING: {ckpt_path} not found — skipping {label}")
@@ -99,7 +109,7 @@ def main():
         print(f"Loaded {tag} ({label})")
 
     if not models:
-        print("No checkpoints found.")
+        print("No models available.")
         return
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -135,7 +145,7 @@ def main():
             for tag, (model, label) in models.items():
                 predictions[tag] = predict_volume(model, bf, device)
 
-            # Build montage: rows=z slices, cols=BF|GT|frac001|...|frac100
+            # Build montage: rows=z slices, cols=BF|GT|frac000|...|frac100
             n_cols = 2 + len(models)
             fig, axes = plt.subplots(N_ZSLICES, n_cols,
                                      figsize=(3 * n_cols, 3 * N_ZSLICES))
