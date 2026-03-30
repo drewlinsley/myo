@@ -18,8 +18,8 @@ RESULTS_DIR="results/power_law"
 EXISTING_CKPT="ckpts/unet_2d_imagenet_pearson/best.pth"
 
 # Hardcoded fraction → tag mapping (avoids bc dependency)
-FRAC_LIST="0.0 0.01 0.25 0.50 0.75 1.0"
-TAG_LIST="frac000 frac001 frac025 frac050 frac075 frac100"
+FRAC_LIST="0.0 0.01 0.25 0.50 1.0"
+TAG_LIST="frac000 frac001 frac025 frac050 frac100"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -86,6 +86,9 @@ done
 
 # ── Plot ────────────────────────────────────────────────────────
 echo "=== Plotting power law ==="
-python plot_power_law.py --results_dir "$RESULTS_DIR" --output "${RESULTS_DIR}/power_law.png"
+python plot_power_law.py \
+    --results_dir "$RESULTS_DIR" \
+    --ckpt_base "ckpts/unet_2d_imagenet_pearson" \
+    --output "${RESULTS_DIR}/power_law.png"
 
-echo "=== Done. Plot saved to ${RESULTS_DIR}/power_law.png ==="
+echo "=== Done. Plots saved to ${RESULTS_DIR}/ ==="
