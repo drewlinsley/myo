@@ -15,12 +15,27 @@ CONFIG="configs/unet_2d_imagenet_pearson.yaml"
 FRACTIONS="0.01 0.25 0.50 0.75 1.0"
 RESULTS_DIR="results/power_law"
 
+# Existing 100% model — reuse instead of retraining
+EXISTING_CKPT="ckpts/unet_2d_imagenet_pearson/latest.pth"
+
 mkdir -p "$RESULTS_DIR"
 
 # ── Train each fraction ─────────────────────────────────────────
 for FRAC in $FRACTIONS; do
     FRAC_TAG=$(printf "frac%03d" "$(echo "$FRAC * 100" | bc | cut -d. -f1)")
     CKPT_DIR="ckpts/unet_2d_imagenet_pearson_${FRAC_TAG}"
+
+    # For 100%, symlink the existing checkpoint instead of retraining
+    if [ "$FRAC" = "1.0" ]; then
+        if [ ! -d "$CKPT_DIR" ]; then
+            mkdir -p "$CKPT_DIR"
+            ln -sf "$(realpath "$EXISTING_CKPT")" "${CKPT_DIR}/best.pth"
+            echo "=== Linked existing 100% checkpoint to ${CKPT_DIR}/best.pth ==="
+        else
+            echo "=== Skipping fraction 1.0 (${CKPT_DIR} exists) ==="
+        fi
+        continue
+    fi
 
     if [ -f "${CKPT_DIR}/best.pth" ]; then
         echo "=== Skipping fraction ${FRAC} (${CKPT_DIR}/best.pth exists) ==="
