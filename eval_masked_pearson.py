@@ -1,7 +1,9 @@
 """Evaluate masked Pearson correlation (within non-zero GT pixels).
 
 Runs inference on the val set and computes Pearson correlation only within
-pixels where the ground-truth GFP is non-zero. Outputs a JSON results file.
+pixels where the ground-truth GFP is non-zero. Concatenates all masked pixels
+across all slices and volumes before computing a single Pearson r, avoiding
+selection bias from per-slice averaging.
 
 Usage:
     python eval_masked_pearson.py \
@@ -23,21 +25,17 @@ from src.utils import load_checkpoint, make_train_val_split
 from src.data.normalization import normalize
 
 
-def masked_pearson(pred, target, mask):
-    """Pearson correlation computed only over masked pixels.
-
-    Args:
-        pred, target: (H, W) numpy arrays
-        mask: boolean (H, W) array — True where GT is non-zero
-
-    Returns:
-        Pearson r (float), or NaN if mask is too small
-    """
-    p = pred[mask]
-    t = target[mask]
-    if len(p) < 2 or p.std() == 0 or t.std() == 0:
+def pearson_r(a, b):
+    """Pearson correlation between two 1-D arrays."""
+    if len(a) < 2:
         return float("nan")
-    return float(np.corrcoef(p, t)[0, 1])
+    a_c = a - a.mean()
+    b_c = b - b.mean()
+    num = (a_c * b_c).sum()
+    den = np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum())
+    if den == 0:
+        return float("nan")
+    return float(num / den)
 
 
 def main():
@@ -88,7 +86,10 @@ def main():
     print(f"Evaluating on {len(val_stems)} val volumes")
 
     z_range = cfg["data"].get("z_range", None)
-    all_pearsons = []
+
+    # Collect ALL masked pixels across all volumes for a single global Pearson
+    all_pred_pixels = []
+    all_gt_pixels = []
     per_volume = {}
 
     with torch.no_grad():
@@ -111,11 +112,15 @@ def main():
             gfp = normalize(gfp_raw, stats["gfp"]["p_low"], stats["gfp"]["p_high"],
                             apply_timm=False)
 
+            # Per-volume 1st percentile threshold — drop bottom 1% (background)
+            gfp_thresh = np.percentile(gfp_raw, 1)
+
             Z, H, W = bf.shape
             pad_h = (32 - H % 32) % 32
             pad_w = (32 - W % 32) % 32
 
-            vol_pearsons = []
+            vol_pred = []
+            vol_gt = []
             for z in range(Z):
                 slc = bf[z]
                 if pad_h > 0 or pad_w > 0:
@@ -125,29 +130,42 @@ def main():
                 pred = model(inp)[0, 0].cpu().numpy()[:H, :W]
 
                 gt = gfp[z]
-                # Mask on raw GFP (before normalization) to find true signal pixels
-                mask = gfp_raw[z] > 0
+                mask = gfp_raw[z] > gfp_thresh
                 if mask.sum() < 2:
                     continue
 
-                r = masked_pearson(pred, gt, mask)
-                if not np.isnan(r):
-                    vol_pearsons.append(r)
-                    all_pearsons.append(r)
+                vol_pred.append(pred[mask])
+                vol_gt.append(gt[mask])
 
-            vol_mean = float(np.mean(vol_pearsons)) if vol_pearsons else float("nan")
+            if vol_pred:
+                vp = np.concatenate(vol_pred)
+                vg = np.concatenate(vol_gt)
+                vol_r = pearson_r(vp, vg)
+                all_pred_pixels.append(vp)
+                all_gt_pixels.append(vg)
+            else:
+                vol_r = float("nan")
+
             per_volume[stem] = {
-                "mean_pearson": vol_mean,
-                "n_slices": len(vol_pearsons),
+                "masked_pearson": vol_r,
+                "n_masked_pixels": sum(p.size for p in vol_pred),
             }
-            print(f"  {stem}: masked Pearson = {vol_mean:.4f} ({len(vol_pearsons)} slices)")
+            print(f"  {stem}: masked Pearson = {vol_r:.4f} "
+                  f"({per_volume[stem]['n_masked_pixels']:,} pixels)")
 
-    overall = float(np.mean(all_pearsons)) if all_pearsons else float("nan")
-    print(f"\nOverall masked Pearson: {overall:.4f} ({len(all_pearsons)} total slices)")
+    # Global Pearson across all masked pixels
+    if all_pred_pixels:
+        global_pred = np.concatenate(all_pred_pixels)
+        global_gt = np.concatenate(all_gt_pixels)
+        overall = pearson_r(global_pred, global_gt)
+    else:
+        overall = float("nan")
+
+    print(f"\nOverall masked Pearson: {overall:.4f} "
+          f"({sum(v['n_masked_pixels'] for v in per_volume.values()):,} total pixels)")
 
     results = {
         "overall_masked_pearson": overall,
-        "n_slices": len(all_pearsons),
         "n_volumes": len(val_stems),
         "per_volume": per_volume,
         "checkpoint": args.checkpoint,
