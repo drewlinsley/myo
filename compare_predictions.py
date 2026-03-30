@@ -1,7 +1,7 @@
 """Generate side-by-side prediction montages for each data fraction.
 
-For each val volume, saves a PNG with columns: BF | GT GFP | 0% | 1% | ... | 100%
-Rows are evenly-spaced Z slices.
+For each val volume, saves a PNG with columns: BF | GT GFP | Mask | 0% | 1% | ... | 100%
+Rows are evenly-spaced Z slices. Also saves per-volume mask PNGs.
 
 Usage:
     python compare_predictions.py \
@@ -140,13 +140,34 @@ def main():
             Z = bf.shape[0]
             z_indices = np.linspace(0, Z - 1, N_ZSLICES, dtype=int)
 
+            # Compute mask (same as eval: 1st percentile threshold)
+            gfp_thresh = np.percentile(gfp_raw, 1)
+            mask_vol = gfp_raw > gfp_thresh  # (Z, H, W) bool
+
+            # Save standalone mask montage
+            mask_fig, mask_axes = plt.subplots(1, N_ZSLICES,
+                                               figsize=(3 * N_ZSLICES, 3))
+            if N_ZSLICES == 1:
+                mask_axes = [mask_axes]
+            for i, zi in enumerate(z_indices):
+                mask_axes[i].imshow(mask_vol[zi], cmap="gray", vmin=0, vmax=1)
+                mask_axes[i].set_title(f"Z={zi}", fontsize=9)
+                mask_axes[i].set_xticks([])
+                mask_axes[i].set_yticks([])
+            mask_fig.suptitle(f"Eval mask (GT > p1): {stem}", fontsize=11)
+            mask_fig.tight_layout()
+            mask_path = os.path.join(args.output_dir, f"{stem}_mask.png")
+            mask_fig.savefig(mask_path, dpi=150, bbox_inches="tight")
+            plt.close(mask_fig)
+            print(f"  Saved {mask_path}")
+
             # Predict with each fraction model
             predictions = {}
             for tag, (model, label) in models.items():
                 predictions[tag] = predict_volume(model, bf, device)
 
-            # Build montage: rows=z slices, cols=BF|GT|frac000|...|frac100
-            n_cols = 2 + len(models)
+            # Build montage: rows=z slices, cols=BF|GT|Mask|frac000|...|frac100
+            n_cols = 3 + len(models)
             fig, axes = plt.subplots(N_ZSLICES, n_cols,
                                      figsize=(3 * n_cols, 3 * N_ZSLICES))
             if N_ZSLICES == 1:
@@ -171,13 +192,18 @@ def main():
                 if row == 0:
                     axes[row, 1].set_title("GT GFP", fontsize=10)
 
+                # Mask
+                axes[row, 2].imshow(mask_vol[zi], cmap="gray", vmin=0, vmax=1)
+                if row == 0:
+                    axes[row, 2].set_title("Mask", fontsize=10)
+
                 # Each fraction prediction
                 for col_offset, (tag, (_, label)) in enumerate(models.items()):
                     pred_slice = np.clip(predictions[tag][zi], 0, 1)
-                    axes[row, 2 + col_offset].imshow(pred_slice, cmap="gray",
+                    axes[row, 3 + col_offset].imshow(pred_slice, cmap="gray",
                                                       vmin=0, vmax=1)
                     if row == 0:
-                        axes[row, 2 + col_offset].set_title(label, fontsize=10)
+                        axes[row, 3 + col_offset].set_title(label, fontsize=10)
 
                 for ax in axes[row]:
                     ax.set_xticks([])
