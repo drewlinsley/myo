@@ -18,7 +18,6 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib import cm
 
 
 def main():
@@ -58,7 +57,7 @@ def main():
     seg_pcts_sorted = sorted(data.keys())
 
     # Viridis color per classifier fraction
-    cmap = cm.get_cmap("viridis")
+    cmap = plt.get_cmap("viridis")
     denom = max(len(all_clf_fracs) - 1, 1)
     colors = [cmap(0.05 + 0.85 * i / denom) for i in range(len(all_clf_fracs))]
 
@@ -115,15 +114,16 @@ def main():
         ax.set_xlabel("Segmentation Training Data (%)", fontsize=11)
         ax.set_ylabel("Classification Accuracy", fontsize=11)
         ax.set_title(title, fontsize=12)
-        ax.legend(title="Classifier\ntrain frac", fontsize=9, loc="best",
-                  title_fontsize=9)
         ax.grid(True, alpha=0.3)
         ax.set_ylim(0, 1.05)
 
-        # Chance line
+        # Chance line (must be added before legend so it appears in it)
         if n_classes and n_classes > 1:
             ax.axhline(1.0 / n_classes, color="#999999", linestyle=":",
                        linewidth=1, alpha=0.7, label="chance")
+
+        ax.legend(title="Classifier\ntrain frac", fontsize=9, loc="best",
+                  title_fontsize=9)
 
     fig.suptitle(
         "Classification Accuracy vs. Segmentation Training Size",

@@ -132,11 +132,15 @@ def train_classifier_sweep(features, labels, fractions, n_splits, seed=42):
 
     class_counts = np.bincount(y)
     min_count = int(class_counts.min())
+    n_samples = len(y)
 
-    # Need at least 2 samples per class for stratification
-    use_stratified = min_count >= 2
+    # StratifiedShuffleSplit requires each split's test set to contain at least
+    # one sample from each class; sklearn enforces test_size * n_samples >= n_classes.
+    n_test = int(round(TEST_SIZE * n_samples))
+    use_stratified = min_count >= 2 and n_test >= n_classes
     if not use_stratified:
-        print(f"  WARNING: class with only {min_count} samples; using unstratified splits")
+        print(f"  WARNING: min class count={min_count}, n_test={n_test}, "
+              f"n_classes={n_classes}; using unstratified splits")
 
     if use_stratified:
         splitter = StratifiedShuffleSplit(
@@ -229,6 +233,12 @@ def main():
     features, vol_meta = extract_volume_features_all(
         cfg, args.checkpoint, args.metadata, args.no_checkpoint,
         args.layers, device)
+
+    if features.size == 0 or features.ndim < 2:
+        raise RuntimeError(
+            f"No volumes matched metadata for seg_tag={args.seg_tag}. "
+            "Check --metadata path and dataset stems."
+        )
 
     out = {
         "seg_tag": args.seg_tag,
