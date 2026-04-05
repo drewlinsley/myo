@@ -179,16 +179,29 @@ def train_classifier_sweep(features, labels, fractions, n_splits, seed=42):
             else:
                 train_sub = train_idx
 
-            if len(np.unique(y[train_sub])) < 2:
+            train_classes = np.unique(y[train_sub])
+            if len(train_classes) < 2:
                 continue
+
+            # Remap labels to consecutive [0, k-1] for XGBoost, since
+            # subsampling may drop classes and leave gaps in the label set.
+            global_to_local = {g: i for i, g in enumerate(train_classes)}
+            y_train_local = np.array(
+                [global_to_local[v] for v in y[train_sub]], dtype=np.int64)
 
             clf = xgb.XGBClassifier(
                 n_estimators=100, max_depth=4, learning_rate=0.1,
                 verbosity=0, eval_metric="mlogloss", n_jobs=1,
             )
-            clf.fit(features[train_sub], y[train_sub])
-            acc = clf.score(features[test_idx], y[test_idx])
-            accs.append(float(acc))
+            clf.fit(features[train_sub], y_train_local)
+
+            # Unmap predictions back to global label space; any test sample
+            # whose true class was missing from training can't be predicted
+            # correctly but will simply be counted as wrong.
+            y_pred_local = clf.predict(features[test_idx])
+            y_pred_global = train_classes[y_pred_local]
+            acc = float((y_pred_global == y[test_idx]).mean())
+            accs.append(acc)
             n_trains.append(int(len(train_sub)))
 
         if accs:
