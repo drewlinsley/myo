@@ -226,7 +226,7 @@ def main():
                         help="Encoder stages to extract (default: [5])")
     parser.add_argument("--k_values", type=int, nargs="+", default=K_VALUES,
                         help="k values for k-NN (default: 1 3 5)")
-    parser.add_argument("--mask_percentile", type=float, default=10,
+    parser.add_argument("--mask_percentile", type=float, default=50,
                         help="BF intensity percentile for foreground mask (0=no mask)")
     parser.add_argument("--metric", choices=["cosine", "euclidean"],
                         default="cosine",
