@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run XGBoost classifier sweeps on features from each seg-fraction checkpoint.
+# Run leave-one-out k-NN classification on features from each seg-fraction checkpoint.
 #
 # Usage:
 #   bash run_classifier_scaling.sh
@@ -33,7 +33,7 @@ for i in "${!FRACS[@]}"; do
     fi
 
     if [ "$FRAC" = "0.0" ]; then
-        echo "=== Classifiers on seg=${SEG_TAG} (untrained baseline) ==="
+        echo "=== k-NN on seg=${SEG_TAG} (untrained baseline) ==="
         python train_classifiers.py \
             -c "$CONFIG" \
             --no_checkpoint \
@@ -42,7 +42,7 @@ for i in "${!FRACS[@]}"; do
             --output "$OUT_JSON"
     else
         CKPT="ckpts/unet_2d_imagenet_pearson_${SEG_TAG}/best.pth"
-        echo "=== Classifiers on seg=${SEG_TAG} (${CKPT}) ==="
+        echo "=== k-NN on seg=${SEG_TAG} (${CKPT}) ==="
         python train_classifiers.py \
             -c "$CONFIG" \
             --checkpoint "$CKPT" \

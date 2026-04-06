@@ -1,9 +1,9 @@
-"""Train XGBoost classifiers on encoder features at multiple data fractions.
+"""Classify volumes via leave-one-out k-NN on encoder features.
 
-For a given seg checkpoint, extracts volume-level encoder features, then trains
-classifiers for each task (Exercise, Perturbation) at 10%, 25%, 50%, 75%, 100%
-of the classifier training data. Uses repeated stratified shuffle splits for
-robust accuracy estimates.
+For a given seg checkpoint, extracts volume-level encoder features, then
+runs leave-one-out k-NN classification for each task (Exercise, Perturbation).
+No train/test split — each volume is classified by its nearest neighbors
+among all other volumes.  Truly zero-shot w.r.t. classifier training data.
 
 Usage:
     python train_classifiers.py \
@@ -39,9 +39,7 @@ from extract_features import (
 )
 
 
-CLASSIFIER_FRACTIONS = [0.10, 0.25, 0.50, 0.75, 1.00]
-N_SPLITS = 10      # repeated stratified shuffle splits
-TEST_SIZE = 0.25   # fraction held out per split
+K_VALUES = [1, 3, 5]
 
 
 def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
@@ -116,124 +114,100 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
     return np.array(vol_features, dtype=np.float32), vol_meta
 
 
-def train_classifier_sweep(features, labels, fractions, n_splits, seed=42,
-                           pca_dim=None):
-    """Repeated stratified shuffle splits + training-data subsampling."""
-    from sklearn.preprocessing import LabelEncoder, StandardScaler
-    from sklearn.decomposition import PCA
-    from sklearn.model_selection import StratifiedShuffleSplit, ShuffleSplit
-    import xgboost as xgb
+def knn_leave_one_out(features, labels, k_values, metric="cosine"):
+    """Leave-one-out k-NN classification at multiple k values.
+
+    For each sample, finds its nearest neighbors among all OTHER samples
+    and predicts the majority label.  No train/test split needed.
+
+    Args:
+        features: (N, D) array
+        labels: list of N label strings
+        k_values: list of k values to evaluate
+        metric: "cosine" or "euclidean"
+
+    Returns:
+        dict with results per k value, or None if <2 classes.
+    """
+    from sklearn.preprocessing import LabelEncoder
+    from collections import Counter
 
     le = LabelEncoder()
     y = le.fit_transform(labels)
     n_classes = len(le.classes_)
-
-    # Reduce dimensionality to avoid N << D regime
-    if pca_dim is not None and pca_dim < features.shape[1]:
-        n_comp = min(pca_dim, features.shape[0] - 1, features.shape[1])
-        scaler = StandardScaler()
-        features = scaler.fit_transform(features)
-        pca = PCA(n_components=n_comp, random_state=seed)
-        features = pca.fit_transform(features)
-        ev = pca.explained_variance_ratio_.sum()
-        print(f"  PCA: {features.shape[1]} components, {ev:.1%} variance retained")
 
     if n_classes < 2:
         print("  <2 unique classes — skipping task")
         return None
 
     class_counts = np.bincount(y)
-    min_count = int(class_counts.min())
-    n_samples = len(y)
+    N = len(y)
 
-    # StratifiedShuffleSplit requires each split's test set to contain at least
-    # one sample from each class; sklearn enforces test_size * n_samples >= n_classes.
-    n_test = int(round(TEST_SIZE * n_samples))
-    use_stratified = min_count >= 2 and n_test >= n_classes
-    if not use_stratified:
-        print(f"  WARNING: min class count={min_count}, n_test={n_test}, "
-              f"n_classes={n_classes}; using unstratified splits")
-
-    if use_stratified:
-        splitter = StratifiedShuffleSplit(
-            n_splits=n_splits, test_size=TEST_SIZE, random_state=seed)
-        splits = list(splitter.split(features, y))
+    # Compute pairwise distance matrix
+    if metric == "cosine":
+        # Cosine distance = 1 - cosine_similarity
+        norms = np.linalg.norm(features, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        normed = features / norms
+        sim = normed @ normed.T          # (N, N) cosine similarity
+        dist = 1.0 - sim
     else:
-        splitter = ShuffleSplit(
-            n_splits=n_splits, test_size=TEST_SIZE, random_state=seed)
-        splits = list(splitter.split(features))
+        # Euclidean
+        diff = features[:, None, :] - features[None, :, :]
+        dist = np.sqrt((diff ** 2).sum(axis=-1))
+
+    # Set self-distance to infinity so a sample can't be its own neighbor
+    np.fill_diagonal(dist, np.inf)
+
+    # Nearest neighbor indices sorted by distance
+    nn_indices = np.argsort(dist, axis=1)  # (N, N)
 
     results = {
-        "n_samples": int(len(y)),
+        "n_samples": int(N),
         "n_classes": int(n_classes),
         "classes": [str(c) for c in le.classes_],
         "class_counts": [int(c) for c in class_counts],
-        "per_fraction": {},
+        "metric": metric,
+        "per_k": {},
     }
 
-    for frac in fractions:
-        accs, n_trains = [], []
-        for split_idx, (train_idx, test_idx) in enumerate(splits):
-            if frac < 1.0:
-                rng = np.random.RandomState(seed + split_idx * 101)
-                if use_stratified:
-                    sub = []
-                    for cls in np.unique(y[train_idx]):
-                        cls_idx = train_idx[y[train_idx] == cls]
-                        n_keep = max(1, int(round(len(cls_idx) * frac)))
-                        n_keep = min(n_keep, len(cls_idx))
-                        sub.extend(rng.choice(cls_idx, n_keep, replace=False))
-                    train_sub = np.array(sub)
-                else:
-                    n_keep = max(n_classes, int(round(len(train_idx) * frac)))
-                    n_keep = min(n_keep, len(train_idx))
-                    train_sub = rng.choice(train_idx, n_keep, replace=False)
-            else:
-                train_sub = train_idx
+    max_k = max(k_values)
+    for k in k_values:
+        if k > N - 1:
+            print(f"  k={k}: not enough samples (N={N}), skipping")
+            continue
 
-            train_classes = np.unique(y[train_sub])
-            if len(train_classes) < 2:
-                continue
+        correct = 0
+        per_sample = []
+        for i in range(N):
+            neighbors = nn_indices[i, :k]
+            neighbor_labels = y[neighbors]
+            counts = Counter(neighbor_labels)
+            pred = counts.most_common(1)[0][0]
+            is_correct = int(pred == y[i])
+            correct += is_correct
+            per_sample.append({
+                "true": str(le.classes_[y[i]]),
+                "pred": str(le.classes_[pred]),
+                "correct": is_correct,
+            })
 
-            # Remap labels to consecutive [0, k-1] for XGBoost, since
-            # subsampling may drop classes and leave gaps in the label set.
-            global_to_local = {g: i for i, g in enumerate(train_classes)}
-            y_train_local = np.array(
-                [global_to_local[v] for v in y[train_sub]], dtype=np.int64)
-
-            clf = xgb.XGBClassifier(
-                n_estimators=100, max_depth=4, learning_rate=0.1,
-                verbosity=0, eval_metric="mlogloss", n_jobs=1,
-            )
-            clf.fit(features[train_sub], y_train_local)
-
-            # Unmap predictions back to global label space; any test sample
-            # whose true class was missing from training can't be predicted
-            # correctly but will simply be counted as wrong.
-            y_pred_local = clf.predict(features[test_idx])
-            y_pred_global = train_classes[y_pred_local]
-            acc = float((y_pred_global == y[test_idx]).mean())
-            accs.append(acc)
-            n_trains.append(int(len(train_sub)))
-
-        if accs:
-            results["per_fraction"][f"{frac:.2f}"] = {
-                "mean_acc": float(np.mean(accs)),
-                "std_acc": float(np.std(accs)),
-                "n_splits": len(accs),
-                "n_train_mean": float(np.mean(n_trains)),
-            }
-            print(f"  clf_frac={frac:.2f}: acc={np.mean(accs):.3f}±{np.std(accs):.3f} "
-                  f"(n_train≈{int(np.mean(n_trains))}, {len(accs)} splits)")
-        else:
-            print(f"  clf_frac={frac:.2f}: all splits degenerate, skipped")
+        acc = correct / N
+        results["per_k"][str(k)] = {
+            "k": k,
+            "accuracy": float(acc),
+            "n_correct": int(correct),
+            "n_total": int(N),
+            "per_sample": per_sample,
+        }
+        print(f"  k={k}: acc={acc:.3f} ({correct}/{N})")
 
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train XGBoost classifiers on seg-encoder features")
+        description="Leave-one-out k-NN classification on seg-encoder features")
     parser.add_argument("-c", "--config", required=True)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--no_checkpoint", action="store_true",
@@ -243,10 +217,11 @@ def main():
                         help="Label for this seg model, e.g. frac025")
     parser.add_argument("--layers", type=int, nargs="+", default=[5],
                         help="Encoder stages to extract (default: [5])")
-    parser.add_argument("--pca_dim", type=int, default=20,
-                        help="PCA components before classifier (0=skip PCA)")
-    parser.add_argument("--n_splits", type=int, default=N_SPLITS)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--k_values", type=int, nargs="+", default=K_VALUES,
+                        help="k values for k-NN (default: 1 3 5)")
+    parser.add_argument("--metric", choices=["cosine", "euclidean"],
+                        default="cosine",
+                        help="Distance metric (default: cosine)")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -287,11 +262,9 @@ def main():
         ds_labels = [vol_meta[i][label_col] for i in range(len(vol_meta))
                      if mask[i]]
 
-        pca_dim = args.pca_dim if args.pca_dim > 0 else None
         print(f"\n── Task: {ds.capitalize()} ({label_col}) — {int(mask.sum())} volumes ──")
-        results = train_classifier_sweep(
-            ds_features, ds_labels, CLASSIFIER_FRACTIONS, args.n_splits, args.seed,
-            pca_dim=pca_dim)
+        results = knn_leave_one_out(
+            ds_features, ds_labels, args.k_values, args.metric)
         if results is not None:
             out["tasks"][ds] = {"label_col": label_col, **results}
 
