@@ -116,15 +116,27 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
     return np.array(vol_features, dtype=np.float32), vol_meta
 
 
-def train_classifier_sweep(features, labels, fractions, n_splits, seed=42):
+def train_classifier_sweep(features, labels, fractions, n_splits, seed=42,
+                           pca_dim=None):
     """Repeated stratified shuffle splits + training-data subsampling."""
-    from sklearn.preprocessing import LabelEncoder
+    from sklearn.preprocessing import LabelEncoder, StandardScaler
+    from sklearn.decomposition import PCA
     from sklearn.model_selection import StratifiedShuffleSplit, ShuffleSplit
     import xgboost as xgb
 
     le = LabelEncoder()
     y = le.fit_transform(labels)
     n_classes = len(le.classes_)
+
+    # Reduce dimensionality to avoid N << D regime
+    if pca_dim is not None and pca_dim < features.shape[1]:
+        n_comp = min(pca_dim, features.shape[0] - 1, features.shape[1])
+        scaler = StandardScaler()
+        features = scaler.fit_transform(features)
+        pca = PCA(n_components=n_comp, random_state=seed)
+        features = pca.fit_transform(features)
+        ev = pca.explained_variance_ratio_.sum()
+        print(f"  PCA: {features.shape[1]} components, {ev:.1%} variance retained")
 
     if n_classes < 2:
         print("  <2 unique classes — skipping task")
@@ -231,6 +243,8 @@ def main():
                         help="Label for this seg model, e.g. frac025")
     parser.add_argument("--layers", type=int, nargs="+", default=[5],
                         help="Encoder stages to extract (default: [5])")
+    parser.add_argument("--pca_dim", type=int, default=20,
+                        help="PCA components before classifier (0=skip PCA)")
     parser.add_argument("--n_splits", type=int, default=N_SPLITS)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", required=True)
@@ -273,9 +287,11 @@ def main():
         ds_labels = [vol_meta[i][label_col] for i in range(len(vol_meta))
                      if mask[i]]
 
+        pca_dim = args.pca_dim if args.pca_dim > 0 else None
         print(f"\n── Task: {ds.capitalize()} ({label_col}) — {int(mask.sum())} volumes ──")
         results = train_classifier_sweep(
-            ds_features, ds_labels, CLASSIFIER_FRACTIONS, args.n_splits, args.seed)
+            ds_features, ds_labels, CLASSIFIER_FRACTIONS, args.n_splits, args.seed,
+            pca_dim=pca_dim)
         if results is not None:
             out["tasks"][ds] = {"label_col": label_col, **results}
 
