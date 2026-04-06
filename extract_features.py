@@ -74,7 +74,8 @@ def load_metadata(path):
     return mapping
 
 
-def extract_encoder_features(model, bf_vol, device, layers, batch_size):
+def extract_encoder_features(model, bf_vol, device, layers, batch_size,
+                             mask=None):
     """Run Z-slices through the encoder and pool feature maps.
 
     Args:
@@ -83,6 +84,8 @@ def extract_encoder_features(model, bf_vol, device, layers, batch_size):
         device: torch device
         layers: list of encoder stage indices (0-5) to extract
         batch_size: slices per forward pass
+        mask: optional (Z, H, W) boolean array — True = foreground.
+              When provided, pools only over foreground spatial locations.
 
     Returns:
         features: (Z, D_feat) numpy array
@@ -98,24 +101,50 @@ def extract_encoder_features(model, bf_vol, device, layers, batch_size):
     for start in range(0, Z, batch_size):
         end = min(start + batch_size, Z)
         batch_slices = []
+        batch_masks = []
         for z in range(start, end):
             slc = bf_vol[z]
             if pad_h > 0 or pad_w > 0:
                 slc = np.pad(slc, ((0, pad_h), (0, pad_w)), mode="reflect")
             batch_slices.append(slc)
+            if mask is not None:
+                m = mask[z].astype(np.float32)
+                if pad_h > 0 or pad_w > 0:
+                    m = np.pad(m, ((0, pad_h), (0, pad_w)), mode="constant")
+                batch_masks.append(m)
 
         # (B, 1, H', W')
         inp = torch.from_numpy(
             np.stack(batch_slices)[:, np.newaxis]
         ).float().to(device)
 
+        # (B, 1, H', W') mask at input resolution
+        if batch_masks:
+            mask_t = torch.from_numpy(
+                np.stack(batch_masks)[:, np.newaxis]
+            ).float().to(device)
+        else:
+            mask_t = None
+
         encoder_out = model.encoder(inp)  # list of 6 feature maps
 
         layer_feats = []
         for li in layers:
             feat = encoder_out[li]  # (B, C, H', W')
-            pooled = F.adaptive_avg_pool2d(feat, 1)  # (B, C, 1, 1)
-            pooled = pooled.squeeze(-1).squeeze(-1)   # (B, C)
+
+            if mask_t is not None:
+                # Downsample mask to match this feature map's spatial size
+                mask_down = F.interpolate(
+                    mask_t, size=feat.shape[2:], mode="nearest"
+                )  # (B, 1, h, w)
+                # Masked mean: sum(feat * mask) / sum(mask)
+                numer = (feat * mask_down).sum(dim=(2, 3))   # (B, C)
+                denom = mask_down.sum(dim=(2, 3)).clamp(min=1)  # (B, 1)
+                pooled = numer / denom
+            else:
+                pooled = F.adaptive_avg_pool2d(feat, 1)  # (B, C, 1, 1)
+                pooled = pooled.squeeze(-1).squeeze(-1)   # (B, C)
+
             layer_feats.append(pooled)
 
         # Concatenate across layers → (B, D_feat)

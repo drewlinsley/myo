@@ -43,8 +43,14 @@ K_VALUES = [1, 3, 5]
 
 
 def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
-                                layers, device):
-    """Load seg model and extract volume-level features for every volume."""
+                                layers, device, mask_percentile=10):
+    """Load seg model and extract volume-level features for every volume.
+
+    Args:
+        mask_percentile: percentile of raw BF intensity used as foreground
+            threshold.  Pixels below this percentile are considered background
+            and excluded from spatial pooling.  Set to 0 to disable masking.
+    """
     apply_timm = cfg["model"].get("encoder_weights") is not None
 
     if no_checkpoint:
@@ -65,7 +71,6 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
 
     data_dir = cfg["data"]["data_dir"]
     bf_dir = os.path.join(data_dir, "bf")
-    gfp_dir = os.path.join(data_dir, "gfp")
     stats_dir = os.path.join(data_dir, "stats")
     z_range = cfg["data"].get("z_range", None)
 
@@ -87,25 +92,27 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
                 stats = json.load(f)
 
             bf_raw = np.load(bf_path)
-            gfp_raw = np.load(os.path.join(gfp_dir, f"{stem}.npy"))
             if z_range is not None:
                 z_lo = max(0, z_range[0])
                 z_hi = min(bf_raw.shape[0], z_range[1])
                 bf_raw = bf_raw[z_lo:z_hi]
-                gfp_raw = gfp_raw[z_lo:z_hi]
+
+            # Foreground mask from raw BF (before normalization)
+            if mask_percentile > 0:
+                thresh = np.percentile(bf_raw, mask_percentile)
+                bf_mask = bf_raw > thresh  # (Z, H, W) bool
+            else:
+                bf_mask = None
 
             bf = normalize(bf_raw, stats["bf"]["p_low"], stats["bf"]["p_high"],
                            apply_timm=apply_timm)
 
             feats = extract_encoder_features(model, bf, device, layers,
-                                             batch_size=16)
-            Z = feats.shape[0]
-            nonzero_prop = np.array(
-                [(gfp_raw[z] > 0).mean() for z in range(Z)], dtype=np.float32)
+                                             batch_size=16, mask=bf_mask)
 
-            # Aggregate to volume level
+            # Aggregate to volume level (encoder features only — no GFP
+            # covariates, so we measure purely what the encoder represents)
             vol_feat = feats.mean(axis=0)
-            vol_feat = np.concatenate([vol_feat, [float(nonzero_prop.mean())]])
 
             vol_features.append(vol_feat)
             vol_meta.append(meta)
@@ -219,6 +226,8 @@ def main():
                         help="Encoder stages to extract (default: [5])")
     parser.add_argument("--k_values", type=int, nargs="+", default=K_VALUES,
                         help="k values for k-NN (default: 1 3 5)")
+    parser.add_argument("--mask_percentile", type=float, default=10,
+                        help="BF intensity percentile for foreground mask (0=no mask)")
     parser.add_argument("--metric", choices=["cosine", "euclidean"],
                         default="cosine",
                         help="Distance metric (default: cosine)")
@@ -234,7 +243,7 @@ def main():
     print(f"Extracting features for seg_tag={args.seg_tag}...")
     features, vol_meta = extract_volume_features_all(
         cfg, args.checkpoint, args.metadata, args.no_checkpoint,
-        args.layers, device)
+        args.layers, device, mask_percentile=args.mask_percentile)
 
     if features.size == 0 or features.ndim < 2:
         raise RuntimeError(
