@@ -140,7 +140,7 @@ def predict_3d(model, bf_vol, device, patch_depth=32, overlap=(16, 128, 128),
     return predictions[:Z, :H, :W]
 
 
-def main(config_path, checkpoint, output_dir):
+def main(config_path, checkpoint, output_dir, denorm=False):
     cfg = load_config(config_path)
     dims = cfg["model"]["dims"]
     apply_timm = cfg["model"].get("encoder_weights") is not None
@@ -201,10 +201,15 @@ def main(config_path, checkpoint, output_dir):
                 pred = predict_3d(model, bf, device, patch_depth, overlap, inf_batch,
                                   spatial_tile=spatial_tile)
 
-            # Save prediction (in [0,1] normalized space)
+            # Optionally denormalize to raw GFP intensity scale
+            if denorm:
+                pred = denormalize(pred, stats["gfp"]["p_low"],
+                                   stats["gfp"]["p_high"])
+
             out_path = os.path.join(output_dir, f"{stem}.npy")
             np.save(out_path, pred)
-            accelerator.print(f"  {stem}: {pred.shape}, range=[{pred.min():.3f}, {pred.max():.3f}]")
+            scale_str = "raw GFP" if denorm else "[0,1] normalized"
+            accelerator.print(f"  {stem}: {pred.shape}, range=[{pred.min():.3f}, {pred.max():.3f}] ({scale_str})")
 
     accelerator.print("Prediction complete.")
 
@@ -217,5 +222,7 @@ if __name__ == "__main__":
                         help="Path to model checkpoint")
     parser.add_argument("--output_dir", type=str, default="predictions/",
                         help="Directory for output predictions")
+    parser.add_argument("--denormalize", action="store_true",
+                        help="Save in raw GFP intensity scale (not [0,1])")
     args = parser.parse_args()
-    main(args.config, args.checkpoint, args.output_dir)
+    main(args.config, args.checkpoint, args.output_dir, denorm=args.denormalize)

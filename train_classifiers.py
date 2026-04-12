@@ -41,6 +41,21 @@ from extract_features import (
 
 K_VALUES = [1, 3, 5]
 
+# Labels that map to "Control" (case-insensitive).  Everything else → "Perturbed".
+CONTROL_KEYWORDS = {"control", "ctrl", "no", "none", "untreated", "vehicle",
+                    "unstimulated", "baseline", "wt", "wild type", "dmso"}
+
+
+def binarize_labels(labels):
+    """Map raw labels to binary Control / Perturbed."""
+    out = []
+    for l in labels:
+        if l.strip().lower() in CONTROL_KEYWORDS:
+            out.append("Control")
+        else:
+            out.append("Perturbed")
+    return out
+
 
 def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
                                 layers, device, mask_percentile=10):
@@ -101,8 +116,12 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
             if mask_percentile > 0:
                 thresh = np.percentile(bf_raw, mask_percentile)
                 bf_mask = bf_raw > thresh  # (Z, H, W) bool
+                bg_count = int((~bf_mask).sum())
+                fg_count = int(bf_mask.sum())
             else:
                 bf_mask = None
+                bg_count = 0
+                fg_count = int(bf_raw.size)
 
             bf = normalize(bf_raw, stats["bf"]["p_low"], stats["bf"]["p_high"],
                            apply_timm=apply_timm)
@@ -115,8 +134,12 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
             vol_feat = feats.mean(axis=0)
 
             vol_features.append(vol_feat)
+            meta["_bg_pixels"] = bg_count
+            meta["_fg_pixels"] = fg_count
+            meta["_bg_frac"] = bg_count / max(bg_count + fg_count, 1)
             vol_meta.append(meta)
-            print(f"  {stem}: Dataset={meta['Dataset']}, D={len(vol_feat)}")
+            print(f"  {stem}: Dataset={meta['Dataset']}, D={len(vol_feat)}, "
+                  f"bg={meta['_bg_frac']:.1%}")
 
     return np.array(vol_features, dtype=np.float32), vol_meta
 
@@ -268,13 +291,38 @@ def main():
 
         mask = np.array([m["Dataset"].lower() == ds for m in vol_meta])
         ds_features = features[mask]
-        ds_labels = [vol_meta[i][label_col] for i in range(len(vol_meta))
-                     if mask[i]]
+        ds_labels_raw = [vol_meta[i][label_col] for i in range(len(vol_meta))
+                         if mask[i]]
+        ds_meta = [vol_meta[i] for i in range(len(vol_meta)) if mask[i]]
+
+        # Binarize: Control vs Perturbed
+        ds_labels = binarize_labels(ds_labels_raw)
 
         print(f"\n── Task: {ds.capitalize()} ({label_col}) — {int(mask.sum())} volumes ──")
+        print(f"  Raw labels: {sorted(set(ds_labels_raw))}")
+        print(f"  Binary:     {dict(zip(*np.unique(ds_labels, return_counts=True)))}")
+
+        # ── Control: background pixel count per class ──
+        from collections import defaultdict
+        bg_by_class = defaultdict(list)
+        for label, meta in zip(ds_labels, ds_meta):
+            bg_by_class[label].append(meta["_bg_frac"])
+        print(f"  CONTROL — background fraction (mask=0) per {label_col}:")
+        bg_control = {}
+        for cls in sorted(bg_by_class.keys()):
+            vals = np.array(bg_by_class[cls])
+            print(f"    {cls}: bg_frac = {vals.mean():.3f} ± {vals.std():.3f}  "
+                  f"(n={len(vals)})")
+            bg_control[cls] = {
+                "mean_bg_frac": float(vals.mean()),
+                "std_bg_frac": float(vals.std()),
+                "n": len(vals),
+            }
+
         results = knn_leave_one_out(
             ds_features, ds_labels, args.k_values, args.metric)
         if results is not None:
+            results["bg_control"] = bg_control
             out["tasks"][ds] = {"label_col": label_col, **results}
 
     out_dir = os.path.dirname(args.output)
