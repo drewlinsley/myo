@@ -1,0 +1,30 @@
+File,Dataset,Exercise,Perturbation,Week of development,Tissue,Myotube Diameter Hypothesis,peak_amplitude_week_3,peak_amplitude_week_4,peak_amplitude_week_5,WK5/WK3
+093025_fixed_6_20x001.nd2,perurbation,NA,DMSO control,5,1,medium,29.963,22.003,23.624,0.788
+093025_fixed_6_20x002.nd2,perurbation,NA,DMSO control,5,1,medium,29.963,22.003,23.624,0.788
+093025_fixed_6_20x003.nd2,perurbation,NA,DMSO control,5,1,medium,29.963,22.003,23.624,0.788
+093025_fixed_10_20x001.nd2,perurbation,NA,Dexamethasone low dose,5,1,small,12.860,2.274,1.003,0.078
+093025_fixed_10_20x002.nd2,perurbation,NA,Dexamethasone low dose,5,1,small,12.860,2.274,1.003,0.078
+093025_fixed_10_20x003.nd2,perurbation,NA,Dexamethasone low dose,5,1,small,12.860,2.274,1.003,0.078
+093025_fixed_11_20x001.nd2,perurbation,NA,Dexamethasone low dose,5,2,small,23.470,4.035,1.315,0.056
+093025_fixed_11_20x002.nd2,perurbation,NA,Dexamethasone low dose,5,2,small,23.470,4.035,1.315,0.056
+093025_fixed_11_20x003.nd2,perurbation,NA,Dexamethasone low dose,5,2,small,23.470,4.035,1.315,0.056
+093025_fixed_12_20x001.nd2,perurbation,NA,Dexamethasone low dose,5,3,small,19.230,5.374,1.129,0.059
+093025_fixed_12_20x002.nd2,perurbation,NA,Dexamethasone low dose,5,3,small,19.230,5.374,1.129,0.059
+093025_fixed_21_20x001.nd2,perurbation,NA,Dexamethasone high dose,5,1,extra_small,9.465,1.131,0.497,0.053
+093025_fixed_21_20x002.nd2,perurbation,NA,Dexamethasone high dose,5,1,extra_small,9.465,1.131,0.497,0.053
+093025_fixed_22_20x001.nd2,perurbation,NA,Dexamethasone high dose,5,2,extra_small,23.423,2.533,0.635,0.027
+093025_fixed_22_20x002.nd2,perurbation,NA,Dexamethasone high dose,5,2,extra_small,23.423,2.533,0.635,0.027
+T26_101525__20x_.nd2,perurbation,NA,BSA control,5,1,medium,22.219,18.072,17.600,0.792
+T30_101525__20x_001.nd2,perurbation,NA,Activin A low dose,5,1,small,8.668,5.140,3.232,0.373
+T31_101525__20x_004.nd2,perurbation,NA,Activin A low dose,5,2,small,12.193,4.815,3.312,0.272
+T36_101525__20x_005.nd2,perurbation,NA,Activin A high dose,5,1,extra_small,10.760,7.163,3.877,0.360
+T37_101525__20x_003.nd2,perurbation,NA,Activin A high dose,5,2,extra_small,8.502,2.847,3.298,0.388
+T38_101525__20x_006.nd2,perurbation,NA,Activin A high dose,5,3,extra_small,6.979,3.540,1.587,0.227
+day12_093025_fixed_stim_t2_20x001.nd2,exercise,Stimulated,NA,2,2,large,NA,NA,NA,NA
+day12_093025_fixed_stim_t2_20x.nd2,exercise,Stimulated,NA,2,2,large,NA,NA,NA,NA
+day12_093025_fixed_stim_t1_20x003.nd2,exercise,Stimulated,NA,2,1,large,NA,NA,NA,NA
+day12_093025_fixed_stim_t1_20x002.nd2,exercise,Stimulated,NA,2,1,large,NA,NA,NA,NA
+day12_093025_fixed_unstim_t2_20x001.nd2,exercise,Unstimulated,NA,2,2,medium,NA,NA,NA,NA
+day12_093025_fixed_unstim_t2_20x.nd2,exercise,Unstimulated,NA,2,2,medium,NA,NA,NA,NA
+day12_093025_fixed_unstim_t1_20x001.nd2,exercise,Unstimulated,NA,2,1,medium,NA,NA,NA,NA
+day12_093025_fixed_unstim_t1_20x.nd2,exercise,Unstimulated,NA,2,1,medium,NA,NA,NA,NA
