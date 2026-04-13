@@ -9,7 +9,7 @@
 set -e
 
 CONFIG=configs/unet_2d_imagenet_pearson.yaml
-METADATA=data_mapping_drew.csv
+METADATA=data_mapping_drew.xlsx
 OUT_DIR=results/classifier
 
 mkdir -p "$OUT_DIR"
