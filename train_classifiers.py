@@ -28,6 +28,9 @@ import argparse
 import warnings
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from glob import glob
 from src.config import load_config
@@ -47,10 +50,15 @@ CONTROL_KEYWORDS = {"control", "ctrl", "no", "none", "untreated", "vehicle",
 
 
 def binarize_labels(labels):
-    """Map raw labels to binary Control / Perturbed."""
+    """Map raw labels to binary Control / Perturbed.
+
+    Uses word-level matching so multi-word labels like "DMSO control"
+    are caught when any word overlaps CONTROL_KEYWORDS.
+    """
     out = []
     for l in labels:
-        if l.strip().lower() in CONTROL_KEYWORDS:
+        words = set(l.strip().lower().split())
+        if words & CONTROL_KEYWORDS:
             out.append("Control")
         else:
             out.append("Perturbed")
@@ -137,6 +145,7 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
             meta["_bg_pixels"] = bg_count
             meta["_fg_pixels"] = fg_count
             meta["_bg_frac"] = bg_count / max(bg_count + fg_count, 1)
+            meta["_stem"] = stem
             vol_meta.append(meta)
             print(f"  {stem}: Dataset={meta['Dataset']}, D={len(vol_feat)}, "
                   f"bg={meta['_bg_frac']:.1%}")
@@ -235,6 +244,166 @@ def knn_leave_one_out(features, labels, k_values, metric="cosine"):
     return results
 
 
+def _compute_distance_matrix(features, metric="cosine"):
+    """Compute pairwise distance matrix with self-distance = inf."""
+    if metric == "cosine":
+        norms = np.linalg.norm(features, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        normed = features / norms
+        sim = normed @ normed.T
+        dist = 1.0 - sim
+    else:
+        diff = features[:, None, :] - features[None, :, :]
+        dist = np.sqrt((diff ** 2).sum(axis=-1))
+    np.fill_diagonal(dist, np.inf)
+    return dist
+
+
+def knn_leave_one_out_regression(features, targets, k_values,
+                                 metric="cosine", stems=None, labels=None):
+    """Leave-one-out k-NN regression at multiple k values.
+
+    Prediction = mean of k nearest neighbors' target values.
+
+    Note: same-tissue FOVs share force values, so a volume's nearest
+    neighbor may be its same-tissue sibling, inflating R².
+
+    Returns:
+        dict with R², Pearson r, MAE, RMSE per k, or None if <3 samples.
+    """
+    N = len(targets)
+    if N < 3:
+        print(f"  <3 regression samples (N={N}) — skipping")
+        return None
+
+    targets = np.asarray(targets, dtype=np.float64)
+    dist = _compute_distance_matrix(features, metric)
+    nn_indices = np.argsort(dist, axis=1)
+
+    results = {
+        "n_samples": int(N),
+        "target_col": "peak_amplitude_week_5",
+        "metric": metric,
+        "per_k": {},
+    }
+
+    ss_tot = np.sum((targets - targets.mean()) ** 2)
+
+    for k in k_values:
+        if k > N - 1:
+            print(f"  k={k}: not enough samples (N={N}), skipping")
+            continue
+
+        preds = np.zeros(N)
+        for i in range(N):
+            neighbors = nn_indices[i, :k]
+            preds[i] = targets[neighbors].mean()
+
+        ss_res = np.sum((targets - preds) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        corr_matrix = np.corrcoef(targets, preds)
+        pearson_r = float(np.nan_to_num(corr_matrix[0, 1]))
+        mae = float(np.mean(np.abs(targets - preds)))
+        rmse = float(np.sqrt(np.mean((targets - preds) ** 2)))
+
+        per_sample = []
+        for i in range(N):
+            entry = {"true": float(targets[i]), "pred": float(preds[i])}
+            if stems is not None:
+                entry["stem"] = stems[i]
+            if labels is not None:
+                entry["label"] = labels[i]
+            per_sample.append(entry)
+
+        results["per_k"][str(k)] = {
+            "k": k,
+            "r2": float(r2),
+            "pearson_r": pearson_r,
+            "mae": mae,
+            "rmse": rmse,
+            "per_sample": per_sample,
+        }
+        print(f"  k={k}: R²={r2:.3f}, r={pearson_r:.3f}, "
+              f"MAE={mae:.3f}, RMSE={rmse:.3f}")
+
+    return results
+
+
+# Colors for scatter plots (matches extract_features.COLORS)
+_SCATTER_COLORS = [
+    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#bfef45", "#fabed4", "#469990",
+    "#dcbeff", "#9A6324", "#800000", "#aaffc3", "#808000",
+    "#000075", "#a9a9a9",
+]
+
+
+def plot_regression_results(results_per_k, labels_raw, stems, output_path):
+    """Scatter plot of predicted vs actual force for best k (highest R²)."""
+    best_k = max(results_per_k.keys(),
+                 key=lambda k: results_per_k[k]["r2"])
+    best = results_per_k[best_k]
+
+    trues = np.array([s["true"] for s in best["per_sample"]])
+    preds = np.array([s["pred"] for s in best["per_sample"]])
+
+    unique_labels = sorted(set(labels_raw))
+    label_to_color = {lab: _SCATTER_COLORS[i % len(_SCATTER_COLORS)]
+                      for i, lab in enumerate(unique_labels)}
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for lab in unique_labels:
+        mask = np.array([l == lab for l in labels_raw])
+        ax.scatter(trues[mask], preds[mask], c=label_to_color[lab],
+                   label=lab, s=50, alpha=0.85, edgecolors="white",
+                   linewidths=0.5)
+
+    lo = min(trues.min(), preds.min()) * 0.9
+    hi = max(trues.max(), preds.max()) * 1.1
+    ax.plot([lo, hi], [lo, hi], "--", color="gray", linewidth=1, alpha=0.7)
+
+    textstr = (f"k={best['k']}  R²={best['r2']:.3f}\n"
+               f"r={best['pearson_r']:.3f}  RMSE={best['rmse']:.2f}")
+    ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=10,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+    ax.set_xlabel("Actual peak_amplitude_week_5")
+    ax.set_ylabel("Predicted peak_amplitude_week_5")
+    ax.set_title("k-NN LOO Regression: Force Prediction")
+    ax.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
+
+def plot_feature_force_correlation(features, targets, output_path):
+    """Horizontal bar plot of top-20 feature dims most correlated with force."""
+    D = features.shape[1]
+    corrs = np.array([np.corrcoef(features[:, d], targets)[0, 1]
+                      for d in range(D)])
+    corrs = np.nan_to_num(corrs)
+
+    top_idx = np.argsort(np.abs(corrs))[::-1][:20]
+    top_corrs = corrs[top_idx]
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    colors = ["#e6194b" if c < 0 else "#3cb44b" for c in top_corrs]
+    y_pos = np.arange(len(top_idx))
+    ax.barh(y_pos, top_corrs, color=colors, edgecolor="white", linewidth=0.5)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([f"dim {i}" for i in top_idx], fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Pearson r with peak_amplitude_week_5")
+    ax.set_title("Top 20 Feature Dimensions by Force Correlation")
+    ax.axvline(0, color="black", linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Leave-one-out k-NN classification on seg-encoder features")
@@ -255,7 +424,12 @@ def main():
                         default="cosine",
                         help="Distance metric (default: cosine)")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--output_dir", default=None,
+                        help="Directory for plots (default: same dir as --output)")
     args = parser.parse_args()
+
+    if args.output_dir is None:
+        args.output_dir = os.path.dirname(args.output) or "."
 
     if not args.no_checkpoint and args.checkpoint is None:
         parser.error("Either --checkpoint or --no_checkpoint is required")
@@ -324,6 +498,68 @@ def main():
         if results is not None:
             results["bg_control"] = bg_control
             out["tasks"][ds] = {"label_col": label_col, **results}
+
+    # ── Regression on peak_amplitude_week_5 ────────────────────────
+    out["regression"] = {}
+    # Check if any volume has force data
+    has_force = any(
+        isinstance(m.get("peak_amplitude_week_5"), (int, float))
+        for m in vol_meta
+    )
+    if has_force:
+        os.makedirs(args.output_dir, exist_ok=True)
+        for ds in datasets_seen:
+            label_col = DATASET_LABEL_COL.get(ds)
+            if label_col is None:
+                continue
+
+            mask = np.array([m["Dataset"].lower() == ds for m in vol_meta])
+            ds_meta = [vol_meta[i] for i in range(len(vol_meta)) if mask[i]]
+
+            # Filter to samples with valid (non-None) force values
+            valid_idx = []
+            targets = []
+            stems = []
+            labels_raw = []
+            for j, meta in enumerate(ds_meta):
+                force = meta.get("peak_amplitude_week_5")
+                if isinstance(force, (int, float)):
+                    valid_idx.append(j)
+                    targets.append(float(force))
+                    stems.append(meta.get("_stem", ""))
+                    labels_raw.append(meta.get(label_col, ""))
+
+            if len(targets) < 3:
+                print(f"\n── Regression: {ds} — <3 valid force values, skipping ──")
+                continue
+
+            ds_features = features[mask]
+            reg_features = ds_features[valid_idx]
+            targets_arr = np.array(targets)
+
+            print(f"\n── Regression: {ds} — {len(targets)} volumes with force data ──")
+            reg_results = knn_leave_one_out_regression(
+                reg_features, targets_arr, args.k_values, args.metric,
+                stems=stems, labels=labels_raw)
+
+            if reg_results is not None:
+                out["regression"][ds] = reg_results
+
+                # Scatter plot: predicted vs actual
+                scatter_path = os.path.join(
+                    args.output_dir,
+                    f"{args.seg_tag}_{ds}_regression_scatter.png")
+                plot_regression_results(
+                    reg_results["per_k"], labels_raw, stems, scatter_path)
+
+                # Feature-force correlation bar plot
+                corr_path = os.path.join(
+                    args.output_dir,
+                    f"{args.seg_tag}_{ds}_feature_force_corr.png")
+                plot_feature_force_correlation(
+                    reg_features, targets_arr, corr_path)
+    else:
+        print("\nNo force data found in metadata — skipping regression.")
 
     out_dir = os.path.dirname(args.output)
     if out_dir:

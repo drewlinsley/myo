@@ -26,7 +26,8 @@ def main():
     args = parser.parse_args()
 
     # Load all frac{XXX}.json files
-    data = {}  # seg_pct → {task_name → task_data}
+    data = {}       # seg_pct → {task_name → task_data}
+    reg_data = {}   # seg_pct → {task_name → regression_data}
     for fname in sorted(os.listdir(args.results_dir)):
         m = re.match(r"frac(\d+)\.json", fname)
         if not m:
@@ -35,6 +36,7 @@ def main():
         with open(os.path.join(args.results_dir, fname)) as f:
             d = json.load(f)
         data[seg_pct] = d.get("tasks", {})
+        reg_data[seg_pct] = d.get("regression", {})
 
     if not data:
         print("No results found.")
@@ -55,17 +57,23 @@ def main():
 
     seg_pcts_sorted = sorted(data.keys())
 
+    # Identify regression tasks (datasets that have regression data in any JSON)
+    reg_tasks = sorted({task for v in reg_data.values() for task in v.keys()})
+
     # Color per k value
     cmap = plt.get_cmap("viridis")
     denom = max(len(all_k_values) - 1, 1)
     colors = [cmap(0.05 + 0.85 * i / denom) for i in range(len(all_k_values))]
 
-    # One subplot per task
-    n_tasks = len(all_tasks)
-    fig, axes = plt.subplots(1, n_tasks, figsize=(7 * n_tasks, 5.5),
+    # Layout: classification columns + regression columns
+    n_class_cols = len(all_tasks)
+    n_reg_cols = len(reg_tasks)
+    n_cols = n_class_cols + n_reg_cols
+    fig, axes = plt.subplots(1, n_cols, figsize=(7 * n_cols, 5.5),
                              squeeze=False)
     axes = axes[0]
 
+    # ── Classification subplots ──
     for ax_idx, task in enumerate(all_tasks):
         ax = axes[ax_idx]
 
@@ -93,13 +101,11 @@ def main():
                     markeredgewidth=1.2,
                     label=f"k={k_val}")
 
-            # Annotate each point with its accuracy
             for x, y in zip(x_arr, y_arr):
                 ax.annotate(f"{y:.2f}", (x, y),
                             textcoords="offset points", xytext=(0, 10),
                             ha="center", fontsize=8, color=colors[k_idx])
 
-        # Find class info for title (any seg_pct that has this task)
         n_samples, n_classes = None, None
         for seg_pct in seg_pcts_sorted:
             td = data[seg_pct].get(task)
@@ -108,7 +114,7 @@ def main():
                 n_classes = td.get("n_classes")
                 break
 
-        title = f"Task: {task.capitalize()}"
+        title = f"Classification: {task.capitalize()}"
         if n_samples is not None:
             title += f"  (n={n_samples}, {n_classes} classes)"
 
@@ -118,15 +124,74 @@ def main():
         ax.grid(True, alpha=0.3)
         ax.set_ylim(0, 1.05)
 
-        # Chance line
         if n_classes and n_classes > 1:
             ax.axhline(1.0 / n_classes, color="#999999", linestyle=":",
                        linewidth=1, alpha=0.7, label="chance")
 
         ax.legend(title="k-NN", fontsize=9, loc="best", title_fontsize=9)
 
+    # ── Regression subplots ──
+    for reg_idx, task in enumerate(reg_tasks):
+        ax = axes[n_class_cols + reg_idx]
+
+        for k_idx, k_val in enumerate(all_k_values):
+            key = str(k_val)
+            x_r2, y_r2 = [], []
+            x_pr, y_pr = [], []
+
+            for seg_pct in seg_pcts_sorted:
+                task_reg = reg_data[seg_pct].get(task, {})
+                per_k = task_reg.get("per_k", {})
+                k_data = per_k.get(key)
+                if k_data is None:
+                    continue
+                x_r2.append(seg_pct)
+                y_r2.append(k_data["r2"])
+                x_pr.append(seg_pct)
+                y_pr.append(k_data["pearson_r"])
+
+            if not x_r2:
+                continue
+
+            x_arr = np.array(x_r2)
+            r2_arr = np.array(y_r2)
+            pr_arr = np.array(y_pr)
+
+            ax.plot(x_arr, r2_arr, "o-", color=colors[k_idx],
+                    markersize=8, linewidth=2, markeredgecolor="white",
+                    markeredgewidth=1.2,
+                    label=f"k={k_val} R²")
+            ax.plot(x_arr, pr_arr, "s--", color=colors[k_idx],
+                    markersize=6, linewidth=1.5, markeredgecolor="white",
+                    markeredgewidth=0.8, alpha=0.7,
+                    label=f"k={k_val} r")
+
+            for x, y in zip(x_arr, r2_arr):
+                ax.annotate(f"{y:.2f}", (x, y),
+                            textcoords="offset points", xytext=(0, 10),
+                            ha="center", fontsize=8, color=colors[k_idx])
+
+        n_reg_samples = None
+        for seg_pct in seg_pcts_sorted:
+            tr = reg_data[seg_pct].get(task, {})
+            if tr:
+                n_reg_samples = tr.get("n_samples")
+                break
+
+        title = f"Regression: {task.capitalize()} (force)"
+        if n_reg_samples is not None:
+            title += f"  (n={n_reg_samples})"
+
+        ax.set_xlabel("Segmentation Training Data (%)", fontsize=11)
+        ax.set_ylabel("R² / Pearson r", fontsize=11)
+        ax.set_title(title, fontsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(-0.5, 1.05)
+        ax.axhline(0, color="#999999", linestyle=":", linewidth=1, alpha=0.7)
+        ax.legend(fontsize=8, loc="best")
+
     fig.suptitle(
-        "k-NN Classification vs. Segmentation Training Size",
+        "k-NN Classification & Regression vs. Segmentation Training Size",
         fontsize=14, y=1.02)
     fig.tight_layout()
 

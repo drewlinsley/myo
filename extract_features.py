@@ -43,13 +43,13 @@ def load_metadata(path):
     """Load metadata from .xlsx, .csv, or .tsv.
 
     Expected columns: File, Dataset, Exercise, Perturbation, ...
-    Stems are derived by stripping the .nd2 extension from File.
+    All columns are preserved.  Numeric strings are converted to float;
+    "NA" and empty strings become None.
 
     Returns:
-        dict {stem: {"Dataset": str, "Exercise": str, "Perturbation": str}}
+        dict {stem: {"Dataset": str, "Exercise": str|None, ...}}
     """
     ext = os.path.splitext(path)[1].lower()
-    keep_cols = ["Dataset", "Exercise", "Perturbation"]
 
     if ext in (".xlsx", ".xls"):
         import openpyxl
@@ -70,7 +70,20 @@ def load_metadata(path):
     for row in data_rows:
         nd2_name = row["File"].strip()
         stem = os.path.splitext(nd2_name)[0]
-        mapping[stem] = {col: row[col].strip() for col in keep_cols}
+        entry = {}
+        for col, val in row.items():
+            if col == "File":
+                continue
+            val = val.strip() if val else ""
+            if val == "" or val.upper() == "NA":
+                entry[col] = None
+                continue
+            # Try numeric conversion
+            try:
+                entry[col] = float(val)
+            except (ValueError, TypeError):
+                entry[col] = val
+        mapping[stem] = entry
     return mapping
 
 
