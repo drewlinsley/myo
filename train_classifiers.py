@@ -404,6 +404,106 @@ def plot_feature_force_correlation(features, targets, output_path):
     print(f"  Saved {output_path}")
 
 
+def plot_force_by_group(labels_raw, targets, output_path):
+    """Box + strip plot of peak_amplitude_week_5 grouped by perturbation label."""
+    unique_labels = sorted(set(labels_raw))
+    label_to_color = {lab: _SCATTER_COLORS[i % len(_SCATTER_COLORS)]
+                      for i, lab in enumerate(unique_labels)}
+
+    # Group targets by label
+    grouped = {lab: [] for lab in unique_labels}
+    for lab, val in zip(labels_raw, targets):
+        grouped[lab].append(val)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    positions = list(range(len(unique_labels)))
+    box_data = [grouped[lab] for lab in unique_labels]
+
+    bp = ax.boxplot(box_data, positions=positions, widths=0.5, patch_artist=True,
+                    showfliers=False)
+    for patch, lab in zip(bp["boxes"], unique_labels):
+        patch.set_facecolor(label_to_color[lab])
+        patch.set_alpha(0.4)
+
+    # Overlay individual points
+    for i, lab in enumerate(unique_labels):
+        jitter = np.random.default_rng(42).uniform(-0.15, 0.15, len(grouped[lab]))
+        ax.scatter(np.full(len(grouped[lab]), i) + jitter, grouped[lab],
+                   c=label_to_color[lab], s=40, alpha=0.9, edgecolors="white",
+                   linewidths=0.5, zorder=3)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(unique_labels, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("peak_amplitude_week_5 (force)")
+    ax.set_title("Contractile Force by Perturbation Group")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
+
+def plot_classification_summary(results, ds_labels_raw, ds_labels, output_path):
+    """Bar chart of k-NN accuracy per k + confusion-style per-class accuracy."""
+    per_k = results.get("per_k", {})
+    if not per_k:
+        return
+
+    k_vals = sorted(per_k.keys(), key=int)
+    accs = [per_k[k]["accuracy"] for k in k_vals]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Left: accuracy per k
+    ax = axes[0]
+    colors_k = plt.get_cmap("viridis")(np.linspace(0.15, 0.85, len(k_vals)))
+    ax.bar(range(len(k_vals)), accs, color=colors_k, edgecolor="white")
+    ax.set_xticks(range(len(k_vals)))
+    ax.set_xticklabels([f"k={k}" for k in k_vals])
+    ax.set_ylabel("LOO Accuracy")
+    ax.set_ylim(0, 1.05)
+    ax.set_title("Classification Accuracy by k")
+    for i, acc in enumerate(accs):
+        ax.text(i, acc + 0.02, f"{acc:.2f}", ha="center", fontsize=10)
+    # Chance line
+    n_classes = results.get("n_classes", 2)
+    if n_classes > 1:
+        ax.axhline(1.0 / n_classes, color="#999", linestyle=":", alpha=0.7,
+                    label="chance")
+        ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    # Right: per-class accuracy for best k
+    ax = axes[1]
+    best_k = max(k_vals, key=lambda k: per_k[k]["accuracy"])
+    samples = per_k[best_k]["per_sample"]
+    classes = sorted(set(s["true"] for s in samples))
+    class_correct = {c: 0 for c in classes}
+    class_total = {c: 0 for c in classes}
+    for s in samples:
+        class_total[s["true"]] += 1
+        class_correct[s["true"]] += s["correct"]
+
+    class_acc = [class_correct[c] / max(class_total[c], 1) for c in classes]
+    class_colors = [_SCATTER_COLORS[i % len(_SCATTER_COLORS)]
+                    for i in range(len(classes))]
+    ax.bar(range(len(classes)), class_acc, color=class_colors, edgecolor="white")
+    ax.set_xticks(range(len(classes)))
+    ax.set_xticklabels(classes, fontsize=10)
+    ax.set_ylabel("Accuracy")
+    ax.set_ylim(0, 1.05)
+    ax.set_title(f"Per-Class Accuracy (k={best_k})")
+    for i, (acc, c) in enumerate(zip(class_acc, classes)):
+        ax.text(i, acc + 0.02, f"{acc:.2f}\n(n={class_total[c]})",
+                ha="center", fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Leave-one-out k-NN classification on seg-encoder features")
@@ -499,6 +599,14 @@ def main():
             results["bg_control"] = bg_control
             out["tasks"][ds] = {"label_col": label_col, **results}
 
+            # Classification summary plot
+            os.makedirs(args.output_dir, exist_ok=True)
+            cls_plot_path = os.path.join(
+                args.output_dir,
+                f"{args.seg_tag}_{ds}_classification.png")
+            plot_classification_summary(
+                results, ds_labels_raw, ds_labels, cls_plot_path)
+
     # ── Regression on peak_amplitude_week_5 ────────────────────────
     out["regression"] = {}
     # Check if any volume has force data
@@ -551,6 +659,12 @@ def main():
                     f"{args.seg_tag}_{ds}_regression_scatter.png")
                 plot_regression_results(
                     reg_results["per_k"], labels_raw, stems, scatter_path)
+
+                # Force by group box plot
+                force_path = os.path.join(
+                    args.output_dir,
+                    f"{args.seg_tag}_{ds}_force_by_group.png")
+                plot_force_by_group(labels_raw, targets, force_path)
 
                 # Feature-force correlation bar plot
                 corr_path = os.path.join(
