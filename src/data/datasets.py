@@ -33,7 +33,8 @@ class BaseDataset(Dataset):
     def __init__(self, bf_files, gfp_files, stats_dir, apply_timm=True,
                  transform=None, cache_volumes=False, z_range=None,
                  gfp_norm_mode="volume", filter_empty_gfp=False,
-                 empty_gfp_threshold=0.01, percentile_clip=(0.5, 99.5)):
+                 empty_gfp_threshold=0.01, percentile_clip=(0.5, 99.5),
+                 mask_threshold_method=None):
         assert len(bf_files) == len(gfp_files)
         self.bf_files = bf_files
         self.gfp_files = gfp_files
@@ -46,6 +47,7 @@ class BaseDataset(Dataset):
         self.filter_empty_gfp = filter_empty_gfp
         self.empty_gfp_threshold = empty_gfp_threshold
         self.percentile_clip = tuple(percentile_clip)
+        self.mask_threshold_method = mask_threshold_method  # None | "minimum" | "otsu" | "li" | "triangle"
         self._cache = {}
 
         # Load stats for all volumes
@@ -57,12 +59,15 @@ class BaseDataset(Dataset):
                 self.stats.append(json.load(f))
 
     def _load_volume(self, idx):
-        """Load and normalize a BF+GFP volume pair.
+        """Load and normalize a BF+GFP volume pair, optionally with a mask.
 
         GFP normalization depends on gfp_norm_mode:
           - 'volume': normalize with pre-computed volume stats (current default)
           - 'per_z' / 'per_patch': store raw float32 GFP, normalize later
         BF is always normalized with volume stats.
+
+        Returns:
+            (bf, gfp, mask) — mask is None when mask_threshold_method is None.
         """
         if self.cache_volumes and idx in self._cache:
             return self._cache[idx]
@@ -77,6 +82,21 @@ class BaseDataset(Dataset):
             bf_raw = bf_raw[z_lo:z_hi]
             gfp_raw = gfp_raw[z_lo:z_hi]
 
+        # Compute foreground mask from raw BF before normalization
+        mask = None
+        if self.mask_threshold_method is not None:
+            from skimage.filters import (
+                threshold_otsu, threshold_li, threshold_triangle,
+                threshold_minimum,
+            )
+            flat = bf_raw.ravel().astype(np.float64)
+            _algo = {"minimum": threshold_minimum,
+                     "otsu": threshold_otsu,
+                     "li": threshold_li,
+                     "triangle": threshold_triangle}
+            thresh = float(_algo[self.mask_threshold_method](flat))
+            mask = (bf_raw > thresh)  # (Z, H, W) bool
+
         st = self.stats[idx]
         bf = normalize(bf_raw, st["bf"]["p_low"], st["bf"]["p_high"],
                        apply_timm=self.apply_timm)
@@ -89,9 +109,9 @@ class BaseDataset(Dataset):
             gfp = gfp_raw.astype(np.float32)
 
         if self.cache_volumes:
-            self._cache[idx] = (bf, gfp)
+            self._cache[idx] = (bf, gfp, mask)
 
-        return bf, gfp
+        return bf, gfp, mask
 
     def _normalize_patch_gfp(self, gfp_tensor):
         """Percentile-normalize a cropped GFP tensor to [0,1] using its own stats.
@@ -117,13 +137,15 @@ class SliceDataset(BaseDataset):
     def __init__(self, bf_files, gfp_files, stats_dir, apply_timm=True,
                  transform=None, cache_volumes=False, crop_size=256, z_range=None,
                  gfp_norm_mode="volume", filter_empty_gfp=False,
-                 empty_gfp_threshold=0.01, percentile_clip=(0.5, 99.5)):
+                 empty_gfp_threshold=0.01, percentile_clip=(0.5, 99.5),
+                 mask_threshold_method=None):
         super().__init__(bf_files, gfp_files, stats_dir, apply_timm,
                          transform, cache_volumes, z_range=z_range,
                          gfp_norm_mode=gfp_norm_mode,
                          filter_empty_gfp=filter_empty_gfp,
                          empty_gfp_threshold=empty_gfp_threshold,
-                         percentile_clip=percentile_clip)
+                         percentile_clip=percentile_clip,
+                         mask_threshold_method=mask_threshold_method)
         self.crop_size = crop_size
 
         # Build index: (file_idx, z_idx) for each sample
@@ -144,7 +166,7 @@ class SliceDataset(BaseDataset):
             n_before = len(self.index_map)
             filtered = []
             for file_idx, z_idx in self.index_map:
-                _, gfp = self._load_volume(file_idx)
+                _, gfp, _ = self._load_volume(file_idx)
                 gfp_slice = gfp[z_idx]
                 # For volume mode, GFP is already [0,1]; for per_z/per_patch, auto-normalize
                 if self.gfp_norm_mode != "volume":
@@ -159,7 +181,7 @@ class SliceDataset(BaseDataset):
 
     def __getitem__(self, idx):
         file_idx, z_idx = self.index_map[idx]
-        bf, gfp = self._load_volume(file_idx)
+        bf, gfp, mask = self._load_volume(file_idx)
 
         # Extract single slice: (H, W)
         bf_slice = bf[z_idx]
@@ -169,23 +191,38 @@ class SliceDataset(BaseDataset):
         if self.gfp_norm_mode == "per_z":
             gfp_slice, _, _ = normalize_auto(gfp_slice, self.percentile_clip)
 
-        # Stack as (H, W, 2) for joint augmentation
-        combined = np.stack([bf_slice, gfp_slice], axis=-1)
+        if mask is not None:
+            mask_slice = mask[z_idx].astype(np.float32)
+            # Stack as (H, W, 3) for joint augmentation: BF, GFP, mask
+            combined = np.stack([bf_slice, gfp_slice, mask_slice], axis=-1)
+        else:
+            # Stack as (H, W, 2) for joint augmentation
+            combined = np.stack([bf_slice, gfp_slice], axis=-1)
 
         if self.transform:
             combined = self.transform(combined)
-            # After ToTensor2D: (2, H, W)
+            # After ToTensor2D: (C, H, W) where C=2 or 3
             bf_out = combined[:1]   # (1, H, W)
             gfp_out = combined[1:2]  # (1, H, W)
+            if mask is not None:
+                mask_out = (combined[2:3] > 0.5).float()  # (1, H, W)
+            else:
+                mask_out = torch.ones_like(gfp_out)
         else:
             bf_out = torch.from_numpy(bf_slice[np.newaxis].copy()).float()
             gfp_out = torch.from_numpy(gfp_slice[np.newaxis].copy()).float()
+            if mask is not None:
+                mask_out = torch.from_numpy(
+                    mask_slice[np.newaxis].copy()).float()
+                mask_out = (mask_out > 0.5).float()
+            else:
+                mask_out = torch.ones_like(gfp_out)
 
         # per_patch: normalize GFP after crop/transform using patch stats
         if self.gfp_norm_mode == "per_patch":
             gfp_out = self._normalize_patch_gfp(gfp_out)
 
-        return bf_out, gfp_out
+        return bf_out, gfp_out, mask_out
 
 
 class VolumeDataset(BaseDataset):
@@ -199,13 +236,15 @@ class VolumeDataset(BaseDataset):
                  transform=None, cache_volumes=False,
                  patch_depth=32, crop_size=256, patches_per_volume=32, z_range=None,
                  gfp_norm_mode="volume", filter_empty_gfp=False,
-                 empty_gfp_threshold=0.01, percentile_clip=(0.5, 99.5)):
+                 empty_gfp_threshold=0.01, percentile_clip=(0.5, 99.5),
+                 mask_threshold_method=None):
         super().__init__(bf_files, gfp_files, stats_dir, apply_timm,
                          transform, cache_volumes, z_range=z_range,
                          gfp_norm_mode=gfp_norm_mode,
                          filter_empty_gfp=filter_empty_gfp,
                          empty_gfp_threshold=empty_gfp_threshold,
-                         percentile_clip=percentile_clip)
+                         percentile_clip=percentile_clip,
+                         mask_threshold_method=mask_threshold_method)
         self.patch_depth = patch_depth
         self.crop_size = crop_size
         self.patches_per_volume = patches_per_volume
@@ -220,12 +259,12 @@ class VolumeDataset(BaseDataset):
         return len(self.index_map)
 
     def _extract_patch(self, file_idx):
-        """Extract a single BF/GFP patch pair from a volume.
+        """Extract a single BF/GFP/mask patch triple from a volume.
 
-        Returns (bf_out, gfp_out) tensors, or applies per_z/per_patch
-        normalization as needed.
+        Returns (bf_out, gfp_out, mask_out) tensors. mask_out is all-ones
+        when masking is disabled.
         """
-        bf, gfp = self._load_volume(file_idx)
+        bf, gfp, mask = self._load_volume(file_idx)
 
         # per_z: normalize each Z-slice of raw GFP independently
         if self.gfp_norm_mode == "per_z":
@@ -234,8 +273,13 @@ class VolumeDataset(BaseDataset):
                 gfp_normed[zi], _, _ = normalize_auto(gfp[zi], self.percentile_clip)
             gfp = gfp_normed
 
-        # Stack as (Z, H, W, 2) for joint augmentation
-        combined = np.stack([bf, gfp], axis=-1)  # (Z, H, W, 2)
+        if mask is not None:
+            mask_float = mask.astype(np.float32)
+            # Stack as (Z, H, W, 3) for joint augmentation: BF, GFP, mask
+            combined = np.stack([bf, gfp, mask_float], axis=-1)
+        else:
+            # Stack as (Z, H, W, 2)
+            combined = np.stack([bf, gfp], axis=-1)
 
         # Pad if volume is smaller than patch size
         z, h, w, c = combined.shape
@@ -248,9 +292,13 @@ class VolumeDataset(BaseDataset):
 
         if self.transform:
             combined = self.transform(combined)
-            # After ToTensor3D: (2, H, W, D) — CHWD format
+            # After ToTensor3D: (C, H, W, D) where C=2 or 3
             bf_out = combined[:1]    # (1, H, W, D)
             gfp_out = combined[1:2]  # (1, H, W, D)
+            if mask is not None:
+                mask_out = (combined[2:3] > 0.5).float()  # (1, H, W, D)
+            else:
+                mask_out = torch.ones_like(gfp_out)
         else:
             # Manual crop and convert
             z, h, w, c = combined.shape
@@ -262,12 +310,17 @@ class VolumeDataset(BaseDataset):
             patch = patch.transpose(3, 1, 2, 0)
             bf_out = torch.from_numpy(patch[:1].copy()).float()
             gfp_out = torch.from_numpy(patch[1:2].copy()).float()
+            if mask is not None:
+                mask_out = torch.from_numpy(patch[2:3].copy()).float()
+                mask_out = (mask_out > 0.5).float()
+            else:
+                mask_out = torch.ones_like(gfp_out)
 
         # per_patch: normalize GFP after crop using patch stats
         if self.gfp_norm_mode == "per_patch":
             gfp_out = self._normalize_patch_gfp(gfp_out)
 
-        return bf_out, gfp_out
+        return bf_out, gfp_out, mask_out
 
     def __getitem__(self, idx):
         file_idx, _ = self.index_map[idx]
@@ -276,13 +329,13 @@ class VolumeDataset(BaseDataset):
             # Retry loop: resample if GFP patch is empty
             max_attempts = 50
             for attempt in range(max_attempts):
-                bf_out, gfp_out = self._extract_patch(file_idx)
+                bf_out, gfp_out, mask_out = self._extract_patch(file_idx)
                 if gfp_out.mean().item() >= self.empty_gfp_threshold:
-                    return bf_out, gfp_out
+                    return bf_out, gfp_out, mask_out
                 # After several failures, try a different volume
                 if attempt == max_attempts // 2:
                     file_idx = np.random.randint(0, len(self.bf_files))
             # Exhausted attempts — return last patch anyway
-            return bf_out, gfp_out
+            return bf_out, gfp_out, mask_out
         else:
             return self._extract_patch(file_idx)

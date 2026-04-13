@@ -10,6 +10,7 @@ data:
   filter_empty_gfp: true
   empty_gfp_threshold: 0.01   # mean normalized GFP below this → skip
   cache_volumes: true
+  mask_method: null   # null | minimum | otsu | li | triangle
   z_range: [70, 105]
   crop_size: 256
   patches_per_volume: 32

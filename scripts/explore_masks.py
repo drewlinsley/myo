@@ -25,7 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from glob import glob
 
-from scipy.ndimage import binary_dilation, generate_binary_structure
+from scipy.ndimage import binary_dilation, generate_binary_structure, label as ndimage_label
 from skimage.filters import (
     threshold_otsu,
     threshold_li,
@@ -38,9 +38,17 @@ from src.config import load_config
 
 PERCENTILES = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 ALGO_METHODS = ["otsu", "li", "triangle", "minimum", "multiotsu"]
-DILATIONS = [0, 3, 5, 10, 15, 20]  # dilation iterations to test on minimum
-DILATION_METHODS = [f"minimum_d{d}" for d in DILATIONS if d > 0]
-ALL_METHODS = [f"p{p}" for p in PERCENTILES] + ALGO_METHODS + DILATION_METHODS
+# (dilation_iters, min_component_frac_of_slice_fg)
+CLEANUP_CONFIGS = [
+    (0, 0.01),   # no dilation, remove blobs <1% of fg
+    (0, 0.05),   # no dilation, remove blobs <5% of fg
+    (3, 0.01),   # small dilation + remove tiny
+    (3, 0.05),   # small dilation + remove small
+    (5, 0.01),   # medium dilation + remove tiny
+    (5, 0.05),   # medium dilation + remove small
+]
+CLEANUP_METHODS = [f"minimum_d{d}_r{int(s*100):02d}" for d, s in CLEANUP_CONFIGS]
+ALL_METHODS = [f"p{p}" for p in PERCENTILES] + ALGO_METHODS + CLEANUP_METHODS
 
 
 def compute_volume_thresholds(bf_vol):
@@ -85,10 +93,9 @@ def compute_volume_thresholds(bf_vol):
     except (ValueError, Exception):
         thresholds["multiotsu"] = float("nan")
 
-    # Dilation variants of minimum: same threshold, mask is dilated later
-    for d in DILATIONS:
-        if d > 0:
-            thresholds[f"minimum_d{d}"] = thresholds["minimum"]
+    # Cleanup variants of minimum: same threshold, dilation + component removal later
+    for d, s in CLEANUP_CONFIGS:
+        thresholds[f"minimum_d{d}_r{int(s*100):02d}"] = thresholds["minimum"]
 
     return thresholds
 
@@ -96,7 +103,8 @@ def compute_volume_thresholds(bf_vol):
 def apply_mask(bf_vol, method, thresholds):
     """Build a boolean foreground mask for a given method.
 
-    For minimum_dN methods, threshold with minimum then dilate by N iterations.
+    For minimum_dN_rMM methods: threshold with minimum, dilate by N iterations,
+    then remove connected components smaller than MM% of per-slice foreground.
     Returns (Z, H, W) bool array.
     """
     thr = thresholds[method]
@@ -104,10 +112,25 @@ def apply_mask(bf_vol, method, thresholds):
         return None
     mask = bf_vol > thr
     if method.startswith("minimum_d"):
-        n_iter = int(method.split("_d")[1])
+        # Parse dilation iters and min component fraction
+        # Format: minimum_d{N}_r{MM}
+        parts = method.split("_")
+        n_iter = int(parts[1][1:])   # d{N}
+        min_frac = int(parts[2][1:]) / 100.0  # r{MM}
         struct = generate_binary_structure(2, 1)  # 2D cross
         for z in range(mask.shape[0]):
-            mask[z] = binary_dilation(mask[z], structure=struct, iterations=n_iter)
+            if n_iter > 0:
+                mask[z] = binary_dilation(
+                    mask[z], structure=struct, iterations=n_iter)
+            # Remove small connected components
+            fg_count = mask[z].sum()
+            if fg_count > 0 and min_frac > 0:
+                labeled, n_components = ndimage_label(mask[z])
+                min_pixels = fg_count * min_frac
+                for comp_id in range(1, n_components + 1):
+                    comp_mask = labeled == comp_id
+                    if comp_mask.sum() < min_pixels:
+                        mask[z][comp_mask] = False
     return mask
 
 

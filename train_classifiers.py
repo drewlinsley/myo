@@ -65,9 +65,36 @@ def binarize_labels(labels):
     return out
 
 
+def _pool_volume(feats, pool_method):
+    """Aggregate per-slice features (Z, D) to a single volume vector.
+
+    Args:
+        feats: (Z, D) array — one feature vector per Z-slice.
+        pool_method: "mean" | "mean+std" | "cov" | "mean+cov"
+            mean     — normalized mean across Z → (D,)
+            mean+std — concatenate mean and std → (2D,)
+            cov      — upper triangle of covariance matrix → (D*(D+1)/2,)
+            mean+cov — concatenation of both
+    """
+    mu = feats.mean(axis=0)  # (D,)
+    if pool_method == "mean":
+        return mu
+    if pool_method == "mean+std":
+        std = feats.std(axis=0)  # (D,)
+        return np.concatenate([mu, std]).astype(np.float32)
+    # Covariance: (D, D), use upper triangle to avoid redundancy
+    cov = np.cov(feats, rowvar=False)  # (D, D)
+    tri = cov[np.triu_indices(cov.shape[0])]  # (D*(D+1)/2,)
+    if pool_method == "cov":
+        return tri.astype(np.float32)
+    # mean+cov
+    return np.concatenate([mu, tri]).astype(np.float32)
+
+
 def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
                                 layers, device, mask_percentile=10,
-                                mask_method="percentile", mask_dilate=0):
+                                mask_method="percentile", mask_dilate=0,
+                                pool_method="mean", gfp_control=False):
     """Load seg model and extract volume-level features for every volume.
 
     Args:
@@ -77,6 +104,10 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
         mask_method: "percentile", "minimum", "otsu", "li", "triangle".
         mask_dilate: number of binary dilation iterations (2D per-slice)
             to expand the foreground mask.
+        pool_method: "mean", "mean+std", "cov", or "mean+cov" for volume
+            aggregation.
+        gfp_control: if True, feed GFP (instead of BF) through the encoder
+            as an upper-bound control.
     """
     apply_timm = cfg["model"].get("encoder_weights") is not None
 
@@ -98,8 +129,17 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
 
     data_dir = cfg["data"]["data_dir"]
     bf_dir = os.path.join(data_dir, "bf")
+    gfp_dir = os.path.join(data_dir, "gfp")
     stats_dir = os.path.join(data_dir, "stats")
     z_range = cfg["data"].get("z_range", None)
+
+    if gfp_control:
+        print("GFP control mode: feeding GFP through encoder instead of BF")
+
+    if pool_method in ("cov", "mean+cov"):
+        warnings.warn(
+            f"pool_method={pool_method!r} with D=2048 produces ~2M features "
+            f"vs ~20 samples — may overfit k-NN.")
 
     bf_files = sorted(glob(os.path.join(bf_dir, "*.npy")))
 
@@ -123,6 +163,13 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
                 z_lo = max(0, z_range[0])
                 z_hi = min(bf_raw.shape[0], z_range[1])
                 bf_raw = bf_raw[z_lo:z_hi]
+
+            # Load GFP if running GFP control
+            if gfp_control:
+                gfp_path = os.path.join(gfp_dir, f"{stem}.npy")
+                gfp_raw = np.load(gfp_path)
+                if z_range is not None:
+                    gfp_raw = gfp_raw[z_lo:z_hi]
 
             # Foreground mask from raw BF (before normalization)
             if mask_method == "percentile" and mask_percentile == 0:
@@ -159,12 +206,18 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
             bf = normalize(bf_raw, stats["bf"]["p_low"], stats["bf"]["p_high"],
                            apply_timm=apply_timm)
 
-            feats = extract_encoder_features(model, bf, device, layers,
+            # GFP control: normalize GFP and feed it to encoder instead of BF
+            if gfp_control:
+                encoder_input = normalize(
+                    gfp_raw, stats["gfp"]["p_low"], stats["gfp"]["p_high"],
+                    apply_timm=apply_timm)
+            else:
+                encoder_input = bf
+
+            feats = extract_encoder_features(model, encoder_input, device, layers,
                                              batch_size=16, mask=bf_mask)
 
-            # Aggregate to volume level (encoder features only — no GFP
-            # covariates, so we measure purely what the encoder represents)
-            vol_feat = feats.mean(axis=0)
+            vol_feat = _pool_volume(feats, pool_method)
 
             vol_features.append(vol_feat)
             meta["_bg_pixels"] = bg_count
@@ -550,6 +603,11 @@ def main():
                         help="Thresholding method for foreground mask")
     parser.add_argument("--mask_dilate", type=int, default=0,
                         help="Binary dilation iterations on foreground mask (0=none)")
+    parser.add_argument("--pool_method", default="mean",
+                        choices=["mean", "mean+std", "cov", "mean+cov"],
+                        help="Volume-level feature pooling (default: mean)")
+    parser.add_argument("--gfp_control", action="store_true",
+                        help="Feed GFP through encoder instead of BF (upper-bound control)")
     parser.add_argument("--metric", choices=["cosine", "euclidean"],
                         default="cosine",
                         help="Distance metric (default: cosine)")
@@ -571,7 +629,8 @@ def main():
     features, vol_meta = extract_volume_features_all(
         cfg, args.checkpoint, args.metadata, args.no_checkpoint,
         args.layers, device, mask_percentile=args.mask_percentile,
-        mask_method=args.mask_method, mask_dilate=args.mask_dilate)
+        mask_method=args.mask_method, mask_dilate=args.mask_dilate,
+        pool_method=args.pool_method, gfp_control=args.gfp_control)
 
     if features.size == 0 or features.ndim < 2:
         raise RuntimeError(

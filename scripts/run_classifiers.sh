@@ -18,6 +18,18 @@ EXTRA_ARGS="$@"
 
 mkdir -p "$OUT_DIR"
 
+# ── GFP control (ImageNet-only weights) ──
+echo "=== gfp_control: GFP through encoder (ImageNet) ==="
+python train_classifiers.py \
+    -c "$CONFIG" \
+    --no_checkpoint \
+    --gfp_control \
+    --metadata "$METADATA" \
+    --seg_tag gfp_control \
+    --output "$OUT_DIR/gfp_control.json" \
+    --output_dir "$OUT_DIR" \
+    $EXTRA_ARGS
+
 # ── 0% baseline (untrained) ──
 echo "=== frac000: untrained baseline ==="
 python train_classifiers.py \
@@ -53,6 +65,18 @@ for ckpt in ckpts/*/best.pth; do
         --metadata "$METADATA" \
         --seg_tag "$tag" \
         --output "$OUT_DIR/${tag}.json" \
+        --output_dir "$OUT_DIR" \
+        $EXTRA_ARGS
+
+    # GFP control with trained encoder
+    echo "=== ${tag}_gfp: GFP through trained encoder ==="
+    python train_classifiers.py \
+        -c "$CONFIG" \
+        --checkpoint "$ckpt" \
+        --gfp_control \
+        --metadata "$METADATA" \
+        --seg_tag "${tag}_gfp" \
+        --output "$OUT_DIR/${tag}_gfp.json" \
         --output_dir "$OUT_DIR" \
         $EXTRA_ARGS
 done

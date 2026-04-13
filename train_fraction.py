@@ -72,6 +72,8 @@ def build_datasets_with_fraction(cfg, fraction, seed=42):
     empty_gfp_threshold = dcfg.get("empty_gfp_threshold", 0.01)
     percentile_clip = tuple(dcfg.get("percentile_clip", [0.5, 99.5]))
 
+    mask_threshold_method = dcfg.get("mask_method", None)
+
     common_kwargs = dict(
         stats_dir=stats_dir,
         apply_timm=apply_timm,
@@ -81,6 +83,7 @@ def build_datasets_with_fraction(cfg, fraction, seed=42):
         filter_empty_gfp=filter_empty_gfp,
         empty_gfp_threshold=empty_gfp_threshold,
         percentile_clip=percentile_clip,
+        mask_threshold_method=mask_threshold_method,
     )
 
     if dims == "2d":
@@ -193,10 +196,10 @@ def main(config_path, fraction, resume_from=None):
         progress = tqdm(total=len(train_loader),
                         desc=f"Epoch {epoch+1}/{tcfg['epochs']} [train]")
 
-        for step, (bf, fl) in enumerate(train_loader):
+        for step, (bf, fl, mask) in enumerate(train_loader):
             with accelerator.accumulate(model):
                 pred = model(bf)
-                loss = criterion(pred, fl) / grad_accum
+                loss = criterion(pred, fl, mask=mask) / grad_accum
                 accelerator.backward(loss)
 
                 if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
@@ -216,9 +219,9 @@ def main(config_path, fraction, resume_from=None):
         with torch.no_grad():
             progress = tqdm(total=len(val_loader),
                             desc=f"Epoch {epoch+1}/{tcfg['epochs']} [val]")
-            for bf, fl in val_loader:
+            for bf, fl, mask in val_loader:
                 pred = model(bf)
-                loss = criterion(pred, fl)
+                loss = criterion(pred, fl, mask=mask)
                 p = compute_psnr(pred, fl)
                 val_losses.append(loss.item())
                 val_psnrs.append(p.item() if isinstance(p, torch.Tensor) else p)
