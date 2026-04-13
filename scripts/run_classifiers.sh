@@ -5,12 +5,16 @@
 # Also runs the untrained (0%) baseline and the scaling plot.
 #
 # Usage: bash scripts/run_classifiers.sh
+#        bash scripts/run_classifiers.sh --mask_method minimum --mask_dilate 10
 
 set -e
 
 CONFIG=configs/unet_2d_imagenet_pearson.yaml
 METADATA=data_mapping_drew.csv
 OUT_DIR=results/classifier
+
+# Pass through any extra args (e.g. --mask_method minimum --mask_dilate 10)
+EXTRA_ARGS="$@"
 
 mkdir -p "$OUT_DIR"
 
@@ -22,7 +26,8 @@ python train_classifiers.py \
     --metadata "$METADATA" \
     --seg_tag frac000 \
     --output "$OUT_DIR/frac000.json" \
-    --output_dir "$OUT_DIR"
+    --output_dir "$OUT_DIR" \
+    $EXTRA_ARGS
 
 # ── Trained checkpoints ──
 # Expects directories like ckpts/unet_2d_imagenet_pearson_frac025/best.pth
@@ -48,7 +53,8 @@ for ckpt in ckpts/*/best.pth; do
         --metadata "$METADATA" \
         --seg_tag "$tag" \
         --output "$OUT_DIR/${tag}.json" \
-        --output_dir "$OUT_DIR"
+        --output_dir "$OUT_DIR" \
+        $EXTRA_ARGS
 done
 
 # ── Scaling plot ──

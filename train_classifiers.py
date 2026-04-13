@@ -66,13 +66,17 @@ def binarize_labels(labels):
 
 
 def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
-                                layers, device, mask_percentile=10):
+                                layers, device, mask_percentile=10,
+                                mask_method="percentile", mask_dilate=0):
     """Load seg model and extract volume-level features for every volume.
 
     Args:
         mask_percentile: percentile of raw BF intensity used as foreground
-            threshold.  Pixels below this percentile are considered background
-            and excluded from spatial pooling.  Set to 0 to disable masking.
+            threshold (only used when mask_method="percentile").
+            Set to 0 to disable masking.
+        mask_method: "percentile", "minimum", "otsu", "li", "triangle".
+        mask_dilate: number of binary dilation iterations (2D per-slice)
+            to expand the foreground mask.
     """
     apply_timm = cfg["model"].get("encoder_weights") is not None
 
@@ -121,15 +125,36 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
                 bf_raw = bf_raw[z_lo:z_hi]
 
             # Foreground mask from raw BF (before normalization)
-            if mask_percentile > 0:
-                thresh = np.percentile(bf_raw, mask_percentile)
-                bf_mask = bf_raw > thresh  # (Z, H, W) bool
-                bg_count = int((~bf_mask).sum())
-                fg_count = int(bf_mask.sum())
-            else:
+            if mask_method == "percentile" and mask_percentile == 0:
                 bf_mask = None
                 bg_count = 0
                 fg_count = int(bf_raw.size)
+            else:
+                if mask_method == "percentile":
+                    thresh = np.percentile(bf_raw, mask_percentile)
+                else:
+                    from skimage.filters import (
+                        threshold_otsu, threshold_li, threshold_triangle,
+                        threshold_minimum,
+                    )
+                    flat = bf_raw.ravel().astype(np.float64)
+                    _algo = {"minimum": threshold_minimum,
+                             "otsu": threshold_otsu,
+                             "li": threshold_li,
+                             "triangle": threshold_triangle}
+                    thresh = float(_algo[mask_method](flat))
+
+                bf_mask = bf_raw > thresh  # (Z, H, W) bool
+
+                if mask_dilate > 0:
+                    from scipy.ndimage import binary_dilation, generate_binary_structure
+                    struct = generate_binary_structure(2, 1)
+                    for z in range(bf_mask.shape[0]):
+                        bf_mask[z] = binary_dilation(
+                            bf_mask[z], structure=struct, iterations=mask_dilate)
+
+                bg_count = int((~bf_mask).sum())
+                fg_count = int(bf_mask.sum())
 
             bf = normalize(bf_raw, stats["bf"]["p_low"], stats["bf"]["p_high"],
                            apply_timm=apply_timm)
@@ -520,6 +545,11 @@ def main():
                         help="k values for k-NN (default: 1 3 5)")
     parser.add_argument("--mask_percentile", type=float, default=50,
                         help="BF intensity percentile for foreground mask (0=no mask)")
+    parser.add_argument("--mask_method", default="percentile",
+                        choices=["percentile", "minimum", "otsu", "li", "triangle"],
+                        help="Thresholding method for foreground mask")
+    parser.add_argument("--mask_dilate", type=int, default=0,
+                        help="Binary dilation iterations on foreground mask (0=none)")
     parser.add_argument("--metric", choices=["cosine", "euclidean"],
                         default="cosine",
                         help="Distance metric (default: cosine)")
@@ -540,7 +570,8 @@ def main():
     print(f"Extracting features for seg_tag={args.seg_tag}...")
     features, vol_meta = extract_volume_features_all(
         cfg, args.checkpoint, args.metadata, args.no_checkpoint,
-        args.layers, device, mask_percentile=args.mask_percentile)
+        args.layers, device, mask_percentile=args.mask_percentile,
+        mask_method=args.mask_method, mask_dilate=args.mask_dilate)
 
     if features.size == 0 or features.ndim < 2:
         raise RuntimeError(

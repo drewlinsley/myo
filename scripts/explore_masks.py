@@ -133,19 +133,21 @@ def plot_mask_grid(bf_vol, gfp_vol, thresholds, z_indices, stem, output_dir):
     if n_rows == 1:
         axes = axes[np.newaxis, :]
 
-    # Compute volume-level stats per method
+    # Compute volume-level stats per method (with dilation where applicable)
     stats = {}
+    vol_masks = {}  # cache for rendering
     for method in ALL_METHODS:
-        thr = thresholds[method]
-        if np.isnan(thr):
+        mask = apply_mask(bf_vol, method, thresholds)
+        vol_masks[method] = mask
+        if mask is None:
             stats[method] = dict(threshold=None, fg_fraction=None,
                                  fg_mean_bf=None, bg_mean_bf=None)
         else:
-            mask = bf_vol > thr
             fg_frac = float(mask.mean())
             fg_mean = float(bf_vol[mask].mean()) if mask.any() else 0.0
             bg_mean = float(bf_vol[~mask].mean()) if (~mask).any() else 0.0
-            stats[method] = dict(threshold=float(thr), fg_fraction=fg_frac,
+            stats[method] = dict(threshold=float(thresholds[method]),
+                                 fg_fraction=fg_frac,
                                  fg_mean_bf=fg_mean, bg_mean_bf=bg_mean)
 
     for row, zi in enumerate(z_indices):
@@ -167,9 +169,9 @@ def plot_mask_grid(bf_vol, gfp_vol, thresholds, z_indices, stem, output_dir):
         # Mask columns
         for col_idx, method in enumerate(ALL_METHODS):
             ax = axes[row, col_idx + 2]
-            thr = thresholds[method]
+            mask = vol_masks[method]
 
-            if np.isnan(thr):
+            if mask is None:
                 ax.imshow(bf_disp[zi], cmap="gray", vmin=0, vmax=1)
                 ax.text(0.5, 0.5, "FAIL", transform=ax.transAxes,
                         ha="center", va="center", fontsize=10, color="red",
@@ -180,13 +182,13 @@ def plot_mask_grid(bf_vol, gfp_vol, thresholds, z_indices, stem, output_dir):
                 # BF grayscale with semi-transparent red overlay on background
                 bf_slice = bf_disp[zi]
                 rgba = np.zeros((*bf_slice.shape, 4), dtype=np.float32)
-                rgba[..., 0] = bf_slice  # R = gray
-                rgba[..., 1] = bf_slice  # G = gray
-                rgba[..., 2] = bf_slice  # B = gray
+                rgba[..., 0] = bf_slice
+                rgba[..., 1] = bf_slice
+                rgba[..., 2] = bf_slice
                 rgba[..., 3] = 1.0
 
                 # Red overlay on background (mask=0) pixels
-                bg_mask = bf_vol[zi] <= thr
+                bg_mask = ~mask[zi]
                 rgba[bg_mask, 0] = np.clip(rgba[bg_mask, 0] * 0.7 + 0.3, 0, 1)
                 rgba[bg_mask, 1] = rgba[bg_mask, 1] * 0.7
                 rgba[bg_mask, 2] = rgba[bg_mask, 2] * 0.7
@@ -196,6 +198,7 @@ def plot_mask_grid(bf_vol, gfp_vol, thresholds, z_indices, stem, output_dir):
                 if row == 0:
                     fg_pct = stats[method]["fg_fraction"]
                     fg_str = f"{fg_pct * 100:.1f}" if fg_pct is not None else "?"
+                    thr = thresholds[method]
                     ax.set_title(f"{method}\nthr={thr:.0f} / fg={fg_str}%",
                                  fontsize=6)
 
