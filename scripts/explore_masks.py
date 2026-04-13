@@ -25,6 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from glob import glob
 
+from scipy.ndimage import binary_dilation, generate_binary_structure
 from skimage.filters import (
     threshold_otsu,
     threshold_li,
@@ -37,13 +38,17 @@ from src.config import load_config
 
 PERCENTILES = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 ALGO_METHODS = ["otsu", "li", "triangle", "minimum", "multiotsu"]
-ALL_METHODS = [f"p{p}" for p in PERCENTILES] + ALGO_METHODS
+DILATIONS = [0, 3, 5, 10, 15, 20]  # dilation iterations to test on minimum
+DILATION_METHODS = [f"minimum_d{d}" for d in DILATIONS if d > 0]
+ALL_METHODS = [f"p{p}" for p in PERCENTILES] + ALGO_METHODS + DILATION_METHODS
 
 
 def compute_volume_thresholds(bf_vol):
-    """Compute all 14 thresholds on a flattened BF volume.
+    """Compute all thresholds on a flattened BF volume.
 
     Returns dict[method_name, threshold_value].  NaN on failure.
+    Dilation methods (minimum_dN) store the base minimum threshold;
+    actual dilation is applied when building masks.
     """
     flat = bf_vol.ravel().astype(np.float64)
     thresholds = {}
@@ -80,7 +85,30 @@ def compute_volume_thresholds(bf_vol):
     except (ValueError, Exception):
         thresholds["multiotsu"] = float("nan")
 
+    # Dilation variants of minimum: same threshold, mask is dilated later
+    for d in DILATIONS:
+        if d > 0:
+            thresholds[f"minimum_d{d}"] = thresholds["minimum"]
+
     return thresholds
+
+
+def apply_mask(bf_vol, method, thresholds):
+    """Build a boolean foreground mask for a given method.
+
+    For minimum_dN methods, threshold with minimum then dilate by N iterations.
+    Returns (Z, H, W) bool array.
+    """
+    thr = thresholds[method]
+    if np.isnan(thr):
+        return None
+    mask = bf_vol > thr
+    if method.startswith("minimum_d"):
+        n_iter = int(method.split("_d")[1])
+        struct = generate_binary_structure(2, 1)  # 2D cross
+        for z in range(mask.shape[0]):
+            mask[z] = binary_dilation(mask[z], structure=struct, iterations=n_iter)
+    return mask
 
 
 def plot_mask_grid(bf_vol, gfp_vol, thresholds, z_indices, stem, output_dir):
