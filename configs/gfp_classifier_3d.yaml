@@ -1,0 +1,21 @@
+base: base.yaml
+experiment_name: gfp_classifier_3d
+
+model:
+  dims: 3d
+  encoder: resnext50_32x4d
+  encoder_weights: imagenet
+  in_channels: 1
+  out_channels: 2
+  time_kernel: null
+  strides: [[2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2]]
+
+training:
+  epochs: 100
+  batch_size: 2
+  lr: 0.0003
+  weight_decay: 0.01
+  num_workers: 4
+  checkpoint_dir: ckpts/gfp_classifier_3d
+  patience: 15
+  mixed_precision: true
