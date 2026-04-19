@@ -22,21 +22,26 @@ EXTRA_ARGS="$@"
 mkdir -p "$OUT_DIR"
 
 # ──────────────────────────────────────────────────────────────
-# Step 1: GFP control baseline (ImageNet-only, no checkpoint)
+# Step 1: GFP classifier scaling sweep (end-to-end, per-slice,
+#         two heads: Exercise + Perturbation)
 # ──────────────────────────────────────────────────────────────
 echo ""
 echo "########################################"
-echo "# STEP 1: GFP Control Baseline         #"
+echo "# STEP 1: GFP Classifier Scaling Sweep #"
 echo "########################################"
-python train_classifiers.py \
-    -c "$CONFIG" \
-    --no_checkpoint \
-    --gfp_control \
-    --metadata "$METADATA" \
-    --seg_tag gfp_control \
-    --output "$OUT_DIR/gfp_control.json" \
-    --output_dir "$OUT_DIR" \
-    $EXTRA_ARGS
+GFP_CLS_CONFIG=configs/gfp_classifier.yaml
+for frac in "${FRACTIONS[@]}"; do
+    echo "=== GFP classifier fraction=$frac ==="
+    python train_gfp_classifier.py \
+        -c "$GFP_CLS_CONFIG" \
+        --metadata "$METADATA" \
+        --fraction "$frac"
+done
+
+echo "=== Plotting GFP classifier scaling ==="
+python plot_gfp_classifier_scaling.py \
+    --ckpt_glob "ckpts/gfp_classifier_frac*" \
+    --output "$OUT_DIR/gfp_classifier_scaling.png"
 
 # ──────────────────────────────────────────────────────────────
 # Step 2: Retrain scaling-law models across fractions
