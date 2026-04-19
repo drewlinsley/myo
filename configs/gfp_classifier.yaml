@@ -7,6 +7,7 @@ model:
   encoder_weights: imagenet
   in_channels: 1
   out_channels: 2  # unused (per-head sizes determined from label vocab)
+  time_kernel: null
 
 training:
   epochs: 100
