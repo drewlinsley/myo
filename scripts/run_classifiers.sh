@@ -50,6 +50,11 @@ for ckpt in ckpts/*/best.pth; do
     # Extract directory name, e.g. unet_2d_imagenet_pearson_frac025
     dir_name=$(basename "$(dirname "$ckpt")")
 
+    # Skip GFP classifier checkpoints — they're not BF->GFP U-Nets
+    if [[ "$dir_name" == gfp_classifier_* ]]; then
+        continue
+    fi
+
     # Try to pull out fracXXX tag
     if [[ "$dir_name" =~ (frac[0-9]+) ]]; then
         tag="${BASH_REMATCH[1]}"

@@ -78,6 +78,10 @@ python train_classifiers.py \
 for ckpt in ckpts/*/best.pth; do
     [ -f "$ckpt" ] || continue
     dir_name=$(basename "$(dirname "$ckpt")")
+    # Skip GFP classifier checkpoints — they're not BF->GFP U-Nets
+    if [[ "$dir_name" == gfp_classifier_* ]]; then
+        continue
+    fi
     if [[ "$dir_name" =~ (frac[0-9]+) ]]; then
         tag="${BASH_REMATCH[1]}"
     else
