@@ -39,7 +39,9 @@ class GFPClassificationDataset(Dataset):
 
     def __init__(self, gfp_files, stats_dir, metadata, label_vocab,
                  transform=None, z_range=None, apply_timm=True,
-                 percentile_clip=(0.5, 99.5)):
+                 percentile_clip=(0.5, 99.5), use_raw_labels=False,
+                 mode="2d", patch_depth=32, patches_per_volume=32,
+                 crop_size=256):
         self.gfp_files = gfp_files
         self.stats_dir = stats_dir
         self.metadata = metadata
@@ -48,6 +50,10 @@ class GFPClassificationDataset(Dataset):
         self.z_range = z_range
         self.apply_timm = apply_timm
         self.percentile_clip = tuple(percentile_clip)
+        self.mode = mode
+        self.patch_depth = patch_depth
+        self.patches_per_volume = patches_per_volume
+        self.crop_size = crop_size
 
         # Load stats and compute per-volume labels
         self.stats = []
@@ -58,24 +64,33 @@ class GFPClassificationDataset(Dataset):
             with open(os.path.join(stats_dir, f"{stem}.json")) as f:
                 self.stats.append(json.load(f))
             meta = metadata.get(stem, {})
-            ex = binarize(meta.get("Exercise"))
-            pt = binarize(meta.get("Perturbation"))
+            if use_raw_labels:
+                ex = meta.get("Exercise") or None
+                pt = meta.get("Perturbation") or None
+            else:
+                ex = binarize(meta.get("Exercise"))
+                pt = binarize(meta.get("Perturbation"))
             self.ex_idx.append(
                 label_vocab["exercise"].index(ex) if ex in label_vocab["exercise"] else -1)
             self.pt_idx.append(
                 label_vocab["perturbation"].index(pt) if pt in label_vocab["perturbation"] else -1)
 
-        # Build per-slice index map
+        # Build index map
         self.index_map = []
-        for i, gfp_path in enumerate(gfp_files):
-            vol = np.load(gfp_path, mmap_mode="r")
-            n_z_total = vol.shape[0]
-            if z_range is not None:
-                n_z = min(n_z_total, z_range[1]) - max(0, z_range[0])
-            else:
-                n_z = n_z_total
-            for z in range(n_z):
-                self.index_map.append((i, z))
+        if mode == "2d":
+            for i, gfp_path in enumerate(gfp_files):
+                vol = np.load(gfp_path, mmap_mode="r")
+                n_z_total = vol.shape[0]
+                if z_range is not None:
+                    n_z = min(n_z_total, z_range[1]) - max(0, z_range[0])
+                else:
+                    n_z = n_z_total
+                for z in range(n_z):
+                    self.index_map.append((i, z))
+        else:  # 3d: random patches per volume
+            for i in range(len(gfp_files)):
+                for p in range(patches_per_volume):
+                    self.index_map.append((i, p))
 
         self._cache = {}
 
@@ -97,15 +112,39 @@ class GFPClassificationDataset(Dataset):
         return len(self.index_map)
 
     def __getitem__(self, idx):
-        file_idx, z_idx = self.index_map[idx]
+        file_idx, slot = self.index_map[idx]
         gfp = self._load(file_idx)
-        slc = gfp[z_idx]  # (H, W)
 
-        if self.transform:
-            # Match SliceDataset convention: (H, W, C) input
-            img = self.transform(slc[..., None])  # -> (1, H, W) tensor
+        if self.mode == "2d":
+            slc = gfp[slot]  # (H, W)
+            if self.transform:
+                img = self.transform(slc[..., None])  # -> (1, H, W)
+            else:
+                img = torch.from_numpy(slc[np.newaxis].copy()).float()
         else:
-            img = torch.from_numpy(slc[np.newaxis].copy()).float()
+            # 3D: random (D, H, W) patch, transformed to (1, H, W, D) tensor
+            z, h, w = gfp.shape
+            pd, cs = self.patch_depth, self.crop_size
+            # Reflect-pad if volume is smaller than patch size
+            pad_z = max(0, pd - z)
+            pad_h = max(0, cs - h)
+            pad_w = max(0, cs - w)
+            vol = gfp
+            if pad_z or pad_h or pad_w:
+                vol = np.pad(vol, ((0, pad_z), (0, pad_h), (0, pad_w)),
+                             mode="reflect")
+            z, h, w = vol.shape
+            zd = np.random.randint(0, z - pd + 1)
+            yh = np.random.randint(0, h - cs + 1)
+            xw = np.random.randint(0, w - cs + 1)
+            patch = vol[zd:zd + pd, yh:yh + cs, xw:xw + cs]  # (D, H, W)
+            if self.transform:
+                # transforms expect (D, H, W, C)
+                img = self.transform(patch[..., None])  # -> (1, H, W, D)
+            else:
+                # (D, H, W) -> (1, H, W, D)
+                img = torch.from_numpy(
+                    patch.transpose(1, 2, 0)[np.newaxis].copy()).float()
 
         return img, int(self.ex_idx[file_idx]), int(self.pt_idx[file_idx])
 

@@ -21,23 +21,32 @@ import matplotlib.pyplot as plt
 
 from src.config import load_config, validate_config
 from src.utils import set_seed, prepare_env
-from src.data.classification_dataset import (
-    GFPClassificationDataset, build_label_vocab, binarize,
-)
+from src.data.classification_dataset import GFPClassificationDataset
 from src.models.gfp_classifier import build_gfp_classifier
 from src.data import transforms as T
 from extract_features import load_metadata
 
 
 def build_transforms(cfg, train):
+    dims = cfg["model"].get("dims", "2d")
     crop = cfg["data"]["crop_size"]
+    if dims == "2d":
+        if train:
+            return T.Compose([
+                T.RandomCrop2D(crop), T.RandomHFlip2D(), T.RandomVFlip2D(),
+                T.RandomRot90_2D(), T.IntensityJitter2D(n_input_channels=1),
+                T.ToTensor2D(),
+            ])
+        return T.Compose([T.CenterCrop2D(crop), T.ToTensor2D()])
+    # 3D: dataset does random cropping itself, so transforms only do
+    # flips/jitter/tensor conversion on a (D, H, W, C) patch.
     if train:
         return T.Compose([
-            T.RandomCrop2D(crop), T.RandomHFlip2D(), T.RandomVFlip2D(),
-            T.RandomRot90_2D(), T.IntensityJitter2D(n_input_channels=1),
-            T.ToTensor2D(),
+            T.RandomHFlip3D(), T.RandomVFlip3D(), T.RandomZFlip3D(),
+            T.RandomRot90_3D(),
+            T.IntensityJitter3D(n_input_channels=1), T.ToTensor3D(),
         ])
-    return T.Compose([T.CenterCrop2D(crop), T.ToTensor2D()])
+    return T.Compose([T.ToTensor3D()])
 
 
 def main(config_path, metadata_path, output_path):
@@ -60,10 +69,12 @@ def main(config_path, metadata_path, output_path):
     all_stems = sorted([os.path.splitext(os.path.basename(f))[0]
                         for f in glob(os.path.join(gfp_dir, "*.npy"))])
     ex_stems = [s for s in all_stems
-                if binarize(metadata.get(s, {}).get("Exercise")) is not None]
+                if metadata.get(s, {}).get("Exercise") not in (None, "")]
 
-    label_vocab = build_label_vocab(metadata, ex_stems)
-    n_ex = max(len(label_vocab["exercise"]), 2)
+    # Use raw Exercise labels (e.g. "Stimulated"/"Unstimulated"), not binarized
+    raw_classes = sorted({metadata[s]["Exercise"] for s in ex_stems})
+    label_vocab = {"exercise": raw_classes, "perturbation": []}
+    n_ex = max(len(raw_classes), 2)
     accelerator.print(f"Exercise volumes: {len(ex_stems)}")
     accelerator.print(f"label_vocab: {label_vocab}")
     if len(ex_stems) < 2:
@@ -73,6 +84,11 @@ def main(config_path, metadata_path, output_path):
     z_range = dcfg.get("z_range", None)
     percentile_clip = tuple(dcfg.get("percentile_clip", [0.5, 99.5]))
 
+    dims = cfg["model"].get("dims", "2d")
+    patch_depth = dcfg.get("patch_depth", 32)
+    patches_per_volume = dcfg.get("patches_per_volume", 32)
+    crop_size = dcfg.get("crop_size", 256)
+
     def make_ds(stem_list, train):
         paths = [os.path.join(gfp_dir, f"{s}.npy") for s in stem_list]
         return GFPClassificationDataset(
@@ -80,7 +96,10 @@ def main(config_path, metadata_path, output_path):
             label_vocab=label_vocab,
             transform=build_transforms(cfg, train),
             z_range=z_range, apply_timm=apply_timm,
-            percentile_clip=percentile_clip)
+            percentile_clip=percentile_clip, use_raw_labels=True,
+            mode=dims, patch_depth=patch_depth,
+            patches_per_volume=(patches_per_volume if train else 8),
+            crop_size=crop_size)
 
     results = []
     epochs = tcfg.get("epochs", 30)
@@ -88,7 +107,7 @@ def main(config_path, metadata_path, output_path):
 
     for held in ex_stems:
         train_stems = [s for s in ex_stems if s != held]
-        true_label = binarize(metadata[held]["Exercise"])
+        true_label = metadata[held]["Exercise"]
         true_idx = label_vocab["exercise"].index(true_label)
 
         accelerator.print(f"\n── LOO held-out: {held} (true={true_label}) ──")
@@ -112,7 +131,31 @@ def main(config_path, metadata_path, output_path):
             model, optimizer, train_loader, val_loader)
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
 
-        # Train
+        def eval_held_out():
+            model.eval()
+            total_loss, total_n = 0.0, 0
+            probs = torch.zeros(n_ex, device=device)
+            n_slices = 0
+            with torch.no_grad():
+                for img, ex, _pt in val_loader:
+                    logits_ex, _ = model(img)
+                    if (ex != -1).any():
+                        total_loss += criterion(
+                            logits_ex, ex).item() * img.shape[0]
+                        total_n += img.shape[0]
+                    probs += logits_ex.softmax(dim=1).sum(dim=0)
+                    n_slices += img.shape[0]
+            mean_loss = total_loss / max(total_n, 1)
+            mean_probs = (probs / max(n_slices, 1)).cpu().numpy()
+            return mean_loss, mean_probs
+
+        # Train with early stopping on held-out loss (leaky at n=8, acceptable)
+        patience = tcfg.get("patience", 10)
+        min_delta = tcfg.get("min_delta", 1e-3)
+        best_val_loss = float("inf")
+        best_probs = None
+        best_epoch = 0
+        no_improve = 0
         for ep in range(epochs):
             model.train()
             losses = []
@@ -125,20 +168,25 @@ def main(config_path, metadata_path, output_path):
                 accelerator.backward(loss)
                 optimizer.step()
                 losses.append(loss.item())
+            mean_tr = float(np.mean(losses)) if losses else float("inf")
+            val_loss, probs = eval_held_out()
             if (ep + 1) % 5 == 0 or ep == epochs - 1:
                 accelerator.print(
-                    f"  ep{ep+1}/{epochs} loss={np.mean(losses):.4f}")
+                    f"  ep{ep+1}/{epochs} train={mean_tr:.4f} val={val_loss:.4f}")
+            if val_loss < best_val_loss - min_delta:
+                best_val_loss = val_loss
+                best_probs = probs
+                best_epoch = ep + 1
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    accelerator.print(
+                        f"  early stop at ep{ep+1} "
+                        f"(best_val={best_val_loss:.4f} @ ep{best_epoch})")
+                    break
 
-        # Eval on held-out volume
-        model.eval()
-        probs_accum = torch.zeros(n_ex, device=device)
-        n_slices = 0
-        with torch.no_grad():
-            for img, _ex, _pt in val_loader:
-                logits_ex, _ = model(img)
-                probs_accum += logits_ex.softmax(dim=1).sum(dim=0)
-                n_slices += img.shape[0]
-        mean_probs = (probs_accum / max(n_slices, 1)).cpu().numpy()
+        mean_probs = best_probs if best_probs is not None else probs
         pred_idx = int(mean_probs.argmax())
         pred_label = label_vocab["exercise"][pred_idx]
         correct = int(pred_idx == true_idx)
@@ -150,6 +198,8 @@ def main(config_path, metadata_path, output_path):
             "true": true_label,
             "pred": pred_label,
             "correct": correct,
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss),
             "probs": {label_vocab["exercise"][i]: float(mean_probs[i])
                       for i in range(n_ex)},
         })
