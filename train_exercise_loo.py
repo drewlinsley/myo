@@ -253,6 +253,11 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("-c", "--config", required=True)
     p.add_argument("--metadata", default="data_mapping_drew.csv")
-    p.add_argument("--output", default="results/exercise_loo.json")
+    p.add_argument("--output", default=None,
+                   help="Default: results/exercise_loo_{2d|3d}.json")
     args = p.parse_args()
+    if args.output is None:
+        _cfg = load_config(args.config)
+        _dims = _cfg["model"].get("dims", "2d")
+        args.output = f"results/exercise_loo_{_dims}.json"
     main(args.config, args.metadata, args.output)
