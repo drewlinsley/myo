@@ -12,7 +12,7 @@
 
 set -e
 
-CONFIG=configs/unet_2d_imagenet_pearson.yaml
+CONFIG=configs/unet_3d_imagenet_pearson.yaml
 METADATA=data_mapping_drew.csv
 OUT_DIR=results/classifier
 FRACTIONS=(0.05 0.1 0.25 0.5 1.0)

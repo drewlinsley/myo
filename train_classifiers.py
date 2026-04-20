@@ -38,7 +38,8 @@ from src.models.factory import build_model
 from src.utils import load_checkpoint
 from src.data.normalization import normalize
 from extract_features import (
-    load_metadata, extract_encoder_features, DATASET_LABEL_COL
+    load_metadata, extract_encoder_features, extract_encoder_features_3d,
+    DATASET_LABEL_COL,
 )
 
 
@@ -214,8 +215,17 @@ def extract_volume_features_all(cfg, checkpoint, metadata_path, no_checkpoint,
             else:
                 encoder_input = bf
 
-            feats = extract_encoder_features(model, encoder_input, device, layers,
-                                             batch_size=16, mask=bf_mask)
+            dims = cfg["model"].get("dims", "2d")
+            if dims == "3d":
+                patch_depth = cfg["data"].get("patch_depth", 32)
+                crop_size = cfg["data"].get("crop_size", 256)
+                feats = extract_encoder_features_3d(
+                    model, encoder_input, device, layers,
+                    patch_depth=patch_depth, crop_size=crop_size)
+            else:
+                feats = extract_encoder_features(
+                    model, encoder_input, device, layers,
+                    batch_size=16, mask=bf_mask)
 
             vol_feat = _pool_volume(feats, pool_method)
 

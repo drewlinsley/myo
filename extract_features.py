@@ -167,6 +167,76 @@ def extract_encoder_features(model, bf_vol, device, layers, batch_size,
     return np.concatenate(all_features, axis=0)  # (Z, D_feat)
 
 
+def extract_encoder_features_3d(model, bf_vol, device, layers,
+                                patch_depth=32, crop_size=256,
+                                stride_z=None, stride_hw=None):
+    """Patch-based feature extraction for a 3D U-Net encoder.
+
+    Extracts non-overlapping (or strided) 3D patches, runs each through
+    the encoder, global-avg-pools the requested feature maps, and returns
+    (N_patches, D_feat).  Callers pool across patches via `_pool_volume`
+    exactly like the 2D path pools across Z-slices.
+
+    Args:
+        model: 3D smp_3d U-Net (has .encoder attribute accepting (B, 1, H, W, D))
+        bf_vol: (Z, H, W) normalized float32 array
+        device: torch device
+        layers: list of encoder stage indices to concat
+        patch_depth, crop_size: patch dims (must match 32-multiples)
+        stride_z, stride_hw: grid strides (default = patch size, non-overlapping)
+
+    Returns:
+        features: (N_patches, D_feat) numpy array
+    """
+    import torch.nn.functional as F  # local import safe; F already imported above
+    Z, H, W = bf_vol.shape
+    pd, cs = patch_depth, crop_size
+    sz = stride_z if stride_z else pd
+    shw = stride_hw if stride_hw else cs
+
+    # Reflect-pad to at least one patch in every dim
+    pad_z = max(0, pd - Z)
+    pad_h = max(0, cs - H)
+    pad_w = max(0, cs - W)
+    if pad_z or pad_h or pad_w:
+        bf_vol = np.pad(bf_vol, ((0, pad_z), (0, pad_h), (0, pad_w)),
+                        mode="reflect")
+    Z, H, W = bf_vol.shape
+
+    # Grid of patch starts (inclusive of last full-size patch)
+    def grid(total, size, stride):
+        if total <= size:
+            return [0]
+        out = list(range(0, total - size + 1, stride))
+        if out[-1] != total - size:
+            out.append(total - size)
+        return out
+
+    zs = grid(Z, pd, sz)
+    ys = grid(H, cs, shw)
+    xs = grid(W, cs, shw)
+
+    all_feats = []
+    with torch.no_grad():
+        for z0 in zs:
+            for y0 in ys:
+                for x0 in xs:
+                    patch = bf_vol[z0:z0+pd, y0:y0+cs, x0:x0+cs]
+                    # (D, H, W) -> (1, 1, H, W, D) to match smp_3d BCHWD
+                    patch_t = torch.from_numpy(
+                        patch.transpose(1, 2, 0)[None, None].copy()
+                    ).float().to(device)
+                    encoder_out = model.encoder(patch_t)
+                    layer_feats = []
+                    for li in layers:
+                        feat = encoder_out[li]  # (1, C, H', W', D')
+                        pooled = F.adaptive_avg_pool3d(feat, 1).flatten(1)  # (1, C)
+                        layer_feats.append(pooled)
+                    all_feats.append(
+                        torch.cat(layer_feats, dim=1).cpu().numpy())
+    return np.concatenate(all_feats, axis=0)  # (N_patches, D_feat)
+
+
 def run_umap(features, labels, dataset_name, label_col, layer_str, output_dir,
              n_neighbors, min_dist):
     """Fit UMAP on one dataset subset and save scatter plot."""
