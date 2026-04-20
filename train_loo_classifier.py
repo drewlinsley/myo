@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 
 from src.config import load_config, validate_config
 from src.utils import set_seed, prepare_env
-from src.data.classification_dataset import GFPClassificationDataset
+from src.data.classification_dataset import GFPClassificationDataset, binarize
 from src.models.gfp_classifier import build_gfp_classifier
 from src.data import transforms as T
 from extract_features import load_metadata
@@ -86,6 +86,8 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--n_permutations", type=int, default=10000,
                    help="Number of label permutations for p-value (0 to skip)")
+    p.add_argument("--binarize", action="store_true",
+                   help="Collapse raw labels to Control/Perturbed (yes/no)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -103,17 +105,26 @@ def main():
     metadata = load_metadata(args.metadata)
     label_col = TASK_LABEL_COL[args.task]
 
+    def label_of(stem):
+        v = metadata.get(stem, {}).get(label_col)
+        if v in (None, ""):
+            return None
+        return binarize(v) if args.binarize else v
+
     # Filter to volumes with a label for this task
     all_stems = sorted([os.path.splitext(os.path.basename(f))[0]
                         for f in glob(os.path.join(mod_dir, "*.npy"))])
-    stems = [s for s in all_stems
-             if metadata.get(s, {}).get(label_col) not in (None, "")]
+    stems = [s for s in all_stems if label_of(s) is not None]
 
-    raw_classes = sorted({metadata[s][label_col] for s in stems})
+    raw_classes = sorted({label_of(s) for s in stems})
+    if args.binarize and "Control" in raw_classes:
+        raw_classes.remove("Control")
+        raw_classes = ["Control"] + raw_classes
     vocab = {"exercise": [], "perturbation": []}
     vocab[args.task] = raw_classes
     n_cls = max(len(raw_classes), 2)
     accelerator.print(f"task={args.task} input={args.input} "
+                      f"binarize={args.binarize} "
                       f"n_volumes={len(stems)} classes={raw_classes}")
     if len(stems) < 2:
         raise SystemExit(f"Need >=2 {args.task} volumes, got {len(stems)}")
@@ -129,7 +140,8 @@ def main():
             paths, stats_dir=stats_dir, metadata=metadata, label_vocab=vocab,
             transform=build_transforms(cfg, train),
             z_range=z_range, apply_timm=apply_timm,
-            percentile_clip=percentile_clip, use_raw_labels=True,
+            percentile_clip=percentile_clip,
+            use_raw_labels=not args.binarize,
             mode=dims, patch_depth=dcfg.get("patch_depth", 32),
             patches_per_volume=(dcfg.get("patches_per_volume", 32)
                                 if train else 8),
@@ -145,7 +157,7 @@ def main():
     results = []
     for held in stems:
         train_stems = [s for s in stems if s != held]
-        true_label = metadata[held][label_col]
+        true_label = label_of(held)
         true_idx = raw_classes.index(true_label)
         accelerator.print(f"\n── LOO held: {held} (true={true_label}) ──")
 
