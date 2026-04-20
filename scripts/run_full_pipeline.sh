@@ -56,30 +56,34 @@ for frac in "${FRACTIONS[@]}"; do
 done
 
 # ──────────────────────────────────────────────────────────────
-# Step 3: Run classifiers on untrained + all trained checkpoints
+# Step 3: LOO fine-tuning on BF-trained encoders
+# (BF → {Exercise, Perturbation} per encoder checkpoint)
 # ──────────────────────────────────────────────────────────────
 echo ""
 echo "########################################"
-echo "# STEP 3: Run Classifiers              #"
+echo "# STEP 3: LOO Fine-tuning (per task)   #"
 echo "########################################"
+LOO_OUT=results/loo
+mkdir -p "$LOO_OUT"
 
-# 0% baseline (untrained — BF through ImageNet encoder)
-echo "=== frac000: untrained baseline ==="
-python train_classifiers.py \
-    -c "$CONFIG" \
-    --no_checkpoint \
-    --metadata "$METADATA" \
-    --seg_tag frac000 \
-    --output "$OUT_DIR/frac000.json" \
-    --output_dir "$OUT_DIR" \
-    $EXTRA_ARGS
+# Use the matching 3D GFP-classifier config for encoder arch
+LOO_CFG=configs/gfp_classifier_3d.yaml
 
-# Trained checkpoints: BF and GFP-control variants
+# 0% baseline: no init_from, starts from ImageNet-only encoder
+for task in exercise perturbation; do
+    echo "=== frac000 LOO ($task, BF) ==="
+    python train_loo_classifier.py \
+        -c "$LOO_CFG" \
+        --metadata "$METADATA" \
+        --task "$task" --input bf \
+        --output "$LOO_OUT/frac000_${task}_bf.json"
+done
+
+# Fine-tune from each BF->GFP checkpoint
 for ckpt in ckpts/*/best.pth; do
     [ -f "$ckpt" ] || continue
     dir_name=$(basename "$(dirname "$ckpt")")
-    # Skip GFP classifier checkpoints — they're not BF->GFP U-Nets
-    if [[ "$dir_name" == gfp_classifier_* ]]; then
+    if [[ "$dir_name" == gfp_classifier* ]]; then
         continue
     fi
     if [[ "$dir_name" =~ (frac[0-9]+) ]]; then
@@ -87,34 +91,22 @@ for ckpt in ckpts/*/best.pth; do
     else
         tag="$dir_name"
     fi
-
-    echo "=== $tag: $ckpt ==="
-    python train_classifiers.py \
-        -c "$CONFIG" \
-        --checkpoint "$ckpt" \
-        --metadata "$METADATA" \
-        --seg_tag "$tag" \
-        --output "$OUT_DIR/${tag}.json" \
-        --output_dir "$OUT_DIR" \
-        $EXTRA_ARGS
-
-    echo "=== ${tag}_gfp: GFP through trained encoder ==="
-    python train_classifiers.py \
-        -c "$CONFIG" \
-        --checkpoint "$ckpt" \
-        --gfp_control \
-        --metadata "$METADATA" \
-        --seg_tag "${tag}_gfp" \
-        --output "$OUT_DIR/${tag}_gfp.json" \
-        --output_dir "$OUT_DIR" \
-        $EXTRA_ARGS
+    for task in exercise perturbation; do
+        echo "=== $tag LOO ($task, BF, init=$ckpt) ==="
+        python train_loo_classifier.py \
+            -c "$LOO_CFG" \
+            --metadata "$METADATA" \
+            --task "$task" --input bf \
+            --init_from "$ckpt" \
+            --output "$LOO_OUT/${tag}_${task}_bf.json"
+    done
 done
 
-# Scaling plot
-echo "=== Plotting scaling curve ==="
-python plot_classification_scaling.py \
-    --results_dir "$OUT_DIR" \
-    --output "$OUT_DIR/classification_scaling.png"
+# Scaling plot: LOO accuracy vs BF->GFP training fraction
+echo "=== Plotting LOO scaling curve ==="
+python plot_loo_scaling.py \
+    --results_dir "$LOO_OUT" --input bf \
+    --output "$OUT_DIR/loo_scaling_bf.png"
 
 echo ""
 echo "Pipeline complete! Results in $OUT_DIR/"

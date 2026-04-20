@@ -41,7 +41,7 @@ class GFPClassificationDataset(Dataset):
                  transform=None, z_range=None, apply_timm=True,
                  percentile_clip=(0.5, 99.5), use_raw_labels=False,
                  mode="2d", patch_depth=32, patches_per_volume=32,
-                 crop_size=256):
+                 crop_size=256, modality="gfp"):
         self.gfp_files = gfp_files
         self.stats_dir = stats_dir
         self.metadata = metadata
@@ -54,6 +54,7 @@ class GFPClassificationDataset(Dataset):
         self.patch_depth = patch_depth
         self.patches_per_volume = patches_per_volume
         self.crop_size = crop_size
+        self.modality = modality  # "gfp" or "bf" — selects stats key
 
         # Load stats and compute per-volume labels
         self.stats = []
@@ -103,7 +104,8 @@ class GFPClassificationDataset(Dataset):
             z_hi = min(gfp_raw.shape[0], self.z_range[1])
             gfp_raw = gfp_raw[z_lo:z_hi]
         st = self.stats[file_idx]
-        gfp = normalize(gfp_raw, st["gfp"]["p_low"], st["gfp"]["p_high"],
+        gfp = normalize(gfp_raw, st[self.modality]["p_low"],
+                        st[self.modality]["p_high"],
                         apply_timm=self.apply_timm)
         self._cache[file_idx] = gfp
         return gfp
