@@ -79,8 +79,8 @@ for task in exercise perturbation; do
         --output "$LOO_OUT/frac000_${task}_bf.json"
 done
 
-# Fine-tune from each BF->GFP checkpoint
-for ckpt in ckpts/*/best.pth; do
+# Fine-tune from each BF->GFP checkpoint (Step 2 outputs only; must match LOO_CFG dims)
+for ckpt in ckpts/*frac*/best.pth; do
     [ -f "$ckpt" ] || continue
     dir_name=$(basename "$(dirname "$ckpt")")
     if [[ "$dir_name" == gfp_classifier* ]]; then

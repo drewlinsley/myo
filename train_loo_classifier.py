@@ -63,8 +63,13 @@ def load_encoder_from_unet(classifier, ckpt_path, device):
     state = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
     encoder_state = {k[len("encoder."):]: v for k, v in state.items()
                      if k.startswith("encoder.")}
-    missing, unexpected = classifier.encoder.load_state_dict(
+    result = classifier.encoder.load_state_dict(
         encoder_state, strict=False)
+    if result is None:
+        raise RuntimeError(
+            f"encoder.load_state_dict returned None for {ckpt_path}; "
+            "likely shape mismatch (2D ckpt into 3D encoder or vice versa)")
+    missing, unexpected = result
     return len(encoder_state), len(missing), len(unexpected)
 
 
