@@ -84,6 +84,8 @@ def main():
     p.add_argument("--init_from", default=None,
                    help="Optional U-Net checkpoint to initialize encoder")
     p.add_argument("--output", required=True)
+    p.add_argument("--n_permutations", type=int, default=10000,
+                   help="Number of label permutations for p-value (0 to skip)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -248,10 +250,34 @@ def main():
         per_class[r["true"]]["total"] += 1
         per_class[r["true"]]["correct"] += r["correct"]
 
+    perm_info = None
+    if args.n_permutations and len(results) > 1:
+        rng = np.random.default_rng(0)
+        true_labels = np.array([r["true"] for r in results])
+        pred_labels = np.array([r["pred"] for r in results])
+        perm_accs = np.empty(args.n_permutations, dtype=float)
+        for i in range(args.n_permutations):
+            shuffled = rng.permutation(true_labels)
+            perm_accs[i] = float(np.mean(shuffled == pred_labels))
+        n_ge = int(np.sum(perm_accs >= acc))
+        p_value = (n_ge + 1) / (args.n_permutations + 1)
+        perm_info = {
+            "n_permutations": int(args.n_permutations),
+            "p_value": float(p_value),
+            "perm_mean": float(perm_accs.mean()),
+            "perm_std": float(perm_accs.std()),
+            "n_ge_observed": n_ge,
+        }
+        accelerator.print(
+            f"Permutation test: p={p_value:.4f} "
+            f"(perm mean={perm_accs.mean():.3f} "
+            f"std={perm_accs.std():.3f}, n_ge={n_ge}/{args.n_permutations})")
+
     summary = {
         "task": args.task, "input": args.input,
         "init_from": args.init_from,
         "n_volumes": len(results), "overall_accuracy": acc,
+        "permutation_test": perm_info,
         "classes": raw_classes,
         "per_class": {c: {**v,
                           "accuracy": v["correct"] / max(v["total"], 1)}
