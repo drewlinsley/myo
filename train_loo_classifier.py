@@ -63,12 +63,26 @@ def load_encoder_from_unet(classifier, ckpt_path, device):
     state = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
     encoder_state = {k[len("encoder."):]: v for k, v in state.items()
                      if k.startswith("encoder.")}
+    if not encoder_state:
+        raise RuntimeError(f"No encoder.* keys found in {ckpt_path}")
+    # Detect 2D vs 3D from any conv weight (4D = 2D conv, 5D = 3D conv).
+    sample_conv = next((v for k, v in encoder_state.items()
+                        if "conv" in k.lower() and v.ndim >= 4), None)
+    if sample_conv is not None:
+        ckpt_dims = "3d" if sample_conv.ndim == 5 else "2d"
+        cls_sample = next((p for n, p in classifier.encoder.named_parameters()
+                           if "conv" in n.lower() and p.ndim >= 4), None)
+        cls_dims = ("3d" if cls_sample.ndim == 5 else "2d") if cls_sample is not None else "?"
+        if ckpt_dims != cls_dims:
+            raise RuntimeError(
+                f"Dim mismatch: ckpt {ckpt_path} is {ckpt_dims} but classifier "
+                f"encoder is {cls_dims}. Use a checkpoint matching the LOO config.")
     result = classifier.encoder.load_state_dict(
         encoder_state, strict=False)
     if result is None:
         raise RuntimeError(
             f"encoder.load_state_dict returned None for {ckpt_path}; "
-            "likely shape mismatch (2D ckpt into 3D encoder or vice versa)")
+            "likely shape mismatch despite matching dims")
     missing, unexpected = result
     return len(encoder_state), len(missing), len(unexpected)
 
@@ -88,13 +102,16 @@ def main():
                    help="Number of label permutations for p-value (0 to skip)")
     p.add_argument("--binarize", action="store_true",
                    help="Collapse raw labels to Control/Perturbed (yes/no)")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Override config seed for reproducibility / SE runs")
     args = p.parse_args()
 
     cfg = load_config(args.config)
     cfg = validate_config(cfg)
     tcfg = cfg["training"]
     dcfg = cfg["data"]
-    set_seed(cfg.get("seed", 42))
+    seed = args.seed if args.seed is not None else cfg.get("seed", 42)
+    set_seed(seed)
     accelerator, device, tqdm = prepare_env(
         mixed_precision=tcfg.get("mixed_precision", False))
 
@@ -288,6 +305,7 @@ def main():
     summary = {
         "task": args.task, "input": args.input,
         "init_from": args.init_from,
+        "seed": int(seed),
         "n_volumes": len(results), "overall_accuracy": acc,
         "permutation_test": perm_info,
         "classes": raw_classes,

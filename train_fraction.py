@@ -30,9 +30,17 @@ from src.data.datasets import SliceDataset, VolumeDataset
 # Reuse helpers from train.py
 from train import build_transforms, build_scheduler, save_val_montages
 
+HOLDOUT_LABEL_COL = {"exercise": "Exercise", "perturbation": "Perturbation"}
 
-def build_datasets_with_fraction(cfg, fraction, seed=42):
-    """Build train/val datasets, subsampling training volumes to `fraction`."""
+
+def build_datasets_with_fraction(cfg, fraction, seed=42, holdout=None,
+                                 metadata_path=None):
+    """Build train/val datasets, subsampling training volumes to `fraction`.
+
+    If `holdout` is one of {"exercise", "perturbation"}, volumes that have a
+    non-empty label for that task are excluded from BOTH train and val (they
+    become a downstream test set evaluated separately).
+    """
     dcfg = cfg["data"]
     data_dir = dcfg["data_dir"]
     stats_dir = os.path.join(data_dir, "stats")
@@ -43,6 +51,20 @@ def build_datasets_with_fraction(cfg, fraction, seed=42):
     assert len(bf_files) > 0, f"No .npy files found in {bf_dir}"
 
     stems = [os.path.splitext(os.path.basename(f))[0] for f in bf_files]
+
+    heldout_stems = []
+    if holdout and holdout != "none":
+        from extract_features import load_metadata
+        if metadata_path is None:
+            raise ValueError("metadata_path required when holdout is set")
+        metadata = load_metadata(metadata_path)
+        col = HOLDOUT_LABEL_COL[holdout]
+        heldout_stems = sorted(
+            s for s in stems
+            if metadata.get(s, {}).get(col) not in (None, ""))
+        stems = [s for s in stems if s not in set(heldout_stems)]
+        print(f"[holdout={holdout}] excluded {len(heldout_stems)} labeled vols "
+              f"from train+val; {len(stems)} remain")
 
     # Fixed train/val split (identical across fractions)
     train_stems, val_stems = make_train_val_split(
@@ -106,16 +128,20 @@ def build_datasets_with_fraction(cfg, fraction, seed=42):
         **common_kwargs, **extra_kwargs,
     )
 
-    return train_ds, val_ds, train_stems, val_stems
+    return train_ds, val_ds, train_stems, val_stems, heldout_stems
 
 
-def main(config_path, fraction, resume_from=None):
+def main(config_path, fraction, resume_from=None, holdout=None,
+         metadata_path=None):
     cfg = load_config(config_path)
     cfg = validate_config(cfg)
 
     tcfg = cfg["training"]
     experiment_name = cfg.get("experiment_name", "default")
     frac_tag = f"frac{int(fraction * 100):03d}"
+    hold_tag = ""
+    if holdout and holdout != "none":
+        hold_tag = "_holdEx" if holdout == "exercise" else "_holdPt"
 
     set_seed(cfg.get("seed", 42))
 
@@ -125,20 +151,30 @@ def main(config_path, fraction, resume_from=None):
     accelerator.print(f"Experiment: {experiment_name} [{frac_tag}]")
     accelerator.print(f"Training fraction: {fraction:.0%}")
 
-    # Checkpoint dir includes fraction tag
-    ckpt_dir = os.path.join(tcfg["checkpoint_dir"] + f"_{frac_tag}")
+    # Checkpoint dir includes fraction tag (and holdout suffix when set)
+    ckpt_dir = os.path.join(tcfg["checkpoint_dir"] + f"_{frac_tag}{hold_tag}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
     shutil.copy2(config_path, os.path.join(ckpt_dir, "config.yaml"))
 
     # Datasets
-    train_ds, val_ds, train_stems, val_stems = build_datasets_with_fraction(
-        cfg, fraction, seed=cfg.get("seed", 42))
+    train_ds, val_ds, train_stems, val_stems, heldout_stems = (
+        build_datasets_with_fraction(
+            cfg, fraction, seed=cfg.get("seed", 42),
+            holdout=holdout, metadata_path=metadata_path))
     accelerator.print(f"Train: {len(train_ds)} samples ({len(train_stems)} volumes), "
-                      f"Val: {len(val_ds)} samples ({len(val_stems)} volumes)")
+                      f"Val: {len(val_ds)} samples ({len(val_stems)} volumes), "
+                      f"Heldout: {len(heldout_stems)} volumes")
 
     with open(os.path.join(ckpt_dir, "split.json"), "w") as f:
-        json.dump({"train": train_stems, "val": val_stems, "fraction": fraction}, f, indent=2)
+        json.dump({"train": train_stems, "val": val_stems,
+                   "fraction": fraction}, f, indent=2)
+
+    # Sidecar file describing the held-out task vols (for downstream eval).
+    if holdout and holdout != "none":
+        with open(os.path.join(ckpt_dir, "heldout_stems.json"), "w") as f:
+            json.dump({"holdout": holdout, "fraction": fraction,
+                       "heldout_stems": heldout_stems}, f, indent=2)
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=tcfg["batch_size"],
@@ -277,5 +313,11 @@ if __name__ == "__main__":
                         help="Fraction of training data to use (0.0-1.0)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
+    parser.add_argument("--holdout", choices=["none", "exercise", "perturbation"],
+                        default="none",
+                        help="Exclude vols labeled for this task from train+val")
+    parser.add_argument("--metadata", default="data_mapping_drew.csv",
+                        help="Metadata CSV (required when --holdout != none)")
     args = parser.parse_args()
-    main(args.config, args.fraction, args.resume)
+    main(args.config, args.fraction, args.resume,
+         holdout=args.holdout, metadata_path=args.metadata)

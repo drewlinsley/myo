@@ -79,13 +79,10 @@ for task in exercise perturbation; do
         --output "$LOO_OUT/frac000_${task}_bf.json"
 done
 
-# Fine-tune from each BF->GFP checkpoint (Step 2 outputs only; must match LOO_CFG dims)
-for ckpt in ckpts/*frac*/best.pth; do
+# Fine-tune from each BF->GFP checkpoint (3D U-Nets only; must match LOO_CFG dims)
+for ckpt in ckpts/unet_3d_*frac*/best.pth; do
     [ -f "$ckpt" ] || continue
     dir_name=$(basename "$(dirname "$ckpt")")
-    if [[ "$dir_name" == gfp_classifier* ]]; then
-        continue
-    fi
     if [[ "$dir_name" =~ (frac[0-9]+) ]]; then
         tag="${BASH_REMATCH[1]}"
     else
