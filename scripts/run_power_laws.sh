@@ -27,7 +27,7 @@ mkdir -p "$LOO_OUT" "$METRICS_OUT" "$PLOT_OUT"
 # fraction -> 3-char pct (matches train_fraction.py naming)
 declare -A PCT=( [0.05]=005 [0.10]=010 [0.25]=025 [0.50]=050 [1.00]=100 )
 FRACS=(0.05 0.10 0.25 0.50 1.00)
-SEEDS=(0 1 2 3 4 5 6 7 8 9)
+read -r -a SEEDS <<< "${SEEDS:-0}"   # default 1 seed; SEEDS="0 1 2 3 4" to override
 
 skip_if_done() {
   local out="$1"
