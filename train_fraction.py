@@ -156,6 +156,10 @@ def main(config_path, fraction, resume_from=None, holdout=None,
     os.makedirs(ckpt_dir, exist_ok=True)
 
     shutil.copy2(config_path, os.path.join(ckpt_dir, "config.yaml"))
+    # Also copy any inherited base.yaml so the ckpt dir is self-contained.
+    src_base = os.path.join(os.path.dirname(config_path), "base.yaml")
+    if os.path.exists(src_base):
+        shutil.copy2(src_base, os.path.join(ckpt_dir, "base.yaml"))
 
     # Datasets
     train_ds, val_ds, train_stems, val_stems, heldout_stems = (

@@ -12,6 +12,7 @@ Usage:
 """
 
 import os
+import re
 import json
 import argparse
 
@@ -26,6 +27,34 @@ from src.metrics import mae as mae_metric, ssim as ssim_metric, pearson_corr
 from predict import predict_3d, predict_2d
 
 
+def resolve_config_path(ckpt_dir, override=None):
+    """Pick a loadable config.
+
+    Order:
+    1. --config override
+    2. {ckpt_dir}/config.yaml IF it loads (i.e., its `base:` resolves)
+    3. configs/<experiment>.yaml derived from the ckpt dir basename
+       (strips trailing `_frac\\d+(_hold(Ex|Pt))?`)
+    """
+    if override:
+        return override
+    copy = os.path.join(ckpt_dir, "config.yaml")
+    if os.path.exists(copy):
+        try:
+            load_config(copy)
+            return copy
+        except FileNotFoundError:
+            pass
+    name = re.sub(r"_frac\d+(_hold(?:Ex|Pt))?$",
+                  "", os.path.basename(ckpt_dir))
+    candidate = os.path.join("configs", f"{name}.yaml")
+    if os.path.exists(candidate):
+        return candidate
+    raise SystemExit(
+        f"Could not resolve config for {ckpt_dir}. Tried {copy} and "
+        f"{candidate}. Pass --config explicitly.")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True, help="Path to best.pth")
@@ -35,7 +64,7 @@ def main():
     args = p.parse_args()
 
     ckpt_dir = os.path.dirname(args.ckpt)
-    config_path = args.config or os.path.join(ckpt_dir, "config.yaml")
+    config_path = resolve_config_path(ckpt_dir, args.config)
     sidecar_path = os.path.join(ckpt_dir, "heldout_stems.json")
     if not os.path.exists(sidecar_path):
         raise SystemExit(f"Missing {sidecar_path}; this ckpt was not trained "
