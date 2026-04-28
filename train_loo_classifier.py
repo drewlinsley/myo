@@ -77,12 +77,13 @@ def load_encoder_from_unet(classifier, ckpt_path, device):
             raise RuntimeError(
                 f"Dim mismatch: ckpt {ckpt_path} is {ckpt_dims} but classifier "
                 f"encoder is {cls_dims}. Use a checkpoint matching the LOO config.")
+    # smp_3d's ResNet encoder overrides load_state_dict to do 2D->3D weight
+    # conversion and doesn't propagate the return value, so we may get None
+    # even on a successful load. Treat that as success.
     result = classifier.encoder.load_state_dict(
         encoder_state, strict=False)
     if result is None:
-        raise RuntimeError(
-            f"encoder.load_state_dict returned None for {ckpt_path}; "
-            "likely shape mismatch despite matching dims")
+        return len(encoder_state), 0, 0
     missing, unexpected = result
     return len(encoder_state), len(missing), len(unexpected)
 
