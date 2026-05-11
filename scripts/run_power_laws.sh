@@ -28,6 +28,8 @@ mkdir -p "$LOO_OUT" "$METRICS_OUT" "$PLOT_OUT"
 declare -A PCT=( [0.05]=005 [0.10]=010 [0.25]=025 [0.50]=050 [1.00]=100 )
 FRACS=(0.05 0.10 0.25 0.50 1.00)
 read -r -a SEEDS <<< "${SEEDS:-0}"   # default 1 seed; SEEDS="0 1 2 3 4" to override
+# CV granularity (volume/replicate/date). Defaults run all three.
+read -r -a CV_UNITS <<< "${CV_UNITS:-volume replicate date}"
 
 skip_if_done() {
   local out="$1"
@@ -46,15 +48,25 @@ echo "########################################"
 echo "# STAGE 1: frac=0 LOO baselines        #"
 echo "########################################"
 for HOLD in exercise perturbation; do
-  for S in "${SEEDS[@]}"; do
-    OUT="$LOO_OUT/frac000_${HOLD}_bf_seed${S}.json"
-    skip_if_done "$OUT" && continue
-    echo "=== frac000 LOO ($HOLD, seed=$S) ==="
-    python train_loo_classifier.py \
-      -c "$CFG_LOO" --metadata "$METADATA" \
-      --task "$HOLD" --input bf --binarize \
-      --seed "$S" --output "$OUT" \
-      $EXTRA_ARGS
+  for CV in "${CV_UNITS[@]}"; do
+    if [ "$HOLD" = exercise ] && [ "$CV" = date ]; then
+      echo "skip: cv=date not valid for exercise (single date)"
+      continue
+    fi
+    for S in "${SEEDS[@]}"; do
+      if [ "$CV" = volume ]; then
+        OUT="$LOO_OUT/frac000_${HOLD}_bf_seed${S}.json"
+      else
+        OUT="$LOO_OUT/frac000_${HOLD}_bf_cv-${CV}_seed${S}.json"
+      fi
+      skip_if_done "$OUT" && continue
+      echo "=== frac000 LOO ($HOLD, cv=$CV, seed=$S) ==="
+      python train_loo_classifier.py \
+        -c "$CFG_LOO" --metadata "$METADATA" \
+        --task "$HOLD" --input bf --binarize \
+        --cv_unit "$CV" --seed "$S" --output "$OUT" \
+        $EXTRA_ARGS
+    done
   done
 done
 
@@ -88,15 +100,26 @@ for HOLD in exercise perturbation; do
       python eval_bfgfp_metrics.py --ckpt "$CKPT" --output "$METRICS_JSON"
     fi
 
-    for S in "${SEEDS[@]}"; do
-      OUT="$LOO_OUT/${TAG}_frac${P}_${HOLD}_bf_seed${S}.json"
-      skip_if_done "$OUT" && continue
-      echo "=== LOO ${TAG} frac=$F ($HOLD, seed=$S) ==="
-      python train_loo_classifier.py \
-        -c "$CFG_LOO" --metadata "$METADATA" \
-        --task "$HOLD" --input bf --binarize \
-        --init_from "$CKPT" --seed "$S" --output "$OUT" \
-        $EXTRA_ARGS
+    for CV in "${CV_UNITS[@]}"; do
+      if [ "$HOLD" = exercise ] && [ "$CV" = date ]; then
+        echo "skip: cv=date not valid for exercise (single date)"
+        continue
+      fi
+      for S in "${SEEDS[@]}"; do
+        if [ "$CV" = volume ]; then
+          OUT="$LOO_OUT/${TAG}_frac${P}_${HOLD}_bf_seed${S}.json"
+        else
+          OUT="$LOO_OUT/${TAG}_frac${P}_${HOLD}_bf_cv-${CV}_seed${S}.json"
+        fi
+        skip_if_done "$OUT" && continue
+        echo "=== LOO ${TAG} frac=$F ($HOLD, cv=$CV, seed=$S) ==="
+        python train_loo_classifier.py \
+          -c "$CFG_LOO" --metadata "$METADATA" \
+          --task "$HOLD" --input bf --binarize \
+          --init_from "$CKPT" --cv_unit "$CV" \
+          --seed "$S" --output "$OUT" \
+          $EXTRA_ARGS
+      done
     done
   done
 done

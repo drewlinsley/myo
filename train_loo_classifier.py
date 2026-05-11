@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt
 from src.config import load_config, validate_config
 from src.utils import set_seed, prepare_env
 from src.data.classification_dataset import GFPClassificationDataset, binarize
+from src.data.grouping import stem_to_group
 from src.models.gfp_classifier import build_gfp_classifier
 from src.data import transforms as T
 from extract_features import load_metadata
@@ -105,6 +106,9 @@ def main():
                    help="Collapse raw labels to Control/Perturbed (yes/no)")
     p.add_argument("--seed", type=int, default=None,
                    help="Override config seed for reproducibility / SE runs")
+    p.add_argument("--cv_unit", choices=["volume", "replicate", "date"],
+                   default="volume",
+                   help="Leave-one-group-out unit; volume = original behavior")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -142,10 +146,33 @@ def main():
     vocab[args.task] = raw_classes
     n_cls = max(len(raw_classes), 2)
     accelerator.print(f"task={args.task} input={args.input} "
-                      f"binarize={args.binarize} "
+                      f"binarize={args.binarize} cv_unit={args.cv_unit} "
                       f"n_volumes={len(stems)} classes={raw_classes}")
     if len(stems) < 2:
         raise SystemExit(f"Need >=2 {args.task} volumes, got {len(stems)}")
+
+    # Group stems by CV unit (volume = current LOO behavior).
+    groups = {}
+    for s in stems:
+        g = stem_to_group(s, metadata, args.cv_unit, args.task)
+        if g is None:
+            accelerator.print(
+                f"  skip {s}: no group id for cv_unit={args.cv_unit}")
+            continue
+        groups.setdefault(g, []).append(s)
+    if len(groups) < 2:
+        raise SystemExit(
+            f"cv_unit={args.cv_unit} produced {len(groups)} group(s) for "
+            f"task={args.task}; need >= 2.")
+    for g, members in groups.items():
+        glabels = {label_of(s) for s in members}
+        if len(glabels) > 1:
+            raise SystemExit(
+                f"Group {g} mixes labels {glabels}; group-LOO requires "
+                "label-homogeneous groups.")
+    accelerator.print(
+        f"  groups ({len(groups)}): "
+        + ", ".join(f"{g}[n={len(v)}]" for g, v in groups.items()))
 
     apply_timm = cfg["model"].get("encoder_weights") is not None
     z_range = dcfg.get("z_range", None)
@@ -173,11 +200,13 @@ def main():
     n_pt = n_cls if args.task == "perturbation" else 2
 
     results = []
-    for held in stems:
-        train_stems = [s for s in stems if s != held]
-        true_label = label_of(held)
+    for held_g, held_stems in groups.items():
+        train_stems = [s for g, ss in groups.items() if g != held_g for s in ss]
+        true_label = label_of(held_stems[0])  # homogeneous (validated above)
         true_idx = raw_classes.index(true_label)
-        accelerator.print(f"\n── LOO held: {held} (true={true_label}) ──")
+        accelerator.print(
+            f"\n── LOO group: {held_g} (n={len(held_stems)}, "
+            f"true={true_label}) ──")
 
         model = build_gfp_classifier(cfg, n_ex, n_pt)
         if args.init_from:
@@ -197,7 +226,7 @@ def main():
             shuffle=True, drop_last=True,
             num_workers=tcfg.get("num_workers", 4), pin_memory=True)
         val_loader = torch.utils.data.DataLoader(
-            make_ds([held], False), batch_size=tcfg["batch_size"],
+            make_ds(held_stems, False), batch_size=tcfg["batch_size"],
             shuffle=False, num_workers=tcfg.get("num_workers", 4))
 
         model, optimizer, train_loader, val_loader = accelerator.prepare(
@@ -268,7 +297,8 @@ def main():
         accelerator.print(
             f"  pred={pred} (p={pred_probs[pred_idx]:.3f}) correct={correct}")
         results.append({
-            "stem": held, "true": true_label, "pred": pred,
+            "group": held_g, "stems": held_stems,
+            "true": true_label, "pred": pred,
             "correct": correct, "best_epoch": best_epoch,
             "best_val_loss": float(best_val),
             "probs": {raw_classes[i]: float(pred_probs[i])
@@ -303,24 +333,36 @@ def main():
             f"(perm mean={perm_accs.mean():.3f} "
             f"std={perm_accs.std():.3f}, n_ge={n_ge}/{args.n_permutations})")
 
+    n_vols_total = sum(len(r["stems"]) for r in results)
     summary = {
         "task": args.task, "input": args.input,
         "init_from": args.init_from,
         "seed": int(seed),
-        "n_volumes": len(results), "overall_accuracy": acc,
+        "cv_unit": args.cv_unit,
+        "n_groups": len(results),
+        "n_volumes": n_vols_total,
+        "overall_accuracy": acc,
         "permutation_test": perm_info,
         "classes": raw_classes,
         "per_class": {c: {**v,
                           "accuracy": v["correct"] / max(v["total"], 1)}
                       for c, v in per_class.items()},
-        "per_volume": results,
+        "per_group": results,
     }
+    if args.cv_unit == "volume":
+        # Back-compat: also expose per_volume with the original key shape
+        summary["per_volume"] = [
+            {"stem": r["stems"][0], "true": r["true"], "pred": r["pred"],
+             "correct": r["correct"], "best_epoch": r["best_epoch"],
+             "best_val_loss": r["best_val_loss"], "probs": r["probs"]}
+            for r in results]
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
         json.dump(summary, f, indent=2)
     accelerator.print(
         f"\nLOO acc: {acc:.3f} "
-        f"({sum(r['correct'] for r in results)}/{len(results)})")
+        f"({sum(r['correct'] for r in results)}/{len(results)} groups, "
+        f"cv_unit={args.cv_unit})")
     accelerator.print(f"Saved {args.output}")
 
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -334,7 +376,7 @@ def main():
     ax.axhline(1.0 / len(raw_classes), color="gray", linestyle=":")
     ax.set_ylim(0, 1.15)
     ax.set_ylabel("Accuracy")
-    ax.set_title(f"{args.task} LOO | input={args.input} | "
+    ax.set_title(f"{args.task} LOO ({args.cv_unit}) | input={args.input} | "
                  f"init={'scratch' if not args.init_from else os.path.basename(os.path.dirname(args.init_from))}")
     fig.tight_layout()
     plot_path = os.path.splitext(args.output)[0] + ".png"
