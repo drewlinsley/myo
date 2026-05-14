@@ -106,9 +106,10 @@ def main():
                    help="Collapse raw labels to Control/Perturbed (yes/no)")
     p.add_argument("--seed", type=int, default=None,
                    help="Override config seed for reproducibility / SE runs")
-    p.add_argument("--cv_unit", choices=["volume", "replicate", "date"],
+    p.add_argument("--cv_unit", choices=["volume", "replicate"],
                    default="volume",
-                   help="Leave-one-group-out unit; volume = original behavior")
+                   help="Leave-one-group-out unit; replicate groups by "
+                        "(label, Tissue) per colleague's recommendation")
     args = p.parse_args()
 
     cfg = load_config(args.config)

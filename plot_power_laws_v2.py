@@ -23,8 +23,8 @@ from matplotlib.lines import Line2D
 
 FRAC_RE = re.compile(r"frac(\d{3})")
 
-CV_LINESTYLE = {"volume": "-", "replicate": "--", "date": ":"}
-CV_MARKER = {"volume": "o", "replicate": "s", "date": "^"}
+CV_LINESTYLE = {"volume": "-", "replicate": "--"}
+CV_MARKER = {"volume": "o", "replicate": "s"}
 TASK_COLOR = {"exercise": "#3cb44b", "perturbation": "#e6194b"}
 
 
@@ -146,7 +146,7 @@ def main():
     cv_handles = [Line2D([0], [0], color="black",
                          linestyle=CV_LINESTYLE[cv], marker=CV_MARKER[cv],
                          linewidth=2, label=cv)
-                  for cv in ["volume", "replicate", "date"] if cv in seen_cvs]
+                  for cv in ["volume", "replicate"] if cv in seen_cvs]
     chance = Line2D([0], [0], color="gray", linestyle=":",
                     label="chance (binary)")
     legend1 = ax.legend(handles=task_handles + [chance],

@@ -28,8 +28,8 @@ mkdir -p "$LOO_OUT" "$METRICS_OUT" "$PLOT_OUT"
 declare -A PCT=( [0.05]=005 [0.10]=010 [0.25]=025 [0.50]=050 [1.00]=100 )
 FRACS=(0.05 0.10 0.25 0.50 1.00)
 read -r -a SEEDS <<< "${SEEDS:-0}"   # default 1 seed; SEEDS="0 1 2 3 4" to override
-# CV granularity (volume/replicate/date). Defaults run all three.
-read -r -a CV_UNITS <<< "${CV_UNITS:-volume replicate date}"
+# CV granularity (volume/replicate). Default runs both.
+read -r -a CV_UNITS <<< "${CV_UNITS:-volume replicate}"
 
 skip_if_done() {
   local out="$1"
@@ -49,10 +49,6 @@ echo "# STAGE 1: frac=0 LOO baselines        #"
 echo "########################################"
 for HOLD in exercise perturbation; do
   for CV in "${CV_UNITS[@]}"; do
-    if [ "$HOLD" = exercise ] && [ "$CV" = date ]; then
-      echo "skip: cv=date not valid for exercise (single date)"
-      continue
-    fi
     for S in "${SEEDS[@]}"; do
       if [ "$CV" = volume ]; then
         OUT="$LOO_OUT/frac000_${HOLD}_bf_seed${S}.json"
@@ -101,10 +97,6 @@ for HOLD in exercise perturbation; do
     fi
 
     for CV in "${CV_UNITS[@]}"; do
-      if [ "$HOLD" = exercise ] && [ "$CV" = date ]; then
-        echo "skip: cv=date not valid for exercise (single date)"
-        continue
-      fi
       for S in "${SEEDS[@]}"; do
         if [ "$CV" = volume ]; then
           OUT="$LOO_OUT/${TAG}_frac${P}_${HOLD}_bf_seed${S}.json"
