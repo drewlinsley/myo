@@ -12,47 +12,18 @@ Usage:
 """
 
 import os
-import re
 import json
 import argparse
 
 import numpy as np
 import torch
 
-from src.config import load_config
+from src.config import load_config, resolve_ckpt_config
 from src.utils import prepare_env, load_checkpoint
 from src.models import build_model
 from src.data.normalization import normalize
 from src.metrics import mae as mae_metric, ssim as ssim_metric, pearson_corr
 from predict import predict_3d, predict_2d
-
-
-def resolve_config_path(ckpt_dir, override=None):
-    """Pick a loadable config.
-
-    Order:
-    1. --config override
-    2. {ckpt_dir}/config.yaml IF it loads (i.e., its `base:` resolves)
-    3. configs/<experiment>.yaml derived from the ckpt dir basename
-       (strips trailing `_frac\\d+(_hold(Ex|Pt))?`)
-    """
-    if override:
-        return override
-    copy = os.path.join(ckpt_dir, "config.yaml")
-    if os.path.exists(copy):
-        try:
-            load_config(copy)
-            return copy
-        except FileNotFoundError:
-            pass
-    name = re.sub(r"_frac\d+(_hold(?:Ex|Pt))?$",
-                  "", os.path.basename(ckpt_dir))
-    candidate = os.path.join("configs", f"{name}.yaml")
-    if os.path.exists(candidate):
-        return candidate
-    raise SystemExit(
-        f"Could not resolve config for {ckpt_dir}. Tried {copy} and "
-        f"{candidate}. Pass --config explicitly.")
 
 
 def main():
@@ -64,7 +35,7 @@ def main():
     args = p.parse_args()
 
     ckpt_dir = os.path.dirname(args.ckpt)
-    config_path = resolve_config_path(ckpt_dir, args.config)
+    config_path = resolve_ckpt_config(ckpt_dir, args.config)
     sidecar_path = os.path.join(ckpt_dir, "heldout_stems.json")
     if not os.path.exists(sidecar_path):
         raise SystemExit(f"Missing {sidecar_path}; this ckpt was not trained "

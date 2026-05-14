@@ -41,23 +41,18 @@ if [ -z "$CKPT" ] || [ ! -f "$CKPT" ]; then
   exit 1
 fi
 
-CKPT_DIR=$(dirname "$CKPT")
-CFG="${CFG:-$CKPT_DIR/config.yaml}"
-# Fall back to the canonical config if the in-ckpt copy can't resolve `base:`.
-if [ ! -f "$CFG" ]; then
-  case "$(basename "$CKPT_DIR")" in
-    *imagenet_pearson*) CFG=configs/unet_3d_imagenet_pearson.yaml ;;
-    *imagenet*)         CFG=configs/unet_3d_imagenet.yaml ;;
-    *random*)           CFG=configs/unet_3d_random.yaml ;;
-    *)                  CFG=configs/unet_3d_imagenet_pearson.yaml ;;
-  esac
-fi
-
 echo "Checkpoint : $CKPT"
-echo "Config     : $CFG"
+if [ -n "$CFG" ]; then
+  echo "Config     : $CFG (override)"
+else
+  echo "Config     : auto-resolved by predict_per_slice.py"
+fi
 echo "Output dir : $OUT"
 
-ARGS=(-c "$CFG" --checkpoint "$CKPT" --output_dir "$OUT")
+ARGS=(--checkpoint "$CKPT" --output_dir "$OUT")
+if [ -n "$CFG" ]; then
+  ARGS=(-c "$CFG" "${ARGS[@]}")
+fi
 if [ -n "$STEMS" ]; then ARGS+=(--stems $STEMS); fi
 if [ -n "$DENORM" ]; then ARGS+=(--denormalize); fi
 

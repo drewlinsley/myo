@@ -22,7 +22,7 @@ from glob import glob
 import numpy as np
 import torch
 
-from src.config import load_config
+from src.config import load_config, resolve_ckpt_config
 from src.utils import prepare_env, load_checkpoint
 from src.models import build_model
 from src.data.normalization import normalize, denormalize
@@ -31,7 +31,9 @@ from predict import predict_2d, predict_3d
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("-c", "--config", required=True)
+    p.add_argument("-c", "--config", default=None,
+                   help="Optional; defaults to <ckpt_dir>/config.yaml with "
+                        "fallback to configs/<experiment>.yaml")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--output_dir", default="predictions/per_slice")
     p.add_argument("--stems", nargs="*", default=None,
@@ -40,7 +42,9 @@ def main():
                    help="Save in raw GFP intensity scale (default [0,1])")
     args = p.parse_args()
 
-    cfg = load_config(args.config)
+    config_path = resolve_ckpt_config(os.path.dirname(args.checkpoint),
+                                      args.config)
+    cfg = load_config(config_path)
     dims = cfg["model"]["dims"]
     if dims not in ("2d", "3d"):
         raise SystemExit(f"Unknown model.dims={dims}")

@@ -1,8 +1,38 @@
 """Config loading: base + override YAML merge with validation."""
 
 import os
+import re
 import copy
 import yaml
+
+
+def resolve_ckpt_config(ckpt_dir, override=None):
+    """Find a loadable config for a checkpoint directory.
+
+    Order:
+    1. `override` (if given).
+    2. `{ckpt_dir}/config.yaml` IF its `base:` resolves (some old ckpt dirs
+       lack the copied `base.yaml` next to the config).
+    3. `configs/<experiment>.yaml` derived from the ckpt dir basename
+       (strips trailing `_frac\\d+(_hold(Ex|Pt))?`).
+    """
+    if override:
+        return override
+    copy_path = os.path.join(ckpt_dir, "config.yaml")
+    if os.path.exists(copy_path):
+        try:
+            load_config(copy_path)
+            return copy_path
+        except FileNotFoundError:
+            pass
+    name = re.sub(r"_frac\d+(_hold(?:Ex|Pt))?$",
+                  "", os.path.basename(os.path.abspath(ckpt_dir)))
+    candidate = os.path.join("configs", f"{name}.yaml")
+    if os.path.exists(candidate):
+        return candidate
+    raise FileNotFoundError(
+        f"Could not resolve config for {ckpt_dir}. Tried {copy_path} and "
+        f"{candidate}. Pass --config explicitly.")
 
 
 def deep_merge(base, override):

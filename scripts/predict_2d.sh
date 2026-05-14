@@ -33,24 +33,21 @@ if [ -z "$CKPT" ] || [ ! -f "$CKPT" ]; then
   exit 1
 fi
 
-# Use the config copy that train.py saved next to the checkpoint when present;
-# otherwise fall back to the matching config in configs/.
-CKPT_DIR=$(dirname "$CKPT")
-CFG="${CFG:-$CKPT_DIR/config.yaml}"
-if [ ! -f "$CFG" ]; then
-  case "$(basename "$CKPT_DIR")" in
-    *imagenet_pearson*) CFG=configs/unet_2d_imagenet_pearson.yaml ;;
-    *imagenet*)         CFG=configs/unet_2d_imagenet.yaml ;;
-    *random*)           CFG=configs/unet_2d_random.yaml ;;
-    *)                  CFG=configs/unet_2d_imagenet_pearson.yaml ;;
-  esac
-fi
-
+# If the user pinned CFG explicitly, pass it through; otherwise let the
+# python script resolve via src.config.resolve_ckpt_config (which tries the
+# in-ckpt config first, then falls back to configs/<experiment>.yaml).
 echo "Checkpoint : $CKPT"
-echo "Config     : $CFG"
+if [ -n "$CFG" ]; then
+  echo "Config     : $CFG (override)"
+else
+  echo "Config     : auto-resolved by predict_2d_per_slice.py"
+fi
 echo "Output dir : $OUT"
 
-ARGS=(-c "$CFG" --checkpoint "$CKPT" --output_dir "$OUT")
+ARGS=(--checkpoint "$CKPT" --output_dir "$OUT")
+if [ -n "$CFG" ]; then
+  ARGS=(-c "$CFG" "${ARGS[@]}")
+fi
 if [ -n "$STEMS" ]; then
   ARGS+=(--stems $STEMS)
 fi
