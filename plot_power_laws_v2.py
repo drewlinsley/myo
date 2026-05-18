@@ -148,10 +148,10 @@ def main():
     chance = Line2D([0], [0], color="gray", linestyle=":",
                     label="chance (binary)")
     legend1 = ax.legend(handles=task_handles + [chance],
-                        loc="lower right", fontsize=8, title="Task")
+                        loc="upper left", fontsize=8, title="Task")
     ax.add_artist(legend1)
     if cv_handles:
-        ax.legend(handles=cv_handles, loc="upper left", fontsize=8,
+        ax.legend(handles=cv_handles, loc="lower right", fontsize=8,
                   title="CV unit")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
