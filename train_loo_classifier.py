@@ -104,6 +104,10 @@ def main():
                    help="Number of label permutations for p-value (0 to skip)")
     p.add_argument("--binarize", action="store_true",
                    help="Collapse raw labels to Control/Perturbed (yes/no)")
+    p.add_argument("--collapse_doses", action="store_true",
+                   help="Perturbation only: collapse 'high dose'/'low dose' "
+                        "into a single class per perturbation agent. "
+                        "Mutually exclusive with --binarize.")
     p.add_argument("--seed", type=int, default=None,
                    help="Override config seed for reproducibility / SE runs")
     p.add_argument("--cv_unit", choices=["volume", "replicate"],
@@ -111,6 +115,8 @@ def main():
                    help="Leave-one-group-out unit; replicate groups by "
                         "(label, Tissue) per colleague's recommendation")
     args = p.parse_args()
+    if args.binarize and args.collapse_doses:
+        raise SystemExit("--binarize and --collapse_doses are mutually exclusive")
 
     cfg = load_config(args.config)
     cfg = validate_config(cfg)
@@ -127,6 +133,36 @@ def main():
 
     metadata = load_metadata(args.metadata)
     label_col = TASK_LABEL_COL[args.task]
+
+    def collapse_dose(s):
+        """Strip 'high dose'/'low dose' from a perturbation label and bin
+        any control variant (BSA / DMSO) into a single 'Control' class.
+        Yields {Activin A, Control, Dexamethasone} for our 6 raw classes.
+        """
+        if s is None or s == "":
+            return s
+        s = str(s).strip()
+        if "control" in s.lower():
+            return "Control"
+        for suffix in (" high dose", " low dose"):
+            if s.endswith(suffix):
+                return s[: -len(suffix)]
+        return s
+
+    # Collapse-doses preprocessing: mutate Perturbation labels in metadata so
+    # both the dataset (use_raw_labels=True) and label_of() see the collapsed
+    # value. Preserve the original under _perturbation_orig for grouping.
+    if args.collapse_doses and args.task == "perturbation":
+        for stem in metadata:
+            v = metadata[stem].get("Perturbation")
+            if v in (None, ""):
+                continue
+            metadata[stem]["_perturbation_orig"] = v
+            metadata[stem]["Perturbation"] = collapse_dose(v)
+
+    label_mode = ("binary" if args.binarize
+                  else "collapsed" if args.collapse_doses
+                  else "raw")
 
     def label_of(stem):
         v = metadata.get(stem, {}).get(label_col)
@@ -147,8 +183,9 @@ def main():
     vocab[args.task] = raw_classes
     n_cls = max(len(raw_classes), 2)
     accelerator.print(f"task={args.task} input={args.input} "
-                      f"binarize={args.binarize} cv_unit={args.cv_unit} "
-                      f"n_volumes={len(stems)} classes={raw_classes}")
+                      f"label_mode={label_mode} cv_unit={args.cv_unit} "
+                      f"n_volumes={len(stems)} "
+                      f"n_classes={len(raw_classes)} classes={raw_classes}")
     if len(stems) < 2:
         raise SystemExit(f"Need >=2 {args.task} volumes, got {len(stems)}")
 
@@ -340,6 +377,9 @@ def main():
         "init_from": args.init_from,
         "seed": int(seed),
         "cv_unit": args.cv_unit,
+        "label_mode": label_mode,
+        "n_classes": len(raw_classes),
+        "chance": 1.0 / len(raw_classes) if raw_classes else 0.5,
         "n_groups": len(results),
         "n_volumes": n_vols_total,
         "overall_accuracy": acc,

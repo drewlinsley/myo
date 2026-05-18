@@ -17,8 +17,13 @@ def stem_to_group(stem, metadata, cv_unit, task):
         t = metadata.get(stem, {}).get("Tissue")
         if t in (None, ""):
             return None
-        label_col = "Exercise" if task == "exercise" else "Perturbation"
-        label = metadata.get(stem, {}).get(label_col)
+        if task == "exercise":
+            label = metadata.get(stem, {}).get("Exercise")
+        else:
+            # Prefer the original (uncollapsed) Perturbation label when present
+            # so dose variants don't get bundled into a single physical tissue.
+            label = (metadata.get(stem, {}).get("_perturbation_orig")
+                     or metadata.get(stem, {}).get("Perturbation"))
         if label in (None, ""):
             return None
         return f"{label}_tissue={t}"

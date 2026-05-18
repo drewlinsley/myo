@@ -31,14 +31,17 @@ def parse_loo_json(path):
     task = d.get("task")
     acc = d.get("overall_accuracy")
     init_from = d.get("init_from")
-    cv_unit = d.get("cv_unit", "volume")  # older runs default to volume
+    cv_unit = d.get("cv_unit", "volume")
+    label_mode = d.get("label_mode", "binary")  # older runs predate the field
     n_groups = d.get("n_groups")
+    n_classes = d.get("n_classes", 2)
+    chance = d.get("chance", 1.0 / max(n_classes, 1))
     if init_from:
         m = FRAC_RE.search(os.path.basename(os.path.dirname(init_from)))
         frac = int(m.group(1)) / 100.0 if m else None
     else:
         frac = 0.0
-    return task, cv_unit, frac, acc, n_groups
+    return task, cv_unit, label_mode, frac, acc, n_groups, n_classes, chance
 
 
 def parse_metrics_json(path):
@@ -47,13 +50,23 @@ def parse_metrics_json(path):
     return d.get("holdout"), d.get("fraction"), d.get("mean", {})
 
 
-def aggregate_loo(loo_dir):
-    """Returns {(task, cv_unit): {frac: {"accs": [...], "n_groups": int}}}."""
-    agg = defaultdict(lambda: defaultdict(lambda: {"accs": [], "n_groups": None}))
+def aggregate_loo(loo_dir, label_mode):
+    """Filter to `label_mode` and aggregate.
+
+    Returns ({(task, cv_unit): {frac: {"accs": [...], "n_groups": int,
+                                       "n_classes": int}}},
+             chance_levels dict {task: chance}).
+    """
+    agg = defaultdict(lambda: defaultdict(
+        lambda: {"accs": [], "n_groups": None, "n_classes": None}))
+    chance_levels = {}
     for path in sorted(glob(os.path.join(loo_dir, "*.json"))):
         try:
-            task, cv, frac, acc, n_groups = parse_loo_json(path)
+            task, cv, lbl, frac, acc, n_groups, n_classes, chance = (
+                parse_loo_json(path))
         except Exception:
+            continue
+        if lbl != label_mode:
             continue
         if task is None or frac is None or acc is None:
             continue
@@ -61,7 +74,10 @@ def aggregate_loo(loo_dir):
         cell["accs"].append(acc)
         if n_groups is not None and cell["n_groups"] is None:
             cell["n_groups"] = n_groups
-    return agg
+        if n_classes is not None and cell["n_classes"] is None:
+            cell["n_classes"] = n_classes
+        chance_levels.setdefault(task, chance)
+    return agg, chance_levels
 
 
 def aggregate_metrics(metrics_dir):
@@ -81,9 +97,11 @@ def main():
     p.add_argument("--output", default="results/classifier/power_laws_v2.png")
     p.add_argument("--csv", default=None,
                    help="Optional CSV path for aggregated values")
+    p.add_argument("--label_mode", default="binary",
+                   help="Filter LOO JSONs by label_mode (binary|collapsed|raw)")
     args = p.parse_args()
 
-    loo = aggregate_loo(args.loo_dir)
+    loo, chance_levels = aggregate_loo(args.loo_dir, args.label_mode)
     metrics = aggregate_metrics(args.metrics_dir)
 
     fig, ax = plt.subplots(1, 1, figsize=(7.5, 5))
@@ -127,14 +145,24 @@ def main():
             csv_rows.append((task, cv, ng, f, n, float(m), float(se),
                              mm.get("mae"), mm.get("ssim"), mm.get("pearson")))
 
-    ax.axhline(0.5, color="gray", linestyle=":", alpha=0.6)
+    # Draw one chance line per distinct chance level among tasks shown.
+    drawn_chances = set()
+    for task in tasks:
+        c = chance_levels.get(task)
+        if c is None or c in drawn_chances:
+            continue
+        ax.axhline(c, color="gray", linestyle=":", alpha=0.6)
+        drawn_chances.add(c)
     ax.set_xlabel("BF→GFP training fraction")
     ax.set_ylabel("LOO accuracy")
     ax.set_xlim(-0.02, 1.02)
     ax.set_ylim(-0.05, 1.05)
     ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
     ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"])
-    ax.set_title("Classification accuracy vs BF→GFP training fraction")
+    n_cls_str = ""
+    if "perturbation" in chance_levels:
+        n_cls_str = f" (perturbation: {int(round(1/chance_levels['perturbation']))} cls)"
+    ax.set_title(f"LOO accuracy vs BF→GFP fraction [{args.label_mode}{n_cls_str}]")
     ax.grid(True, alpha=0.3)
 
     # Two-section legend: tasks (colors), cv units (linestyles)
@@ -145,8 +173,13 @@ def main():
                          linestyle=CV_LINESTYLE[cv], marker=CV_MARKER[cv],
                          linewidth=2, label=cv)
                   for cv in ["volume", "replicate"] if cv in seen_cvs]
+    if drawn_chances:
+        chance_lbl = "chance (" + ", ".join(
+            f"{c:.2f}" for c in sorted(drawn_chances)) + ")"
+    else:
+        chance_lbl = "chance"
     chance = Line2D([0], [0], color="gray", linestyle=":",
-                    label="chance (binary)")
+                    label=chance_lbl)
     legend1 = ax.legend(handles=task_handles + [chance],
                         loc="lower left", fontsize=8, title="Task")
     ax.add_artist(legend1)
