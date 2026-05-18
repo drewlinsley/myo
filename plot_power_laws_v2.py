@@ -1,10 +1,7 @@
-"""3-panel scaling plot:
-   (1) LOO accuracy (mean ± SE over seeds) vs BF->GFP training fraction
-   (2) MAE on held-out task vols vs fraction
-   (3) SSIM on held-out task vols vs fraction
+"""Power-law plot: LOO accuracy (mean ± SE over seeds) vs BF->GFP training fraction.
 
-Panel 1 supports multiple CV granularities (volume / replicate / date).
-Color = task. Linestyle = cv_unit. Legend is split into two sections.
+Supports multiple CV granularities (volume / replicate). Color = task,
+linestyle = cv_unit. Two-section legend separates the two.
 """
 
 import os
@@ -89,14 +86,13 @@ def main():
     loo = aggregate_loo(args.loo_dir)
     metrics = aggregate_metrics(args.metrics_dir)
 
-    fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 5))
     tasks = ["exercise", "perturbation"]
 
     csv_rows = [("task", "cv_unit", "n_groups", "fraction", "n_seeds",
                  "acc_mean", "acc_se", "mae", "ssim", "pearson")]
 
-    # Panel 1: classification accuracy, one line per (task, cv_unit)
-    ax = axes[0]
+    # Classification accuracy, one line per (task, cv_unit)
     seen_cvs = set()
     seen_tasks = set()
     for (task, cv), per_frac in sorted(loo.items()):
@@ -132,11 +128,13 @@ def main():
                              mm.get("mae"), mm.get("ssim"), mm.get("pearson")))
 
     ax.axhline(0.5, color="gray", linestyle=":", alpha=0.6)
-    ax.set_xscale("symlog", linthresh=0.01)
     ax.set_xlabel("BF→GFP training fraction")
     ax.set_ylabel("LOO accuracy")
-    ax.set_ylim(0, 1.1)
-    ax.set_title("Classification (mean ± SE)")
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"])
+    ax.set_title("Classification accuracy vs BF→GFP training fraction")
     ax.grid(True, alpha=0.3)
 
     # Two-section legend: tasks (colors), cv units (linestyles)
@@ -155,40 +153,6 @@ def main():
     if cv_handles:
         ax.legend(handles=cv_handles, loc="upper left", fontsize=8,
                   title="CV unit")
-
-    # Panel 2: MAE on held-out vols
-    ax = axes[1]
-    for task in tasks:
-        m = metrics.get(task, {})
-        if not m:
-            continue
-        fracs = sorted(m.keys())
-        vals = [m[f].get("mae") for f in fracs]
-        ax.plot(fracs, vals, "-o", color=TASK_COLOR[task],
-                label=task.capitalize(), linewidth=2)
-    ax.set_xscale("symlog", linthresh=0.01)
-    ax.set_xlabel("BF→GFP training fraction")
-    ax.set_ylabel("MAE (lower = better)")
-    ax.set_title("Regression MAE on held-out task vols")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
-
-    # Panel 3: SSIM
-    ax = axes[2]
-    for task in tasks:
-        m = metrics.get(task, {})
-        if not m:
-            continue
-        fracs = sorted(m.keys())
-        vals = [m[f].get("ssim") for f in fracs]
-        ax.plot(fracs, vals, "-o", color=TASK_COLOR[task],
-                label=task.capitalize(), linewidth=2)
-    ax.set_xscale("symlog", linthresh=0.01)
-    ax.set_xlabel("BF→GFP training fraction")
-    ax.set_ylabel("SSIM (higher = better)")
-    ax.set_title("Regression SSIM on held-out task vols")
-    ax.legend(loc="lower right")
-    ax.grid(True, alpha=0.3)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     fig.tight_layout()
