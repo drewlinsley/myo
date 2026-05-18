@@ -148,7 +148,7 @@ def main():
     chance = Line2D([0], [0], color="gray", linestyle=":",
                     label="chance (binary)")
     legend1 = ax.legend(handles=task_handles + [chance],
-                        loc="upper left", fontsize=8, title="Task")
+                        loc="lower left", fontsize=8, title="Task")
     ax.add_artist(legend1)
     if cv_handles:
         ax.legend(handles=cv_handles, loc="lower right", fontsize=8,
