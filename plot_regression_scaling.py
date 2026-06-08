@@ -41,9 +41,12 @@ def parse_reg_json(path):
 
 
 def aggregate(loo_dir):
-    """{(target, cv): {frac: {pearson: [...], mse: [...], n: int}}}."""
+    """{(target, cv): {frac: {pearson: [...], mse: [...], rmse: [...], n: int}}}.
+
+    `rmse` falls back to sqrt(mse) for older JSONs that don't store it.
+    """
     agg = defaultdict(lambda: defaultdict(
-        lambda: {"pearson": [], "mse": [], "mae": [], "n": None}))
+        lambda: {"pearson": [], "mse": [], "rmse": [], "mae": [], "n": None}))
     for path in sorted(glob(os.path.join(loo_dir, "*.json"))):
         try:
             target, cv, frac, metrics, n = parse_reg_json(path)
@@ -52,9 +55,12 @@ def aggregate(loo_dir):
         if target is None or frac is None or not metrics:
             continue
         cell = agg[(target, cv)][frac]
-        for k in ("pearson", "mse", "mae"):
+        for k in ("pearson", "mse", "mae", "rmse"):
             if metrics.get(k) is not None:
                 cell[k].append(float(metrics[k]))
+        # Back-fill RMSE from MSE if missing in older JSONs.
+        if metrics.get("rmse") is None and metrics.get("mse") is not None:
+            cell["rmse"].append(float(np.sqrt(metrics["mse"])))
         if n is not None and cell["n"] is None:
             cell["n"] = n
     return agg
@@ -119,13 +125,24 @@ def main():
     # MSE
     fig, ax = plt.subplots(figsize=(7.5, 5))
     render_panel(ax, agg, metric="mse",
-                 ylabel="MSE (held-out)",
+                 ylabel="MSE (held-out, target units²)",
                  title="LOO regression: MSE vs BF→GFP fraction",
                  lower_is_better=True)
     fig.tight_layout()
     mse_path = os.path.join(args.output_dir, f"{args.prefix}_mse.png")
     fig.savefig(mse_path, dpi=150)
     print(f"Saved {mse_path}")
+
+    # RMSE (raw target units — interpretable "off by N units")
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    render_panel(ax, agg, metric="rmse",
+                 ylabel="RMSE (held-out, target units)",
+                 title="LOO regression: RMSE vs BF→GFP fraction",
+                 lower_is_better=True)
+    fig.tight_layout()
+    rmse_path = os.path.join(args.output_dir, f"{args.prefix}_rmse.png")
+    fig.savefig(rmse_path, dpi=150)
+    print(f"Saved {rmse_path}")
 
 
 if __name__ == "__main__":

@@ -282,10 +282,11 @@ def main():
                 "best_val_loss": float(best_val),
             })
 
-    # Overall metrics
+    # Overall metrics (in raw target units — predictions were de-normalized)
     trues = np.array([r["true"] for r in per_vol], dtype=np.float64)
     preds = np.array([r["pred"] for r in per_vol], dtype=np.float64)
     mse = float(np.mean((preds - trues) ** 2))
+    rmse = float(np.sqrt(mse))
     mae = float(np.mean(np.abs(preds - trues)))
     if trues.std() == 0 or preds.std() == 0:
         pearson = 0.0
@@ -293,8 +294,8 @@ def main():
         pearson = float(np.corrcoef(trues, preds)[0, 1])
 
     accelerator.print(
-        f"\nOverall: pearson={pearson:.3f} mse={mse:.4f} mae={mae:.4f} "
-        f"(n={len(per_vol)})")
+        f"\nOverall: pearson={pearson:.3f} rmse={rmse:.4f} "
+        f"mse={mse:.4f} mae={mae:.4f} (n={len(per_vol)})")
 
     perm_info = None
     if args.n_permutations and len(per_vol) > 2:
@@ -327,7 +328,7 @@ def main():
         "n_groups": len(groups),
         "n_volumes": len(per_vol),
         "metrics": {
-            "pearson": pearson, "mse": mse, "mae": mae,
+            "pearson": pearson, "mse": mse, "rmse": rmse, "mae": mae,
             "target_mean": t_mean, "target_std": t_std,
         },
         "permutation_test": perm_info,
@@ -347,8 +348,8 @@ def main():
     ax.set_xlim(lo - pad, hi + pad); ax.set_ylim(lo - pad, hi + pad)
     ax.set_xlabel(f"True {args.target_col}")
     ax.set_ylabel("Predicted")
-    ax.set_title(f"LOO regression | pearson={pearson:.3f} mse={mse:.4f} "
-                 f"(n={len(per_vol)})")
+    ax.set_title(f"LOO regression | pearson={pearson:.3f} "
+                 f"rmse={rmse:.4f} (n={len(per_vol)})")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     plot_path = os.path.splitext(args.output)[0] + ".png"
