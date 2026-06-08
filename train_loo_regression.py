@@ -99,6 +99,13 @@ def main():
                    default="volume")
     p.add_argument("--n_permutations", type=int, default=10000,
                    help="Permutation test on Pearson (0 to skip)")
+    p.add_argument("--inner_val_frac", type=float, default=0.2,
+                   help="Fraction of train_stems set aside as inner val for "
+                        "early stopping (so the outer held-out group is NEVER "
+                        "used to select epochs). 0 disables and runs full epochs.")
+    p.add_argument("--peek_val_for_earlystop", action="store_true",
+                   help="(Legacy / debug) early-stop on held-out loss. Leaks "
+                        "the test target — kept only for back-compat.")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -166,18 +173,40 @@ def main():
     min_delta = tcfg.get("min_delta", 1e-3)
     lr = tcfg["lr"]
 
-    # Normalize targets to z-scores (over all stems) for training stability.
+    # Whole-dataset stats (for the predict-the-mean baseline in the summary).
     target_arr = np.array([targets[s] for s in stems], dtype=np.float64)
-    t_mean, t_std = float(target_arr.mean()), float(target_arr.std() or 1.0)
-    accelerator.print(f"target stats: mean={t_mean:.4f} std={t_std:.4f}")
-
-    norm_targets = {s: (targets[s] - t_mean) / t_std for s in targets}
+    overall_mean = float(target_arr.mean())
+    overall_std = float(target_arr.std() or 1.0)
+    accelerator.print(
+        f"target stats (all stems): mean={overall_mean:.4f} "
+        f"std={overall_std:.4f} (predict-mean RMSE baseline = {overall_std:.4f})")
 
     per_vol = []  # one entry per held-out vol across all groups
     for held_g, held_stems in groups.items():
         train_stems = [s for g, ss in groups.items() if g != held_g for s in ss]
+        # Per-fold normalization — strictly train-only (no held-out leak).
+        train_targets = np.array(
+            [targets[s] for s in train_stems], dtype=np.float64)
+        t_mean = float(train_targets.mean())
+        t_std = float(train_targets.std() or 1.0)
+        norm_targets = {s: (targets[s] - t_mean) / t_std for s in targets}
+
+        # Inner train/val split for early stopping (no peek at outer held-out).
+        rng_split = np.random.default_rng(seed + hash(held_g) % (2 ** 31))
+        train_stems_arr = np.array(train_stems)
+        rng_split.shuffle(train_stems_arr)
+        if args.peek_val_for_earlystop or args.inner_val_frac <= 0:
+            inner_train = list(train_stems_arr)
+            inner_val = []
+        else:
+            n_val = max(1, int(round(len(train_stems_arr) * args.inner_val_frac)))
+            inner_val = list(train_stems_arr[:n_val])
+            inner_train = list(train_stems_arr[n_val:])
+
         accelerator.print(
-            f"\n── LOO group: {held_g} (n={len(held_stems)}) ──")
+            f"\n── LOO group: {held_g} (n_held={len(held_stems)}, "
+            f"n_inner_train={len(inner_train)}, n_inner_val={len(inner_val)}, "
+            f"t_mean={t_mean:.3f}, t_std={t_std:.3f}) ──")
 
         model = build_gfp_regressor(cfg)
         if args.init_from:
@@ -189,57 +218,68 @@ def main():
             weight_decay=tcfg.get("weight_decay", 0.01))
         criterion = nn.MSELoss()
 
-        # Wrap targets for training to use the z-scored values
-        train_loader = torch.utils.data.DataLoader(
-            VolumeRegressionDataset(
-                [os.path.join(mod_dir, f"{s}.npy") for s in train_stems],
+        def make_loader(stem_list, train):
+            ds = VolumeRegressionDataset(
+                [os.path.join(mod_dir, f"{s}.npy") for s in stem_list],
                 stats_dir=stats_dir, targets=norm_targets,
-                transform=build_transforms(cfg, True),
+                transform=build_transforms(cfg, train),
                 z_range=z_range, apply_timm=apply_timm,
                 percentile_clip=percentile_clip, mode=dims,
                 patch_depth=dcfg.get("patch_depth", 32),
-                patches_per_volume=dcfg.get("patches_per_volume", 32),
-                crop_size=dcfg.get("crop_size", 256), modality=args.input),
-            batch_size=tcfg["batch_size"], shuffle=True, drop_last=True,
-            num_workers=tcfg.get("num_workers", 4), pin_memory=True)
+                patches_per_volume=(dcfg.get("patches_per_volume", 32)
+                                    if train else 8),
+                crop_size=dcfg.get("crop_size", 256), modality=args.input)
+            return torch.utils.data.DataLoader(
+                ds, batch_size=tcfg["batch_size"],
+                shuffle=train, drop_last=train, pin_memory=train,
+                num_workers=tcfg.get("num_workers", 4))
 
-        val_ds = VolumeRegressionDataset(
-            [os.path.join(mod_dir, f"{s}.npy") for s in held_stems],
-            stats_dir=stats_dir, targets=norm_targets,
-            transform=build_transforms(cfg, False),
-            z_range=z_range, apply_timm=apply_timm,
-            percentile_clip=percentile_clip, mode=dims,
-            patch_depth=dcfg.get("patch_depth", 32),
-            patches_per_volume=8, crop_size=dcfg.get("crop_size", 256),
-            modality=args.input)
-        val_loader = torch.utils.data.DataLoader(
-            val_ds, batch_size=tcfg["batch_size"], shuffle=False,
-            num_workers=tcfg.get("num_workers", 4))
+        train_loader = make_loader(inner_train, True)
+        inner_val_loader = (make_loader(inner_val, False)
+                            if inner_val else None)
+        predict_loader = make_loader(held_stems, False)
 
-        model, optimizer, train_loader, val_loader = accelerator.prepare(
-            model, optimizer, train_loader, val_loader)
+        to_prep = [model, optimizer, train_loader, predict_loader]
+        if inner_val_loader is not None:
+            to_prep.append(inner_val_loader)
+        prepared = accelerator.prepare(*to_prep)
+        model, optimizer, train_loader, predict_loader = prepared[:4]
+        if inner_val_loader is not None:
+            inner_val_loader = prepared[4]
 
-        def eval_held():
+        def eval_loss_on(loader):
             model.eval()
-            sums = {i: 0.0 for i in range(len(held_stems))}
-            counts = {i: 0 for i in range(len(held_stems))}
             tot_loss, tot_n = 0.0, 0
             with torch.no_grad():
-                for img, tgt, fidx in val_loader:
+                for img, tgt, _ in loader:
                     out = model(img)
                     loss = criterion(out, tgt.float().to(out.device))
                     tot_loss += loss.item() * img.shape[0]
                     tot_n += img.shape[0]
+            return tot_loss / max(tot_n, 1)
+
+        def predict_on_held():
+            """Predictions for held_stems — used for output only, NEVER
+            for epoch selection. No held-out target involved."""
+            model.eval()
+            sums = {i: 0.0 for i in range(len(held_stems))}
+            counts = {i: 0 for i in range(len(held_stems))}
+            with torch.no_grad():
+                for img, _tgt, fidx in predict_loader:
+                    out = model(img)
                     o = out.detach().cpu().numpy().reshape(-1)
                     f = fidx.detach().cpu().numpy().reshape(-1)
                     for v, i in zip(o, f):
                         sums[int(i)] += float(v)
                         counts[int(i)] += 1
-            preds_norm = np.array(
+            return np.array(
                 [sums[i] / max(counts[i], 1) for i in range(len(held_stems))])
-            return tot_loss / max(tot_n, 1), preds_norm
 
-        best_val = float("inf")
+        # Epoch selection signal:
+        #   - if --peek_val_for_earlystop: held-out loss (LEAK, legacy)
+        #   - elif inner_val: inner_val MSE (clean)
+        #   - else: train MSE (no peek, but weak signal)
+        best_sig = float("inf")
         best_preds = None
         best_epoch = 0
         no_improve = 0
@@ -254,12 +294,26 @@ def main():
                 optimizer.step()
                 losses.append(loss.item())
             tr = float(np.mean(losses)) if losses else float("inf")
-            vl, preds_norm = eval_held()
+
+            if args.peek_val_for_earlystop:
+                sig = eval_loss_on(predict_loader)  # LEAK
+                sig_name = "held_val_mse"
+            elif inner_val_loader is not None:
+                sig = eval_loss_on(inner_val_loader)
+                sig_name = "inner_val_mse"
+            else:
+                sig = tr
+                sig_name = "train_mse"
+
+            # Predict on held-out at current epoch (no target leak)
+            preds_norm = predict_on_held()
+
             if (ep + 1) % 5 == 0 or ep == epochs - 1:
                 accelerator.print(
-                    f"  ep{ep+1}/{epochs} train_mse={tr:.4f} val_mse={vl:.4f}")
-            if vl < best_val - min_delta:
-                best_val = vl
+                    f"  ep{ep+1}/{epochs} train_mse={tr:.4f} "
+                    f"{sig_name}={sig:.4f}")
+            if sig < best_sig - min_delta:
+                best_sig = sig
                 best_preds = preds_norm
                 best_epoch = ep + 1
                 no_improve = 0
@@ -267,11 +321,11 @@ def main():
                 no_improve += 1
                 if no_improve >= patience:
                     accelerator.print(
-                        f"  early stop ep{ep+1} (best={best_val:.4f} "
+                        f"  early stop ep{ep+1} ({sig_name}={best_sig:.4f} "
                         f"@ ep{best_epoch})")
                     break
 
-        # De-normalize predictions back to raw target scale.
+        # De-normalize predictions back to raw target scale (per-fold stats).
         preds_raw = best_preds * t_std + t_mean
         for s, pred in zip(held_stems, preds_raw):
             per_vol.append({
@@ -279,7 +333,9 @@ def main():
                 "true": float(targets[s]),
                 "pred": float(pred),
                 "best_epoch": best_epoch,
-                "best_val_loss": float(best_val),
+                "best_inner_val_loss": float(best_sig),
+                "fold_train_mean": t_mean,
+                "fold_train_std": t_std,
             })
 
     # Overall metrics (in raw target units — predictions were de-normalized)
@@ -293,9 +349,23 @@ def main():
     else:
         pearson = float(np.corrcoef(trues, preds)[0, 1])
 
+    # Baseline: predict-the-mean (per-fold). Lower bound a real model must beat.
+    baseline_preds = np.array(
+        [r["fold_train_mean"] for r in per_vol], dtype=np.float64)
+    baseline_mse = float(np.mean((baseline_preds - trues) ** 2))
+    baseline_rmse = float(np.sqrt(baseline_mse))
+    baseline_mae = float(np.mean(np.abs(baseline_preds - trues)))
+
     accelerator.print(
         f"\nOverall: pearson={pearson:.3f} rmse={rmse:.4f} "
         f"mse={mse:.4f} mae={mae:.4f} (n={len(per_vol)})")
+    accelerator.print(
+        f"Baseline (predict fold-train mean): rmse={baseline_rmse:.4f} "
+        f"mse={baseline_mse:.4f} mae={baseline_mae:.4f}")
+    if rmse > baseline_rmse:
+        accelerator.print(
+            "  WARNING: model RMSE is WORSE than the predict-mean baseline. "
+            "Encoder features may be uninformative for this target.")
 
     perm_info = None
     if args.n_permutations and len(per_vol) > 2:
@@ -329,7 +399,14 @@ def main():
         "n_volumes": len(per_vol),
         "metrics": {
             "pearson": pearson, "mse": mse, "rmse": rmse, "mae": mae,
-            "target_mean": t_mean, "target_std": t_std,
+            "target_mean": overall_mean, "target_std": overall_std,
+        },
+        "baseline_predict_mean": {
+            "rmse": baseline_rmse, "mse": baseline_mse, "mae": baseline_mae,
+        },
+        "config_flags": {
+            "inner_val_frac": float(args.inner_val_frac),
+            "peek_val_for_earlystop": bool(args.peek_val_for_earlystop),
         },
         "permutation_test": perm_info,
         "per_volume": per_vol,

@@ -37,19 +37,26 @@ def parse_reg_json(path):
             d.get("cv_unit", "volume"),
             frac,
             d.get("metrics", {}),
+            d.get("baseline_predict_mean") or {},
             d.get("n_volumes"))
 
 
 def aggregate(loo_dir):
-    """{(target, cv): {frac: {pearson: [...], mse: [...], rmse: [...], n: int}}}.
+    """Aggregates LOO regression results.
+
+    Returns ({(target, cv): {frac: {pearson, mse, rmse, mae, baseline_*: lists,
+                                    n: int}}},
+             {target: {rmse, mse}}  # global predict-mean baseline, last seen).
 
     `rmse` falls back to sqrt(mse) for older JSONs that don't store it.
     """
     agg = defaultdict(lambda: defaultdict(
-        lambda: {"pearson": [], "mse": [], "rmse": [], "mae": [], "n": None}))
+        lambda: {"pearson": [], "mse": [], "rmse": [], "mae": [],
+                 "baseline_rmse": [], "baseline_mse": [], "n": None}))
+    baselines = {}
     for path in sorted(glob(os.path.join(loo_dir, "*.json"))):
         try:
-            target, cv, frac, metrics, n = parse_reg_json(path)
+            target, cv, frac, metrics, baseline, n = parse_reg_json(path)
         except Exception:
             continue
         if target is None or frac is None or not metrics:
@@ -58,12 +65,20 @@ def aggregate(loo_dir):
         for k in ("pearson", "mse", "mae", "rmse"):
             if metrics.get(k) is not None:
                 cell[k].append(float(metrics[k]))
-        # Back-fill RMSE from MSE if missing in older JSONs.
         if metrics.get("rmse") is None and metrics.get("mse") is not None:
             cell["rmse"].append(float(np.sqrt(metrics["mse"])))
+        if baseline.get("rmse") is not None:
+            cell["baseline_rmse"].append(float(baseline["rmse"]))
+        if baseline.get("mse") is not None:
+            cell["baseline_mse"].append(float(baseline["mse"]))
         if n is not None and cell["n"] is None:
             cell["n"] = n
-    return agg
+        # Track last-seen baseline per target for the horizontal reference line.
+        if baseline.get("rmse") is not None:
+            baselines.setdefault(target, {})
+            baselines[target]["rmse"] = float(baseline["rmse"])
+            baselines[target]["mse"] = float(baseline.get("mse", 0.0))
+    return agg, baselines
 
 
 def render_panel(ax, agg, metric, ylabel, title, lower_is_better):
@@ -103,11 +118,19 @@ def main():
     p.add_argument("--loo_dir", default="results/loo_reg")
     p.add_argument("--output_dir", default="results/classifier")
     p.add_argument("--prefix", default="regression",
-                   help="Filename prefix; outputs <prefix>_pearson.png and _mse.png")
+                   help="Filename prefix; outputs <prefix>_pearson.png, _mse.png, _rmse.png")
     args = p.parse_args()
 
-    agg = aggregate(args.loo_dir)
+    agg, baselines = aggregate(args.loo_dir)
     os.makedirs(args.output_dir, exist_ok=True)
+
+    def add_baseline(ax, metric):
+        for target, b in baselines.items():
+            v = b.get(metric)
+            if v is None:
+                continue
+            ax.axhline(v, color="gray", linestyle="--", alpha=0.7,
+                       label=f"predict-mean baseline ({target}={v:.2f})")
 
     # Pearson
     fig, ax = plt.subplots(figsize=(7.5, 5))
@@ -128,6 +151,8 @@ def main():
                  ylabel="MSE (held-out, target units²)",
                  title="LOO regression: MSE vs BF→GFP fraction",
                  lower_is_better=True)
+    add_baseline(ax, "mse")
+    ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     mse_path = os.path.join(args.output_dir, f"{args.prefix}_mse.png")
     fig.savefig(mse_path, dpi=150)
@@ -139,6 +164,8 @@ def main():
                  ylabel="RMSE (held-out, target units)",
                  title="LOO regression: RMSE vs BF→GFP fraction",
                  lower_is_better=True)
+    add_baseline(ax, "rmse")
+    ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     rmse_path = os.path.join(args.output_dir, f"{args.prefix}_rmse.png")
     fig.savefig(rmse_path, dpi=150)
