@@ -114,6 +114,13 @@ def main():
                    default="volume",
                    help="Leave-one-group-out unit; replicate groups by "
                         "(label, Tissue) per colleague's recommendation")
+    p.add_argument("--inner_val_frac", type=float, default=0.2,
+                   help="Fraction of train_stems set aside as inner val for "
+                        "early stopping (so the outer held-out group is "
+                        "NEVER used to select epochs). 0 disables.")
+    p.add_argument("--peek_val_for_earlystop", action="store_true",
+                   help="(Legacy / debug) early-stop on held-out CE — leaks "
+                        "the held-out label. Off by default.")
     args = p.parse_args()
     if args.binarize and args.collapse_doses:
         raise SystemExit("--binarize and --collapse_doses are mutually exclusive")
@@ -242,8 +249,22 @@ def main():
         train_stems = [s for g, ss in groups.items() if g != held_g for s in ss]
         true_label = label_of(held_stems[0])  # homogeneous (validated above)
         true_idx = raw_classes.index(true_label)
+
+        # Inner train/val split for early stopping (no peek at outer held-out)
+        rng_split = np.random.default_rng(seed + hash(held_g) % (2 ** 31))
+        train_stems_arr = np.array(train_stems)
+        rng_split.shuffle(train_stems_arr)
+        if args.peek_val_for_earlystop or args.inner_val_frac <= 0:
+            inner_train = list(train_stems_arr)
+            inner_val = []
+        else:
+            n_iv = max(1, int(round(len(train_stems_arr) * args.inner_val_frac)))
+            inner_val = list(train_stems_arr[:n_iv])
+            inner_train = list(train_stems_arr[n_iv:])
+
         accelerator.print(
-            f"\n── LOO group: {held_g} (n={len(held_stems)}, "
+            f"\n── LOO group: {held_g} (n_held={len(held_stems)}, "
+            f"n_inner_train={len(inner_train)}, n_inner_val={len(inner_val)}, "
             f"true={true_label}) ──")
 
         model = build_gfp_classifier(cfg, n_ex, n_pt)
@@ -260,40 +281,59 @@ def main():
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
 
         train_loader = torch.utils.data.DataLoader(
-            make_ds(train_stems, True), batch_size=tcfg["batch_size"],
+            make_ds(inner_train, True), batch_size=tcfg["batch_size"],
             shuffle=True, drop_last=True,
             num_workers=tcfg.get("num_workers", 4), pin_memory=True)
-        val_loader = torch.utils.data.DataLoader(
+        predict_loader = torch.utils.data.DataLoader(
             make_ds(held_stems, False), batch_size=tcfg["batch_size"],
             shuffle=False, num_workers=tcfg.get("num_workers", 4))
+        inner_val_loader = (torch.utils.data.DataLoader(
+            make_ds(inner_val, False), batch_size=tcfg["batch_size"],
+            shuffle=False, num_workers=tcfg.get("num_workers", 4))
+            if inner_val else None)
 
-        model, optimizer, train_loader, val_loader = accelerator.prepare(
-            model, optimizer, train_loader, val_loader)
+        to_prep = [model, optimizer, train_loader, predict_loader]
+        if inner_val_loader is not None:
+            to_prep.append(inner_val_loader)
+        prepared = accelerator.prepare(*to_prep)
+        model, optimizer, train_loader, predict_loader = prepared[:4]
+        if inner_val_loader is not None:
+            inner_val_loader = prepared[4]
 
         def forward_head(logits_ex, logits_pt, ex, pt):
             if args.task == "exercise":
                 return logits_ex, ex
             return logits_pt, pt
 
-        def eval_held():
+        def eval_loss_on(loader):
+            """CE loss on a loader (uses labels) — for early-stop signal."""
             model.eval()
             total_loss, total_n = 0.0, 0
-            probs = torch.zeros(n_cls, device=device)
-            n_samples = 0
             with torch.no_grad():
-                for img, ex, pt in val_loader:
+                for img, ex, pt in loader:
                     lex, lpt = model(img)
                     logits, target = forward_head(lex, lpt, ex, pt)
                     if (target != -1).any():
-                        total_loss += criterion(
-                            logits, target).item() * img.shape[0]
+                        total_loss += (
+                            criterion(logits, target).item() * img.shape[0])
                         total_n += img.shape[0]
+            return total_loss / max(total_n, 1)
+
+        def predict_on_held():
+            """Mean softmax over all slices/patches of held_stems. Uses NO
+            held-out labels — pure prediction, safe to call every epoch."""
+            model.eval()
+            probs = torch.zeros(n_cls, device=device)
+            n_samples = 0
+            with torch.no_grad():
+                for img, ex, pt in predict_loader:
+                    lex, lpt = model(img)
+                    logits = lex if args.task == "exercise" else lpt
                     probs += logits.softmax(dim=1).sum(dim=0)
                     n_samples += img.shape[0]
-            return (total_loss / max(total_n, 1),
-                    (probs / max(n_samples, 1)).cpu().numpy())
+            return (probs / max(n_samples, 1)).cpu().numpy()
 
-        best_val = float("inf")
+        best_sig = float("inf")
         best_probs = None
         best_epoch = 0
         no_improve = 0
@@ -311,12 +351,26 @@ def main():
                 optimizer.step()
                 losses.append(loss.item())
             tr = float(np.mean(losses)) if losses else float("inf")
-            vl, probs = eval_held()
+
+            # Early-stop signal selection
+            if args.peek_val_for_earlystop:
+                sig = eval_loss_on(predict_loader)   # LEAK (legacy)
+                sig_name = "held_val_ce"
+            elif inner_val_loader is not None:
+                sig = eval_loss_on(inner_val_loader)
+                sig_name = "inner_val_ce"
+            else:
+                sig = tr
+                sig_name = "train_ce"
+
+            probs = predict_on_held()   # no held-out labels touched
+
             if (ep + 1) % 5 == 0 or ep == epochs - 1:
                 accelerator.print(
-                    f"  ep{ep+1}/{epochs} train={tr:.4f} val={vl:.4f}")
-            if vl < best_val - min_delta:
-                best_val = vl
+                    f"  ep{ep+1}/{epochs} train_ce={tr:.4f} "
+                    f"{sig_name}={sig:.4f}")
+            if sig < best_sig - min_delta:
+                best_sig = sig
                 best_probs = probs
                 best_epoch = ep + 1
                 no_improve = 0
@@ -325,7 +379,7 @@ def main():
                 if no_improve >= patience:
                     accelerator.print(
                         f"  early stop ep{ep+1} "
-                        f"(best={best_val:.4f} @ ep{best_epoch})")
+                        f"({sig_name}={best_sig:.4f} @ ep{best_epoch})")
                     break
 
         pred_probs = best_probs if best_probs is not None else probs
@@ -338,7 +392,7 @@ def main():
             "group": held_g, "stems": held_stems,
             "true": true_label, "pred": pred,
             "correct": correct, "best_epoch": best_epoch,
-            "best_val_loss": float(best_val),
+            "best_signal_loss": float(best_sig),
             "probs": {raw_classes[i]: float(pred_probs[i])
                       for i in range(n_cls)}})
 
@@ -390,12 +444,16 @@ def main():
                       for c, v in per_class.items()},
         "per_group": results,
     }
+    summary["config_flags"] = {
+        "inner_val_frac": float(args.inner_val_frac),
+        "peek_val_for_earlystop": bool(args.peek_val_for_earlystop),
+    }
     if args.cv_unit == "volume":
         # Back-compat: also expose per_volume with the original key shape
         summary["per_volume"] = [
             {"stem": r["stems"][0], "true": r["true"], "pred": r["pred"],
              "correct": r["correct"], "best_epoch": r["best_epoch"],
-             "best_val_loss": r["best_val_loss"], "probs": r["probs"]}
+             "best_val_loss": r["best_signal_loss"], "probs": r["probs"]}
             for r in results]
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
