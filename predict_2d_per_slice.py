@@ -23,6 +23,7 @@ from src.config import load_config, resolve_ckpt_config
 from src.utils import prepare_env, load_checkpoint
 from src.models import build_model
 from src.data.normalization import normalize, denormalize
+from src.data.foreground_mask import compute_bf_foreground_mask
 from predict import predict_2d
 
 
@@ -37,6 +38,15 @@ def main():
                    help="Optional subset of volume stems to process")
     p.add_argument("--denormalize", action="store_true",
                    help="Save in raw GFP intensity scale (default [0,1])")
+    p.add_argument("--mask_background", action="store_true",
+                   help="Zero out predicted GFP where BF is background "
+                        "(removes edge / OOD artifacts).")
+    p.add_argument("--mask_method", default="minimum",
+                   choices=["minimum", "otsu", "li", "triangle"])
+    p.add_argument("--mask_dilate", type=int, default=3)
+    p.add_argument("--mask_min_frac", type=float, default=0.01)
+    p.add_argument("--data_dir", default=None,
+                   help="Override dataset root (e.g. new dataset path).")
     args = p.parse_args()
 
     config_path = resolve_ckpt_config(os.path.dirname(args.checkpoint),
@@ -60,7 +70,7 @@ def main():
     model = accelerator.prepare(model)
     model.eval()
 
-    data_dir = cfg["data"]["data_dir"]
+    data_dir = args.data_dir or cfg["data"]["data_dir"]
     bf_dir = os.path.join(data_dir, "bf")
     stats_dir = os.path.join(data_dir, "stats")
     z_range = cfg["data"].get("z_range", None)
@@ -89,6 +99,13 @@ def main():
                            apply_timm=apply_timm)
 
             pred = predict_2d(model, bf, device)  # (Z, H, W) in [0, 1]
+            if args.mask_background:
+                fg = compute_bf_foreground_mask(
+                    bf_raw, method=args.mask_method,
+                    dilate=args.mask_dilate,
+                    min_component_frac=args.mask_min_frac)
+                pred = pred * fg.astype(pred.dtype)
+
             if args.denormalize:
                 pred = denormalize(pred, stats["gfp"]["p_low"],
                                    stats["gfp"]["p_high"])

@@ -1,14 +1,24 @@
-"""Evaluate BF->GFP regression metrics on held-out task volumes.
+"""Evaluate BF->GFP regression metrics on a set of held-out volumes.
 
-Reads `heldout_stems.json` next to a `best.pth` (written by
-`train_fraction.py --holdout`), runs 3D inference on each held-out volume,
-and computes MAE / SSIM / Pearson against the GFP target (in the same
-normalized scale as training).
+Two modes:
+  A. Sidecar mode (default): reads `heldout_stems.json` next to `best.pth`
+     (written by `train_fraction.py --holdout`) — used by the power-laws pipeline.
+  B. Explicit mode: pass `--data_dir`, optionally `--stems "a b c"`, to evaluate
+     against any arbitrary dataset (new dataset, full pool, etc.). The script
+     scans `{data_dir}/bf/` for vols that also have GFP + stats, runs inference,
+     and computes MAE / SSIM / Pearson per vol.
 
 Usage:
+    # A — held-out from training:
     python eval_bfgfp_metrics.py \
         --ckpt ckpts/unet_3d_imagenet_pearson_frac100_holdEx/best.pth \
-        --output results/bfgfp_metrics/unet_3d_imagenet_pearson_frac100_holdEx.json
+        --output results/bfgfp_metrics/.../result.json
+
+    # B — new dataset:
+    python eval_bfgfp_metrics.py \
+        --ckpt ckpts/unet_3d_imagenet_pearson_frac100_holdPt/best.pth \
+        --data_dir data_new \
+        --output results/eval_new_dataset/holdPt_frac100_3d.json
 """
 
 import os
@@ -32,19 +42,32 @@ def main():
     p.add_argument("--output", required=True, help="Path to output JSON")
     p.add_argument("--config", default=None,
                    help="Override config (default: <ckpt_dir>/config.yaml)")
+    p.add_argument("--data_dir", default=None,
+                   help="Override dataset root; expects {data_dir}/bf/, /gfp/, /stats/. "
+                        "If set, bypasses the heldout_stems.json sidecar.")
+    p.add_argument("--stems", nargs="*", default=None,
+                   help="Subset of vol stems to evaluate (combine with --data_dir).")
     args = p.parse_args()
 
     ckpt_dir = os.path.dirname(args.ckpt)
     config_path = resolve_ckpt_config(ckpt_dir, args.config)
-    sidecar_path = os.path.join(ckpt_dir, "heldout_stems.json")
-    if not os.path.exists(sidecar_path):
-        raise SystemExit(f"Missing {sidecar_path}; this ckpt was not trained "
-                         "with --holdout.")
-    with open(sidecar_path) as f:
-        sidecar = json.load(f)
-    heldout_stems = sidecar["heldout_stems"]
-    holdout = sidecar["holdout"]
-    fraction = sidecar.get("fraction")
+
+    heldout_stems = None
+    holdout = "explicit"
+    fraction = None
+    if args.stems:
+        heldout_stems = list(args.stems)
+    elif args.data_dir is None:
+        sidecar_path = os.path.join(ckpt_dir, "heldout_stems.json")
+        if not os.path.exists(sidecar_path):
+            raise SystemExit(
+                f"Missing {sidecar_path}. Either train with --holdout, or "
+                "pass --data_dir / --stems explicitly.")
+        with open(sidecar_path) as f:
+            sidecar = json.load(f)
+        heldout_stems = sidecar["heldout_stems"]
+        holdout = sidecar["holdout"]
+        fraction = sidecar.get("fraction")
 
     cfg = load_config(config_path)
     dims = cfg["model"]["dims"]
@@ -59,15 +82,33 @@ def main():
     ckpt = load_checkpoint(args.ckpt, model)
     accelerator.print(
         f"Loaded {args.ckpt} epoch={ckpt.get('epoch', '?')} "
-        f"holdout={holdout} fraction={fraction} n_heldout={len(heldout_stems)}")
+        f"holdout={holdout} fraction={fraction} "
+        f"data_dir={args.data_dir or cfg['data']['data_dir']}")
     model = accelerator.prepare(model)
     model.eval()
 
-    data_dir = cfg["data"]["data_dir"]
+    data_dir = args.data_dir or cfg["data"]["data_dir"]
     bf_dir = os.path.join(data_dir, "bf")
     gfp_dir = os.path.join(data_dir, "gfp")
     stats_dir = os.path.join(data_dir, "stats")
     z_range = cfg["data"].get("z_range", None)
+
+    if heldout_stems is None:
+        # Auto-discover from {data_dir}/bf/ — keep only stems that also have
+        # GFP + stats so we can score.
+        from glob import glob as _glob
+        candidates = sorted(
+            os.path.splitext(os.path.basename(f))[0]
+            for f in _glob(os.path.join(bf_dir, "*.npy")))
+        heldout_stems = [
+            s for s in candidates
+            if os.path.exists(os.path.join(gfp_dir, f"{s}.npy"))
+            and os.path.exists(os.path.join(stats_dir, f"{s}.json"))]
+        if not heldout_stems:
+            raise SystemExit(
+                f"No vols with BF + GFP + stats found under {data_dir}.")
+        accelerator.print(
+            f"Auto-discovered {len(heldout_stems)} vol(s) in {data_dir}")
 
     per_volume = []
     with torch.no_grad():
@@ -125,6 +166,7 @@ def main():
 
     summary = {
         "ckpt": args.ckpt,
+        "data_dir": data_dir,
         "holdout": holdout,
         "fraction": fraction,
         "n_volumes": len(per_volume),
