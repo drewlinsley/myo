@@ -30,11 +30,20 @@
 #                     ND2_SRC (recursive root) and the default channel layout
 #                     ND2_BF_CH=0, ND2_TGT_CH=-1 (last channel). DATA_DIR
 #                     becomes the staging OUT.
-#   CLASSIFY=1      — also run predict_classifier.py per task. Requires a
-#                     non-LOO classifier ckpt produced by train_gfp_classifier.py.
-#                     Knobs: CLASSIFIER_CKPT (auto-finds gfp_classifier_3d_frac100
-#                     if unset), CLS_TASKS="exercise perturbation" (default),
+#   CLASSIFY=1      — also run predict_classifier.py per task. Knobs:
+#                     CLASSIFIER_CKPT     single .pth (e.g. from train_gfp_classifier.py)
+#                     CLASSIFIER_CKPT_GLOB shell glob for LOO ensemble (e.g.
+#                                          "ckpts/loo_classifier_3d_pt/*/best.pth"),
+#                                          REQUIRES train_loo_classifier.py to have
+#                                          been run with --save_ckpt_dir.
+#                     CLS_TASKS="exercise perturbation" (default),
 #                     CLS_N_CLASSES=2, CLS_OUT_DIR="results/classify_new_dataset".
+#   REGRESS=1       — run predict_regression.py (force amplitude). Knobs:
+#                     REGRESSOR_CKPT      single .pth
+#                     REGRESSOR_CKPT_GLOB e.g. "ckpts/loo_regression_3d/*/best.pth"
+#                                          REQUIRES train_loo_regression.py to
+#                                          have been run with --save_ckpt_dir.
+#                     REG_OUT_DIR="results/regress_new_dataset".
 
 set -e
 
@@ -164,35 +173,94 @@ if [ "${CLASSIFY:-0}" = "1" ]; then
   CLS_OUT_DIR="${CLS_OUT_DIR:-results/classify_new_dataset}"
   CLS_TASKS="${CLS_TASKS:-exercise perturbation}"
   CLS_N_CLASSES="${CLS_N_CLASSES:-2}"
-  if [ -z "$CLASSIFIER_CKPT" ]; then
-    for cand in ckpts/gfp_classifier_3d_frac100/best.pth \
-                ckpts/gfp_classifier_3d/best.pth \
-                ckpts/gfp_classifier/best.pth; do
-      [ -f "$cand" ] && CLASSIFIER_CKPT="$cand" && break
-    done
+  # Resolve checkpoint source: glob ensemble > single ckpt > auto-find.
+  CLS_CKPT_FLAG=""
+  CLS_TAG=""
+  if [ -n "$CLASSIFIER_CKPT_GLOB" ]; then
+    # Pass through; predict_classifier.py also expands globs internally.
+    CLS_CKPT_FLAG="--ckpts $CLASSIFIER_CKPT_GLOB"
+    # Tag = leaf dir of the glob's parent (e.g. loo_classifier_3d_pt)
+    CLS_TAG="$(basename "$(dirname "$(dirname "$CLASSIFIER_CKPT_GLOB")")")_ens"
+  else
+    if [ -z "$CLASSIFIER_CKPT" ]; then
+      for cand in ckpts/gfp_classifier_3d_frac100/best.pth \
+                  ckpts/gfp_classifier_3d/best.pth \
+                  ckpts/gfp_classifier/best.pth; do
+        [ -f "$cand" ] && CLASSIFIER_CKPT="$cand" && break
+      done
+    fi
+    if [ -n "$CLASSIFIER_CKPT" ]; then
+      CLS_CKPT_FLAG="--ckpt $CLASSIFIER_CKPT"
+      CLS_TAG="$(basename "$(dirname "$CLASSIFIER_CKPT")")"
+    fi
   fi
-  if [ -z "$CLASSIFIER_CKPT" ]; then
-    echo "WARN: CLASSIFY=1 but no classifier ckpt found. Train one with " >&2
-    echo "      train_gfp_classifier.py or set CLASSIFIER_CKPT explicitly." >&2
+  if [ -z "$CLS_CKPT_FLAG" ]; then
+    echo "WARN: CLASSIFY=1 but no classifier ckpt found. Either" >&2
+    echo "      (a) train_loo_classifier.py --save_ckpt_dir <dir>, then" >&2
+    echo "          set CLASSIFIER_CKPT_GLOB='<dir>/*/best.pth'; or" >&2
+    echo "      (b) train_gfp_classifier.py, then set CLASSIFIER_CKPT." >&2
   else
     mkdir -p "$CLS_OUT_DIR"
     echo ""
     echo "########################################"
-    echo "# STEP 4: classifier predictions ($CLASSIFIER_CKPT)"
+    echo "# STEP 4: classifier predictions ($CLS_TAG)"
     echo "########################################"
-    TAG=$(basename "$(dirname "$CLASSIFIER_CKPT")")
     for T in $CLS_TASKS; do
-      OUT="$CLS_OUT_DIR/${TAG}_${T}.json"
+      OUT="$CLS_OUT_DIR/${CLS_TAG}_${T}.json"
       if [ -f "$OUT" ] && [ -z "$FORCE" ]; then
         echo "skip: $OUT exists (FORCE=1 to redo)"
         continue
       fi
       echo "=== Classify task=$T ==="
       python predict_classifier.py \
-        --ckpt "$CLASSIFIER_CKPT" --data_dir "$DATA_DIR" \
+        $CLS_CKPT_FLAG --data_dir "$DATA_DIR" \
         --task "$T" --n_classes "$CLS_N_CLASSES" --output "$OUT"
     done
     echo "Classifier preds: $CLS_OUT_DIR/"
+  fi
+fi
+
+# ────────────────────────────────────────────────────────────
+# Step 5 (optional): regression predictions (force amplitude)
+# ────────────────────────────────────────────────────────────
+if [ "${REGRESS:-0}" = "1" ]; then
+  REG_OUT_DIR="${REG_OUT_DIR:-results/regress_new_dataset}"
+  REG_CKPT_FLAG=""
+  REG_TAG=""
+  if [ -n "$REGRESSOR_CKPT_GLOB" ]; then
+    REG_CKPT_FLAG="--ckpts $REGRESSOR_CKPT_GLOB"
+    REG_TAG="$(basename "$(dirname "$(dirname "$REGRESSOR_CKPT_GLOB")")")_ens"
+  elif [ -n "$REGRESSOR_CKPT" ]; then
+    REG_CKPT_FLAG="--ckpt $REGRESSOR_CKPT"
+    REG_TAG="$(basename "$(dirname "$REGRESSOR_CKPT")")"
+  else
+    for cand in ckpts/loo_regression_3d ckpts/loo_regression_2d; do
+      hits=$(ls "$cand"/*/best.pth 2>/dev/null | head -1)
+      if [ -n "$hits" ]; then
+        REG_CKPT_FLAG="--ckpts $cand/*/best.pth"
+        REG_TAG="$(basename "$cand")_ens"
+        break
+      fi
+    done
+  fi
+  if [ -z "$REG_CKPT_FLAG" ]; then
+    echo "WARN: REGRESS=1 but no regression ckpt found. Run" >&2
+    echo "      train_loo_regression.py --save_ckpt_dir <dir>, then set" >&2
+    echo "      REGRESSOR_CKPT_GLOB='<dir>/*/best.pth'." >&2
+  else
+    mkdir -p "$REG_OUT_DIR"
+    OUT="$REG_OUT_DIR/${REG_TAG}.json"
+    echo ""
+    echo "########################################"
+    echo "# STEP 5: force regression ($REG_TAG)"
+    echo "########################################"
+    if [ -f "$OUT" ] && [ -z "$FORCE" ]; then
+      echo "skip: $OUT exists (FORCE=1 to redo)"
+    else
+      python predict_regression.py $REG_CKPT_FLAG \
+        --data_dir "$DATA_DIR" --output "$OUT"
+    fi
+    echo "Regression preds: $REG_OUT_DIR/"
   fi
 fi
 

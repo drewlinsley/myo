@@ -15,7 +15,9 @@ Usage:
 """
 
 import os
+import re
 import json
+import shutil
 import argparse
 from glob import glob
 
@@ -106,6 +108,11 @@ def main():
     p.add_argument("--peek_val_for_earlystop", action="store_true",
                    help="(Legacy / debug) early-stop on held-out loss. Leaks "
                         "the test target — kept only for back-compat.")
+    p.add_argument("--save_ckpt_dir", default=None,
+                   help="If set, save each fold's best-epoch weights to "
+                        "<save_ckpt_dir>/<group>/best.pth (with t_mean/t_std "
+                        "for de-normalization). Use with predict_regression.py "
+                        "--ckpts <glob> for ensemble inference on new data.")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -207,6 +214,20 @@ def main():
             f"\n── LOO group: {held_g} (n_held={len(held_stems)}, "
             f"n_inner_train={len(inner_train)}, n_inner_val={len(inner_val)}, "
             f"t_mean={t_mean:.3f}, t_std={t_std:.3f}) ──")
+
+        fold_ckpt_path = None
+        if args.save_ckpt_dir:
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(held_g))
+            fold_dir = os.path.join(args.save_ckpt_dir, safe)
+            os.makedirs(fold_dir, exist_ok=True)
+            fold_ckpt_path = os.path.join(fold_dir, "best.pth")
+            if accelerator.is_main_process:
+                cfg_dst = os.path.join(fold_dir, "config.yaml")
+                if not os.path.exists(cfg_dst):
+                    try:
+                        shutil.copy(args.config, cfg_dst)
+                    except Exception as e:
+                        accelerator.print(f"  warn: copy config failed ({e})")
 
         model = build_gfp_regressor(cfg)
         if args.init_from:
@@ -317,6 +338,21 @@ def main():
                 best_preds = preds_norm
                 best_epoch = ep + 1
                 no_improve = 0
+                if fold_ckpt_path and accelerator.is_main_process:
+                    unwrapped = accelerator.unwrap_model(model)
+                    tmp = fold_ckpt_path + ".tmp"
+                    torch.save({
+                        "epoch": best_epoch,
+                        "val_loss": float(sig),
+                        "model_state_dict": unwrapped.state_dict(),
+                        "t_mean": float(t_mean),
+                        "t_std": float(t_std),
+                        "target_col": args.target_col,
+                        "cv_unit": args.cv_unit,
+                        "fold": str(held_g),
+                        "input": args.input,
+                    }, tmp)
+                    os.replace(tmp, fold_ckpt_path)
             else:
                 no_improve += 1
                 if no_improve >= patience:
