@@ -24,6 +24,17 @@
 #   MASK_MIN_FRAC   — small-component cleanup (default: 0.01)
 #   SKIP_PRED=1     — skip step 3 (predictions)
 #   FORCE=1         — overwrite existing eval JSONs / stats / predictions
+#
+# Optional staging + classification:
+#   STAGE_ND2=1     — run stage_nd2.py first (ND2 → bf/+gfp/.npy) using
+#                     ND2_SRC (recursive root) and the default channel layout
+#                     ND2_BF_CH=0, ND2_TGT_CH=-1 (last channel). DATA_DIR
+#                     becomes the staging OUT.
+#   CLASSIFY=1      — also run predict_classifier.py per task. Requires a
+#                     non-LOO classifier ckpt produced by train_gfp_classifier.py.
+#                     Knobs: CLASSIFIER_CKPT (auto-finds gfp_classifier_3d_frac100
+#                     if unset), CLS_TASKS="exercise perturbation" (default),
+#                     CLS_N_CLASSES=2, CLS_OUT_DIR="results/classify_new_dataset".
 
 set -e
 
@@ -34,8 +45,27 @@ MASK_METHOD="${MASK_METHOD:-minimum}"
 MASK_DILATE="${MASK_DILATE:-3}"
 MASK_MIN_FRAC="${MASK_MIN_FRAC:-0.01}"
 
+# ────────────────────────────────────────────────────────────
+# Step 0 (optional): stage ND2 → bf/ + gfp/
+# ────────────────────────────────────────────────────────────
+if [ "${STAGE_ND2:-0}" = "1" ]; then
+  if [ -z "$ND2_SRC" ]; then
+    echo "ERROR: STAGE_ND2=1 requires ND2_SRC=<root containing .nd2 files>" >&2
+    exit 1
+  fi
+  echo ""
+  echo "########################################"
+  echo "# STEP 0: stage ND2 (src=$ND2_SRC -> $DATA_DIR)"
+  echo "########################################"
+  STAGE_ARGS=(--src "$ND2_SRC" --out "$DATA_DIR"
+              --bf_channel "${ND2_BF_CH:-0}"
+              --target_channel "${ND2_TGT_CH:--1}")
+  [ -n "$FORCE" ] && STAGE_ARGS+=(--force)
+  python stage_nd2.py "${STAGE_ARGS[@]}"
+fi
+
 if [ ! -d "$DATA_DIR/bf" ]; then
-  echo "ERROR: $DATA_DIR/bf/ not found. Set DATA_DIR or stage the data." >&2
+  echo "ERROR: $DATA_DIR/bf/ not found. Set DATA_DIR, run STAGE_ND2=1, or stage manually." >&2
   exit 1
 fi
 
@@ -125,6 +155,45 @@ if [ "${SKIP_PRED:-0}" != "1" ]; then
       --mask_background --mask_method "$MASK_METHOD" \
       --mask_dilate "$MASK_DILATE" --mask_min_frac "$MASK_MIN_FRAC"
   done
+fi
+
+# ────────────────────────────────────────────────────────────
+# Step 4 (optional): classifier predictions per task
+# ────────────────────────────────────────────────────────────
+if [ "${CLASSIFY:-0}" = "1" ]; then
+  CLS_OUT_DIR="${CLS_OUT_DIR:-results/classify_new_dataset}"
+  CLS_TASKS="${CLS_TASKS:-exercise perturbation}"
+  CLS_N_CLASSES="${CLS_N_CLASSES:-2}"
+  if [ -z "$CLASSIFIER_CKPT" ]; then
+    for cand in ckpts/gfp_classifier_3d_frac100/best.pth \
+                ckpts/gfp_classifier_3d/best.pth \
+                ckpts/gfp_classifier/best.pth; do
+      [ -f "$cand" ] && CLASSIFIER_CKPT="$cand" && break
+    done
+  fi
+  if [ -z "$CLASSIFIER_CKPT" ]; then
+    echo "WARN: CLASSIFY=1 but no classifier ckpt found. Train one with " >&2
+    echo "      train_gfp_classifier.py or set CLASSIFIER_CKPT explicitly." >&2
+  else
+    mkdir -p "$CLS_OUT_DIR"
+    echo ""
+    echo "########################################"
+    echo "# STEP 4: classifier predictions ($CLASSIFIER_CKPT)"
+    echo "########################################"
+    TAG=$(basename "$(dirname "$CLASSIFIER_CKPT")")
+    for T in $CLS_TASKS; do
+      OUT="$CLS_OUT_DIR/${TAG}_${T}.json"
+      if [ -f "$OUT" ] && [ -z "$FORCE" ]; then
+        echo "skip: $OUT exists (FORCE=1 to redo)"
+        continue
+      fi
+      echo "=== Classify task=$T ==="
+      python predict_classifier.py \
+        --ckpt "$CLASSIFIER_CKPT" --data_dir "$DATA_DIR" \
+        --task "$T" --n_classes "$CLS_N_CLASSES" --output "$OUT"
+    done
+    echo "Classifier preds: $CLS_OUT_DIR/"
+  fi
 fi
 
 echo ""
