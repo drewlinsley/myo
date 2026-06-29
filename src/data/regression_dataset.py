@@ -51,7 +51,15 @@ class VolumeRegressionDataset(Dataset):
                     self.index_map.append((i, z))
                     self.file_idx_map.append(i)
         else:
-            for i in range(len(files)):
+            for i, path in enumerate(files):
+                n_z = np.load(path, mmap_mode="r").shape[0]
+                if z_range is not None:
+                    n_z = min(n_z, z_range[1]) - max(0, z_range[0])
+                if n_z < 1:
+                    # 0 z-planes after the z_range crop — skip this file (mirror
+                    # the 2D path) so the downstream count==0 exclusion engages
+                    # instead of np.pad crashing on a size-0 axis in __getitem__.
+                    continue
                 for p in range(patches_per_volume):
                     self.index_map.append((i, p))
                     self.file_idx_map.append(i)
@@ -80,6 +88,13 @@ class VolumeRegressionDataset(Dataset):
         img = self._load(file_idx)
         if self.mode == "2d":
             slc = img[slot]
+            # Pad sub-crop FOVs up to crop_size (mirror the 3D branch) so the
+            # 2D RandomCrop/CenterCrop don't get a negative crop range.
+            cs = self.crop_size
+            ph = max(0, cs - slc.shape[0])
+            pw = max(0, cs - slc.shape[1])
+            if ph or pw:
+                slc = np.pad(slc, ((0, ph), (0, pw)), mode="reflect")
             if self.transform:
                 t = self.transform(slc[..., None])
             else:

@@ -115,9 +115,9 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--test_frac", type=float, default=0.25,
                    help="Fraction of replicates held out for TEST")
-    p.add_argument("--val_frac", type=float, default=0.15,
+    p.add_argument("--val_frac", type=float, default=0.0,
                    help="Fraction of replicates for VAL (early stopping). "
-                        "0 -> plain train/test.")
+                        "Default 0 -> plain train/test (early-stop on train loss).")
     p.add_argument("--n_permutations", type=int, default=10000,
                    help="Label-shuffle permutation test on test accuracy (0 skip)")
     p.add_argument("--seed", type=int, default=None)

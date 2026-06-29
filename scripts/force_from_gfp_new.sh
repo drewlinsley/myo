@@ -11,7 +11,8 @@
 # For both a 2D and a 3D model it:
 #   - warm-starts the encoder from the matching BF->GFP U-Net,
 #   - discretizes the per-tissue force column into ordinal bins (default terciles),
-#   - trains GFP-volume -> force-bin on the TRAIN replicates, early-stops on VAL,
+#   - trains GFP-volume -> force-bin on the TRAIN replicates (train/test split by
+#     default; set VAL_FRAC>0 to carve a val split for early stopping),
 #   - reports TEST accuracy, per-class accuracy, confusion, and Spearman/Pearson
 #     correlation between true force and the model's expected force,
 #   - saves a per-model figure. Then emits a 2D-vs-3D comparison.
@@ -35,7 +36,8 @@
 #   N_BINS       number of force classes                 (default: 3)
 #   BIN_SCHEME   quantile | uniform                      (default: quantile)
 #   TEST_FRAC    fraction of replicates for TEST         (default: 0.25)
-#   VAL_FRAC     fraction for VAL (0 -> train/test)      (default: 0.15)
+#   VAL_FRAC     fraction for VAL (0 -> train/test only) (default: 0; set >0 to
+#                carve a val split for early stopping instead of train loss)
 #   SEED         RNG seed                                 (default: 42)
 #   OUT_DIR      results root                            (default: results/force_from_gfp_new)
 #   ENC_CKPT_2D  override 2D BF->GFP encoder ckpt path
@@ -65,7 +67,7 @@ GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
 N_BINS="${N_BINS:-3}"
 BIN_SCHEME="${BIN_SCHEME:-quantile}"
 TEST_FRAC="${TEST_FRAC:-0.25}"
-VAL_FRAC="${VAL_FRAC:-0.15}"
+VAL_FRAC="${VAL_FRAC:-0}"   # 0 -> train/test only (val collapsed into train)
 SEED="${SEED:-42}"
 OUT_DIR="${OUT_DIR:-results/force_from_gfp_new}"
 ONLY="${ONLY:-both}"
@@ -98,13 +100,14 @@ if [ ! -f "$METADATA" ]; then
   exit 1
 fi
 
-# ── Percentile stats (idempotent; gfp stats are added when gfp/ exists) ──
-if [ ! -d "$DATA_DIR/stats" ] || [ "${FORCE:-0}" = "1" ]; then
-  echo "Computing percentile stats (DATA_DIR=$DATA_DIR)…"
-  stats_flag=()
-  [ "${FORCE:-0}" = "1" ] && stats_flag=(--force)
-  python compute_stats.py --data_dir "$DATA_DIR" "${stats_flag[@]+"${stats_flag[@]}"}"
-fi
+# ── Percentile stats — ALWAYS run (idempotent: skips stems that already have a
+#    stats json, fills any missing ones). A pre-existing but PARTIAL stats/ dir
+#    from an earlier eval would otherwise leave some staged volumes without
+#    stats and crash dataset construction. gfp stats are added when gfp/ exists.
+echo "Computing percentile stats (idempotent; fills any missing stems)…"
+stats_flag=()
+[ "${FORCE:-0}" = "1" ] && stats_flag=(--force)
+python compute_stats.py --data_dir "$DATA_DIR" "${stats_flag[@]+"${stats_flag[@]}"}"
 
 # ── Resolve BF->GFP encoder checkpoints (env override > auto-discover) ──
 find_ckpt() {
