@@ -175,8 +175,13 @@ def build_transforms(cfg, train=True):
             ])
 
 
-def build_datasets(cfg):
-    """Build train and val datasets."""
+def build_datasets(cfg, split_stems=None):
+    """Build train and val datasets.
+
+    split_stems: optional {"train":[stem,...], "val":[stem,...]} to force an
+    explicit split (e.g. the non-test stems of a paired force run, so the BF->GFP
+    encoder never sees the force test replicates). Defaults to the hash split.
+    """
     dcfg = cfg["data"]
     data_dir = dcfg["data_dir"]
     stats_dir = os.path.join(data_dir, "stats")
@@ -194,8 +199,24 @@ def build_datasets(cfg):
         assert os.path.exists(gf), f"Missing GFP file: {gf}"
 
     # Train/val split
-    train_stems, val_stems = make_train_val_split(
-        stems, val_fraction=dcfg.get("val_fraction", 0.15), seed=cfg.get("seed", 42))
+    if split_stems is not None:
+        avail = set(stems)
+        train_stems = [s for s in split_stems.get("train", []) if s in avail]
+        val_stems = [s for s in split_stems.get("val", []) if s in avail]
+        missing = ([s for s in split_stems.get("train", []) if s not in avail]
+                   + [s for s in split_stems.get("val", []) if s not in avail])
+        if missing:
+            print(f"  split_json: {len(missing)} listed stem(s) not staged here, "
+                  f"skipped (e.g. {missing[:3]})")
+        assert train_stems, "split_json produced an empty train set"
+        if not val_stems:
+            print("  split_json: empty val list — carving 15% of train for val")
+            train_stems, val_stems = make_train_val_split(
+                train_stems, val_fraction=0.15, seed=cfg.get("seed", 42))
+    else:
+        train_stems, val_stems = make_train_val_split(
+            stems, val_fraction=dcfg.get("val_fraction", 0.15),
+            seed=cfg.get("seed", 42))
 
     def stems_to_paths(stem_list):
         bf = [os.path.join(bf_dir, f"{s}.npy") for s in stem_list]
@@ -282,9 +303,23 @@ def build_scheduler(optimizer, cfg, steps_per_epoch):
         raise ValueError(f"Unknown scheduler: {sched_type}")
 
 
-def main(config_path, resume_from=None):
+def main(config_path, resume_from=None, split_json=None, data_dir=None,
+         ckpt_dir=None):
     cfg = load_config(config_path)
     cfg = validate_config(cfg)
+
+    # Optional CLI overrides (used by the two-stage force pipeline so we can point
+    # a stock BF->GFP config at the new data + a fresh ckpt dir without new yaml).
+    if data_dir:
+        cfg["data"]["data_dir"] = data_dir
+    if ckpt_dir:
+        cfg["training"]["checkpoint_dir"] = ckpt_dir
+
+    split_stems = None
+    if split_json:
+        with open(split_json) as f:
+            sj = json.load(f)
+        split_stems = {"train": sj.get("train", []), "val": sj.get("val", [])}
 
     tcfg = cfg["training"]
     experiment_name = cfg.get("experiment_name", "default")
@@ -308,7 +343,7 @@ def main(config_path, resume_from=None):
     shutil.copy2(config_path, os.path.join(ckpt_dir, "config.yaml"))
 
     # Datasets
-    train_ds, val_ds, train_stems, val_stems = build_datasets(cfg)
+    train_ds, val_ds, train_stems, val_stems = build_datasets(cfg, split_stems)
     accelerator.print(f"Train: {len(train_ds)} samples ({len(train_stems)} volumes), "
                       f"Val: {len(val_ds)} samples ({len(val_stems)} volumes)")
     accelerator.print(f"GFP norm mode: {cfg['data'].get('gfp_norm_mode', 'volume')}")
@@ -473,5 +508,13 @@ if __name__ == "__main__":
                         help="Path to experiment config YAML")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
+    parser.add_argument("--split_json", type=str, default=None,
+                        help="JSON with {'train':[stems],'val':[stems]} to force an "
+                             "explicit split (leak-free BF->GFP for the two-stage "
+                             "force pipeline)")
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Override cfg.data.data_dir")
+    parser.add_argument("--ckpt_dir", type=str, default=None,
+                        help="Override cfg.training.checkpoint_dir")
     args = parser.parse_args()
-    main(args.config, args.resume)
+    main(args.config, args.resume, args.split_json, args.data_dir, args.ckpt_dir)

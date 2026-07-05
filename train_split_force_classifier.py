@@ -50,7 +50,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.config import load_config, validate_config
-from src.utils import set_seed, prepare_env
+from src.utils import set_seed, prepare_env, make_train_val_split
 from src.data.regression_dataset import VolumeRegressionDataset
 from src.models.gfp_classifier import build_gfp_classifier
 from src.data.force_metadata import build_force_groups
@@ -92,11 +92,58 @@ def split_replicates(group_keys, rep_force, n_bins, test_frac, val_frac, seed):
     return sorted(train), sorted(val), sorted(test), [float(e) for e in strat_edges]
 
 
+def _emit_split_manifests(args, seed, n_bins, group_cols, groups, rep_force,
+                          group_bin, train_g, val_g, test_g, edges, classes,
+                          class_rep, strat_edges, forces_per_stem):
+    """Write two side files next to --output:
+
+      <output>.split.json        full force split (consumed by --split_json here)
+      <output>.bfgfp_split.json  {"train","val"} per-volume split of the NON-TEST
+                                 stems, for the paired BF->GFP stage (train.py
+                                 --split_json). Test replicates are excluded, so
+                                 the BF->GFP encoder never sees the force test set.
+    """
+    base = os.path.splitext(args.output)[0]
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+
+    manifest = {
+        "schema": "force_split_v1",
+        "seed": int(seed), "n_bins": int(n_bins), "bin_scheme": args.bin_scheme,
+        "target_col": args.target_col, "group_cols": list(group_cols),
+        "input": args.input,
+        "scoring_bin_edges": [float(e) for e in edges],
+        "stratify_edges": [float(e) for e in strat_edges],
+        "classes": list(classes), "class_rep_force": [float(x) for x in class_rep],
+        "groups": {g: {"stems": list(groups[g]), "force": float(rep_force[g]),
+                       "bin": int(group_bin[g])} for g in groups},
+        "train_groups": list(train_g), "val_groups": list(val_g),
+        "test_groups": list(test_g),
+        "stem_force": {s: float(forces_per_stem[s]) for s in forces_per_stem},
+    }
+    with open(base + ".split.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    # BF->GFP stage: train/val over NON-TEST stems only (test fully held out).
+    nontest = [s for g in (list(train_g) + list(val_g)) for s in groups[g]]
+    bf_tr, bf_va = make_train_val_split(nontest, val_fraction=0.15, seed=seed)
+    test_stems = [s for g in test_g for s in groups[g]]
+    with open(base + ".bfgfp_split.json", "w") as f:
+        json.dump({"train": sorted(bf_tr), "val": sorted(bf_va),
+                   "excluded_test_stems": sorted(test_stems),
+                   "note": "per-volume split of non-test stems; force TEST "
+                           "replicates are excluded to keep the probe leak-free"},
+                  f, indent=2)
+    print(f"  emitted {base}.split.json  and  {base}.bfgfp_split.json "
+          f"(BF->GFP train={len(bf_tr)} val={len(bf_va)}, test excluded={len(test_stems)})")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-c", "--config", required=True)
-    p.add_argument("--metadata", required=True,
-                   help="Mapping spreadsheet (.xlsx/.csv) with file + force cols")
+    p.add_argument("--metadata", default=None,
+                   help="Mapping spreadsheet (.xlsx/.csv) with file + force cols. "
+                        "Required unless --split_json is given (which supplies the "
+                        "already-resolved split).")
     p.add_argument("--target_col", default="peak_amplitude_week3",
                    help="Force column to discretize and classify")
     p.add_argument("--file_col", default="file",
@@ -130,6 +177,21 @@ def main():
                    help="Proceed even if some force-labeled metadata rows fail to "
                         "match a staged volume (default: refuse, to catch a bad "
                         "filename mapping before training).")
+    p.add_argument("--freeze_encoder", action="store_true",
+                   help="Linear-probe mode: freeze the encoder (incl. BN running "
+                        "stats), train ONLY the classification head on the frozen "
+                        "representations. Pair with --init_from a BF->GFP U-Net.")
+    p.add_argument("--split_json", default=None,
+                   help="Consume a split manifest (<output>.split.json) emitted by a "
+                        "prior --plan_only run, so this probe uses the IDENTICAL "
+                        "replicate split as a paired BF->GFP stage. Skips metadata "
+                        "matching + re-splitting (test stays leak-free).")
+    p.add_argument("--weight_decay", type=float, default=None,
+                   help="L2 regularization (AdamW decoupled weight decay) on the "
+                        "TRAINED params; overrides cfg.training.weight_decay. With "
+                        "--freeze_encoder this is the L2 on the linear head — use a "
+                        "stronger value (e.g. 0.05) since it fits 2048-d features "
+                        "from few tissues.")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -145,67 +207,101 @@ def main():
     dims = cfg["model"].get("dims", "2d")
     group_cols = [c.strip() for c in args.group_cols.split(",") if c.strip()]
 
-    # ---- metadata match + replicate groups (no torch needed yet) ----
-    data = build_force_groups(
-        args.metadata, data_dir, args.target_col,
-        file_col=args.file_col, group_cols=tuple(group_cols),
-        modality=args.input)
-    forces_per_stem = data["forces"]
-    groups = data["groups"]
-    rep_force = data["rep_force"]
-    print("\n".join(data["report"]))
+    if args.split_json:
+        # ---- CONSUME a split manifest (identical split to a paired BF->GFP run) ----
+        data = None
+        with open(args.split_json) as f:
+            sp = json.load(f)
+        n_bins = int(sp["n_bins"])
+        classes = sp["classes"]
+        edges = np.array(sp["scoring_bin_edges"], dtype=np.float64)
+        ranges = edges_to_ranges(edges, n_bins)
+        class_rep = np.array(sp["class_rep_force"], dtype=np.float64)
+        strat_edges = sp.get("stratify_edges", [])
+        groups = {g: list(v["stems"]) for g, v in sp["groups"].items()}
+        rep_force = {g: float(v["force"]) for g, v in sp["groups"].items()}
+        group_bin = {g: int(v["bin"]) for g, v in sp["groups"].items()}
+        group_keys = sorted(groups.keys())
+        train_g, val_g, test_g = (sp["train_groups"], sp["val_groups"],
+                                  sp["test_groups"])
+        forces_per_stem = {s: float(v) for s, v in sp["stem_force"].items()}
+        targets = {s: float(assign_bin(forces_per_stem[s], edges))
+                   for s in forces_per_stem}
+        print(f"consuming split manifest {args.split_json} "
+              f"(seed={sp.get('seed')}, n_bins={n_bins}, "
+              f"target={sp.get('target_col')}); reading modality '{args.input}'")
+        if sp.get("target_col") and sp["target_col"] != args.target_col:
+            print(f"  note: manifest target_col={sp['target_col']} "
+                  f"(overrides --target_col {args.target_col})")
+    else:
+        # ---- metadata match + replicate groups, then split (no torch yet) ----
+        if not args.metadata:
+            raise SystemExit("--metadata is required unless --split_json is given.")
+        data = build_force_groups(
+            args.metadata, data_dir, args.target_col,
+            file_col=args.file_col, group_cols=tuple(group_cols),
+            modality=args.input)
+        forces_per_stem = data["forces"]
+        groups = data["groups"]
+        rep_force = data["rep_force"]
+        print("\n".join(data["report"]))
 
-    if data["n_matched"] == 0:
-        raise SystemExit(
-            "No metadata force rows matched any staged volume — check --file_col "
-            "and that the spreadsheet filenames correspond to the staged .npy "
-            "names (see the unmatched examples above).")
-    if data["unmatched_meta"] and not args.allow_partial_match:
-        raise SystemExit(
-            f"{len(data['unmatched_meta'])} force-labeled metadata row(s) matched "
-            "NO staged volume (examples above). Fix the filename mapping, or pass "
-            "--allow_partial_match to train on the matched subset anyway.")
+        if data["n_matched"] == 0:
+            raise SystemExit(
+                "No metadata force rows matched any staged volume — check "
+                "--file_col and that the spreadsheet filenames correspond to the "
+                "staged .npy names (see the unmatched examples above).")
+        if data["unmatched_meta"] and not args.allow_partial_match:
+            raise SystemExit(
+                f"{len(data['unmatched_meta'])} force-labeled metadata row(s) "
+                "matched NO staged volume (examples above). Fix the filename "
+                "mapping, or pass --allow_partial_match to train on the matched "
+                "subset anyway.")
 
-    n_bins = args.n_bins
-    group_keys = sorted(groups.keys())
-    if len(group_keys) < n_bins:
-        raise SystemExit(
-            f"Only {len(group_keys)} replicate(s) but n_bins={n_bins}; "
-            f"lower --n_bins or coarsen --group_cols.")
+        n_bins = args.n_bins
+        group_keys = sorted(groups.keys())
+        if len(group_keys) < n_bins:
+            raise SystemExit(
+                f"Only {len(group_keys)} replicate(s) but n_bins={n_bins}; "
+                f"lower --n_bins or coarsen --group_cols.")
 
-    # ---- replicate split ----
-    train_g, val_g, test_g, strat_edges = split_replicates(
-        group_keys, rep_force, n_bins, args.test_frac, args.val_frac, seed)
+        train_g, val_g, test_g, strat_edges = split_replicates(
+            group_keys, rep_force, n_bins, args.test_frac, args.val_frac, seed)
 
-    # Small-data guard: don't starve train for a val split.
-    min_train = max(n_bins, 3)
-    if val_g and len(train_g) < min_train:
-        print(f"  note: only {len(train_g)} train replicates after carving val; "
-              f"folding val back into train (train/test only).")
-        train_g = sorted(train_g + val_g)
-        val_g = []
-    if not test_g:
-        raise SystemExit(
-            "Split produced an empty TEST set — too few replicates. Lower "
-            "--n_bins or raise --test_frac.")
-    if len(train_g) < n_bins:
-        raise SystemExit(
-            f"Only {len(train_g)} train replicate(s) for {n_bins} bins — "
-            "lower --n_bins or --test_frac/--val_frac.")
+        # Small-data guard: don't starve train for a val split.
+        min_train = max(n_bins, 3)
+        if val_g and len(train_g) < min_train:
+            print(f"  note: only {len(train_g)} train replicates after carving "
+                  f"val; folding val back into train (train/test only).")
+            train_g = sorted(train_g + val_g)
+            val_g = []
+        if not test_g:
+            raise SystemExit(
+                "Split produced an empty TEST set — too few replicates. Lower "
+                "--n_bins or raise --test_frac.")
+        if len(train_g) < n_bins:
+            raise SystemExit(
+                f"Only {len(train_g)} train replicate(s) for {n_bins} bins — "
+                "lower --n_bins or --test_frac/--val_frac.")
 
-    # ---- TRAIN-only scoring discretization + calibration ----
-    edges = compute_bin_edges([rep_force[g] for g in train_g], n_bins,
-                              args.bin_scheme)
-    ranges = edges_to_ranges(edges, n_bins)
-    classes = [bin_label(i, n_bins) for i in range(n_bins)]
-    group_bin = {g: assign_bin(rep_force[g], edges) for g in group_keys}
-    targets = {s: float(assign_bin(forces_per_stem[s], edges))
-               for s in forces_per_stem}
-    class_rep = np.zeros(n_bins, dtype=np.float64)
-    for b in range(n_bins):
-        gv = [rep_force[g] for g in train_g if group_bin[g] == b]
-        class_rep[b] = (float(np.mean(gv)) if gv
-                        else float(np.mean([rep_force[g] for g in train_g])))
+        # ---- TRAIN-only scoring discretization + calibration ----
+        edges = compute_bin_edges([rep_force[g] for g in train_g], n_bins,
+                                  args.bin_scheme)
+        ranges = edges_to_ranges(edges, n_bins)
+        classes = [bin_label(i, n_bins) for i in range(n_bins)]
+        group_bin = {g: assign_bin(rep_force[g], edges) for g in group_keys}
+        targets = {s: float(assign_bin(forces_per_stem[s], edges))
+                   for s in forces_per_stem}
+        class_rep = np.zeros(n_bins, dtype=np.float64)
+        for b in range(n_bins):
+            gv = [rep_force[g] for g in train_g if group_bin[g] == b]
+            class_rep[b] = (float(np.mean(gv)) if gv
+                            else float(np.mean([rep_force[g] for g in train_g])))
+
+        # ---- emit split manifests (force-probe consume + BF->GFP stage) ----
+        _emit_split_manifests(args, seed, n_bins, group_cols, groups, rep_force,
+                              group_bin, train_g, val_g, test_g, edges, classes,
+                              class_rep, strat_edges, forces_per_stem)
 
     def split_summary(name, gs):
         bincnt = {i: 0 for i in range(n_bins)}
@@ -233,8 +329,11 @@ def main():
         "n_bins": n_bins, "bin_scheme": args.bin_scheme,
         "group_cols": group_cols,
         "n_replicates": len(group_keys),
-        "n_volumes_matched": data["n_matched"],
-        "metadata_columns": data["columns"],
+        "n_volumes_matched": (data["n_matched"] if data
+                              else sum(len(v) for v in groups.values())),
+        "metadata_columns": (data["columns"] if data else None),
+        "consumed_split_json": args.split_json,
+        "freeze_encoder": bool(args.freeze_encoder),
         "stratify_edges": strat_edges,
         "scoring_bin_edges": [float(e) for e in edges],
         "bin_ranges": ranges, "classes": classes,
@@ -250,9 +349,9 @@ def main():
                       "bin": int(group_bin[g]), "n_vols": len(groups[g])}
                      for g in test_g],
         },
-        "match_report": data["report"],
-        "n_unmatched_meta": len(data["unmatched_meta"]),
-        "n_unmatched_staged": len(data["unmatched_staged"]),
+        "match_report": (data["report"] if data else ["(consumed split manifest)"]),
+        "n_unmatched_meta": (len(data["unmatched_meta"]) if data else 0),
+        "n_unmatched_staged": (len(data["unmatched_staged"]) if data else 0),
     }
 
     if args.plan_only:
@@ -304,8 +403,30 @@ def main():
                 f"--init_from {args.init_from} matched 0 encoder tensors — "
                 "architecture mismatch? Refusing a fake warm start.")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=tcfg.get("weight_decay", 0.01))
+    # Linear-probe: freeze encoder params BEFORE the optimizer/prepare so only the
+    # head trains and DDP sees the right trainable set. (BN stats are frozen in the
+    # loop via encoder.eval().)
+    if args.freeze_encoder:
+        for pm in model.encoder.parameters():
+            pm.requires_grad = False
+        trainable = [pm for pm in model.parameters() if pm.requires_grad]
+        n_tr = sum(p.numel() for p in trainable)
+        n_enc = sum(p.numel() for p in model.encoder.parameters())
+        accelerator.print(
+            f"freeze_encoder: linear probe — training {n_tr:,} head params, "
+            f"encoder frozen ({n_enc:,} params)")
+        if not args.init_from:
+            accelerator.print(
+                "  WARNING: --freeze_encoder without --init_from freezes a RANDOM "
+                "encoder; features will be uninformative.")
+    else:
+        trainable = model.parameters()
+
+    wd = (args.weight_decay if args.weight_decay is not None
+          else tcfg.get("weight_decay", 0.01))
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=wd)
+    accelerator.print(f"optimizer: AdamW lr={lr} weight_decay(L2)={wd}"
+                      + (" on linear head" if args.freeze_encoder else ""))
     criterion = nn.CrossEntropyLoss()
 
     gen = torch.Generator()
@@ -363,6 +484,9 @@ def main():
     no_improve = 0
     for ep in range(epochs):
         model.train()
+        if args.freeze_encoder:
+            # keep BN running stats frozen so the "frozen" features don't drift
+            accelerator.unwrap_model(model).encoder.eval()
         losses = []
         for img, tgt, _ in train_loader:
             lex, _lpt = model(img)
@@ -528,7 +652,8 @@ def main():
         "best_epoch": best_epoch,
         "config_flags": {"test_frac": float(args.test_frac),
                          "val_frac": float(args.val_frac),
-                         "has_val": bool(val_stems)},
+                         "has_val": bool(val_stems),
+                         "weight_decay_l2": float(wd)},
         "per_test_replicate": results,
     })
     if accelerator.is_main_process:

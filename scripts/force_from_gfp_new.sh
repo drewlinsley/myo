@@ -33,7 +33,7 @@
 #   TARGET_COL   force column to classify                (default: peak_amplitude_week3)
 #   FILE_COL     spreadsheet column with the filename    (default: file)
 #   GROUP_COLS   comma-sep columns = one replicate       (default: plate,Tissue)
-#   N_BINS       number of force classes                 (default: 3)
+#   N_BINS       number of force classes                 (default: 4)
 #   BIN_SCHEME   quantile | uniform                      (default: quantile)
 #   TEST_FRAC    fraction of replicates for TEST         (default: 0.25)
 #   VAL_FRAC     fraction for VAL (0 -> train/test only) (default: 0; set >0 to
@@ -42,7 +42,8 @@
 #   OUT_DIR      results root                            (default: results/force_from_gfp_new)
 #   ENC_CKPT_2D  override 2D BF->GFP encoder ckpt path
 #   ENC_CKPT_3D  override 3D BF->GFP encoder ckpt path
-#   SAVE_CKPTS=1 also persist best weights under <OUT_DIR>/ckpt_{2d,3d}.pth
+#   SAVE_CKPTS    persist best weights to <OUT_DIR>/ckpt_{2d,3d}.pth (default: 1;
+#                 needed by gradviz_force.py). Set SAVE_CKPTS=0 to skip.
 #   ONLY=2d|3d   run just one arch                       (default: both)
 #   FORCE=1      overwrite existing result JSONs
 #   PLAN_ONLY=1  dry run: build match + split, then exit (no training)
@@ -64,7 +65,7 @@ METADATA="${METADATA:-phalloidin_mhc_mapping_051426_SS edit.xlsx}"
 TARGET_COL="${TARGET_COL:-peak_amplitude_week3}"
 FILE_COL="${FILE_COL:-file}"
 GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
-N_BINS="${N_BINS:-3}"
+N_BINS="${N_BINS:-4}"   # 4-way is the practical ceiling for a 6-replicate test set
 BIN_SCHEME="${BIN_SCHEME:-quantile}"
 TEST_FRAC="${TEST_FRAC:-0.25}"
 VAL_FRAC="${VAL_FRAC:-0}"   # 0 -> train/test only (val collapsed into train)
@@ -161,7 +162,11 @@ run_arch() {
   local extra_flag=()
   [ "${PLAN_ONLY:-0}" = "1" ] && extra_flag+=(--plan_only)
   [ "${ALLOW_PARTIAL_MATCH:-0}" = "1" ] && extra_flag+=(--allow_partial_match)
-  [ "${SAVE_CKPTS:-0}" = "1" ] && extra_flag+=(--save_ckpt "$OUT_DIR/ckpt_${dims}.pth")
+  # Save the trained weights by default (needed for gradviz_force.py saliency).
+  [ "${SAVE_CKPTS:-1}" = "1" ] && [ "${PLAN_ONLY:-0}" != "1" ] \
+    && extra_flag+=(--save_ckpt "$OUT_DIR/ckpt_${dims}.pth")
+  # Optional L2 override (AdamW weight decay); default uses the config's 0.01.
+  [ -n "${WEIGHT_DECAY:-}" ] && extra_flag+=(--weight_decay "$WEIGHT_DECAY")
 
   if [ "${PLAN_ONLY:-0}" = "1" ]; then
     echo "[$dims] planning (dry run, no GPU) — config=$cfg"

@@ -138,6 +138,8 @@ def bin_label(i, n_bins):
         return ["low", "high"][i]
     if n_bins == 3:
         return ["low", "mid", "high"][i]
+    if n_bins == 4:
+        return ["low", "mid-low", "mid-high", "high"][i]
     return f"q{i}"
 
 
