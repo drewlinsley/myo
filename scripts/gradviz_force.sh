@@ -16,6 +16,8 @@
 #   OUT_DIR     force results root         (default: results/force_from_gfp_new)
 #   DATA_DIR    staged root                (default: data_phalloidin_mhc_051826_staged)
 #   CKPT_2D/3D  checkpoint paths           (default: <OUT_DIR>/ckpt_{2d,3d}.pth)
+#   RESULT_PREFIX result-json prefix for test-vol pick (default: force; use "probe"
+#               for the two-stage models, i.e. reads <OUT_DIR>/probe_<dims>.json)
 #   N_SAMPLES   SmoothGrad noisy samples   (default: 25)
 #   NOISE       sigma as frac of range     (default: 0.15)
 #   TARGET      pred|high|low class logit  (default: pred)
@@ -59,7 +61,7 @@ run_arch() {
   [ -f "$ckpt" ] || { echo "[$dims] no checkpoint at $ckpt — run force_from_gfp_new.sh (SAVE_CKPTS=1) first; skipping" >&2; return 0; }
   local stems="${STEMS:-}"
   if [ -z "$stems" ]; then
-    stems="$(test_stems "$OUT_DIR/force_${dims}.json" "$N_VOLS")"
+    stems="$(test_stems "$OUT_DIR/${RESULT_PREFIX:-force}_${dims}.json" "$N_VOLS")"
   fi
   local stem_flag=(); [ -n "$stems" ] && stem_flag=(--stems $stems)
   echo "[$dims] SmoothGrad on ${stems:-<first $N_VOLS vols>}"

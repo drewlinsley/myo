@@ -133,6 +133,7 @@ run_probe() {
     --split_json "$SPLIT" --init_from "$enc" \
     --input "$PROBE_INPUT" "${freeze_flag[@]+"${freeze_flag[@]}"}" \
     --weight_decay "$PROBE_L2" \
+    --save_ckpt "$OUT_DIR/probe_${dims}.pth" \
     --seed "$SEED" --output "$out"
 }
 
@@ -143,6 +144,15 @@ fi
 if [ "$ONLY" = "both" ] || [ "$ONLY" = "3d" ]; then
   run_bfgfp 3d configs/unet_3d_imagenet_pearson.yaml
   run_probe 3d configs/gfp_classifier_3d.yaml
+fi
+
+# ── Stage 3: SmoothGrad saliency (XAI) of the frozen-rep probe(s) ──
+# gradviz auto-detects the probe input modality from the saved ckpt (bf/gfp).
+if [ "${SKIP_SALIENCY:-0}" != "1" ]; then
+  echo ""; echo "# Stage 3: SmoothGrad saliency of the probe model(s)"
+  OUT_DIR="$OUT_DIR" DATA_DIR="$DATA_DIR" ONLY="$ONLY" RESULT_PREFIX=probe \
+    CKPT_2D="$OUT_DIR/probe_2d.pth" CKPT_3D="$OUT_DIR/probe_3d.pth" \
+    bash scripts/gradviz_force.sh || echo "  (probe saliency skipped — see above)"
 fi
 
 # ── Compare: two-stage probe (2D/3D) and, if present, the direct GFP->force run ──
@@ -181,5 +191,6 @@ echo "════════════════════════�
 echo " Done. Outputs in $OUT_DIR/:"
 echo "   force.split.json / force.bfgfp_split.json   the shared leak-free split"
 echo "   unet_new_{2d,3d}/best.pth                    stage-1 BF->GFP models"
-echo "   probe_{2d,3d}.json / .png                    stage-2 force metrics + figures"
+echo "   probe_{2d,3d}.json / .png / .pth             stage-2 force metrics + figures + weights"
+echo "   saliency_{2d,3d}/                            stage-3 SmoothGrad (XAI) panels"
 echo "════════════════════════════════════════════════════════════"

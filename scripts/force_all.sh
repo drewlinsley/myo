@@ -8,7 +8,8 @@
 #      which GFP features drive each held-out force call.
 #   3. Two-stage BF->GFP -> frozen-rep force probe  -> results/force_two_stage/
 #      train BF->GFP on this data (same split), freeze it, linear-probe force;
-#      ends with a direct-vs-two-stage comparison.
+#      also emits perf plots AND SmoothGrad (XAI) saliency for the probe models,
+#      and ends with a direct-vs-two-stage comparison.
 #
 # All three share ONE set of knobs (data, force column, bins, split, seed), so the
 # comparison is apples-to-apples. Sub-steps skip work that already exists unless
@@ -16,10 +17,13 @@
 #
 # Usage
 # -----
-#   bash scripts/force_all.sh                 # run everything
-#   FORCE=1 bash scripts/force_all.sh         # redo everything
+#   bash scripts/force_all.sh                 # run everything, RETRAINING all models
+#   FORCE=0 bash scripts/force_all.sh         # reuse existing outputs (skip retrain)
 #   SKIP_TWOSTAGE=1 bash scripts/force_all.sh # just direct + saliency
 #   ONLY=2d bash scripts/force_all.sh         # only the 2D arch throughout
+#
+# NOTE: retrains from scratch by default (FORCE=1) — redoes stats, split, the
+# BF->GFP models, and every classifier. Set FORCE=0 to reuse what already exists.
 #
 # Key knobs (defaults in parens) — all forwarded to the sub-scripts:
 #   DATA_DIR (data_phalloidin_mhc_051826_staged)  METADATA (phalloidin_..._SS edit.xlsx)
@@ -64,7 +68,7 @@ echo " FORCE-FROM-GFP — full pipeline"
 echo "   data=$DATA_DIR"
 echo "   target=$TARGET_COL  groups=$GROUP_COLS  n_bins=$N_BINS  seed=$SEED  ONLY=$ONLY"
 echo "   two-stage: probe_input=$PROBE_INPUT freeze=$FREEZE L2=$PROBE_L2"
-echo "   partial_match=$ALLOW_PARTIAL_MATCH  force=${FORCE:-0}"
+echo "   partial_match=$ALLOW_PARTIAL_MATCH  retrain(FORCE)=$FORCE"
 echo "████████████████████████████████████████████████████████████"
 
 if [ "${SKIP_DIRECT:-0}" != "1" ]; then
@@ -112,10 +116,12 @@ if rows:
 else:
     print("  (no result JSONs found)")
 print()
-for d, what in [("results/force_from_gfp_new", "direct metrics + plots"),
-                ("results/force_from_gfp_new/saliency_2d", "2D saliency panels"),
-                ("results/force_from_gfp_new/saliency_3d", "3D saliency panels"),
-                ("results/force_two_stage", "two-stage probe + BF->GFP models")]:
+for d, what in [("results/force_from_gfp_new", "direct: metrics + perf plots"),
+                ("results/force_from_gfp_new/saliency_2d", "direct 2D XAI (saliency)"),
+                ("results/force_from_gfp_new/saliency_3d", "direct 3D XAI (saliency)"),
+                ("results/force_two_stage", "two-stage: probe metrics + perf plots + BF->GFP models"),
+                ("results/force_two_stage/saliency_2d", "two-stage 2D XAI (saliency)"),
+                ("results/force_two_stage/saliency_3d", "two-stage 3D XAI (saliency)")]:
     print(f"  {'[ok]' if os.path.isdir(d) else '[--]'} {d}  ({what})")
 PY
 echo "████████████████████████████████████████████████████████████"
