@@ -68,7 +68,18 @@ GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
 N_BINS="${N_BINS:-4}"   # 4-way is the practical ceiling for a 6-replicate test set
 BIN_SCHEME="${BIN_SCHEME:-quantile}"
 TEST_FRAC="${TEST_FRAC:-0.25}"
-VAL_FRAC="${VAL_FRAC:-0}"   # 0 -> train/test only (val collapsed into train)
+# Held-out val for early stopping. With 0 (no val) we early-stop on TRAIN loss,
+# which just picks the most-overfit epoch — a real cause of poor test numbers on
+# this small data. Default now carves a val split so early stopping is honest.
+VAL_FRAC="${VAL_FRAC:-0.2}"
+# TASK: classification (force bins) or regression (continuous force). Selects the
+# trainer, the output prefix, and the metrics/plots.
+TASK="${TASK:-classification}"
+case "$TASK" in
+  classification) PREFIX=force; TRAINER=train_split_force_classifier.py ;;
+  regression)     PREFIX=reg;   TRAINER=train_split_force_regressor.py ;;
+  *) echo "ERROR: TASK must be classification|regression (got '$TASK')" >&2; exit 1 ;;
+esac
 SEED="${SEED:-42}"
 OUT_DIR="${OUT_DIR:-results/force_from_gfp_new}"
 ONLY="${ONLY:-both}"
@@ -130,7 +141,7 @@ ENC_CKPT_3D="${ENC_CKPT_3D:-$(find_ckpt 3d)}"
 # ── One training (or plan) run for a given arch ──
 run_arch() {
   local dims="$1" cfg="$2" enc="$3"
-  local out="$OUT_DIR/force_${dims}.json"
+  local out="$OUT_DIR/${PREFIX}_${dims}.json"
 
   if [ "${PLAN_ONLY:-0}" != "1" ] && [ -f "$out" ] && [ "${FORCE:-0}" != "1" ]; then
     echo "[$dims] exists, skipping: $out  (FORCE=1 to redo)"
@@ -164,16 +175,24 @@ run_arch() {
   [ "${ALLOW_PARTIAL_MATCH:-0}" = "1" ] && extra_flag+=(--allow_partial_match)
   # Save the trained weights by default (needed for gradviz_force.py saliency).
   [ "${SAVE_CKPTS:-1}" = "1" ] && [ "${PLAN_ONLY:-0}" != "1" ] \
-    && extra_flag+=(--save_ckpt "$OUT_DIR/ckpt_${dims}.pth")
+    && extra_flag+=(--save_ckpt "$OUT_DIR/${PREFIX}_ckpt_${dims}.pth")
   # Optional L2 override (AdamW weight decay); default uses the config's 0.01.
   [ -n "${WEIGHT_DECAY:-}" ] && extra_flag+=(--weight_decay "$WEIGHT_DECAY")
 
-  if [ "${PLAN_ONLY:-0}" = "1" ]; then
-    echo "[$dims] planning (dry run, no GPU) — config=$cfg"
+  # Task-specific args: bins for classification, loss for regression.
+  local task_flag=()
+  if [ "$TASK" = "classification" ]; then
+    task_flag=(--n_bins "$N_BINS" --bin_scheme "$BIN_SCHEME")
   else
-    echo "[$dims] training force classifier — config=$cfg"
+    task_flag=(--loss "${REG_LOSS:-huber}")
   fi
-  python train_split_force_classifier.py \
+
+  if [ "${PLAN_ONLY:-0}" = "1" ]; then
+    echo "[$dims] planning $TASK (dry run) — config=$cfg"
+  else
+    echo "[$dims] training $TASK ($PREFIX) — config=$cfg"
+  fi
+  python "$TRAINER" \
     -c "$cfg" \
     --metadata "$METADATA" \
     --data_dir "$DATA_DIR" \
@@ -181,8 +200,7 @@ run_arch() {
     --target_col "$TARGET_COL" \
     --file_col "$FILE_COL" \
     --group_cols "$GROUP_COLS" \
-    --n_bins "$N_BINS" \
-    --bin_scheme "$BIN_SCHEME" \
+    "${task_flag[@]}" \
     --test_frac "$TEST_FRAC" \
     --val_frac "$VAL_FRAC" \
     --seed "$SEED" \
@@ -207,17 +225,45 @@ fi
 if [ "${PLAN_ONLY:-0}" = "1" ]; then
   echo "════════════════════════════════════════════════════════════"
   echo " Plan written. Review match coverage + the train/val/test split above"
-  echo " (and $OUT_DIR/force_*.plan.json), then rerun WITHOUT PLAN_ONLY to train."
+  echo " (and $OUT_DIR/${PREFIX}_*.plan.json), then rerun WITHOUT PLAN_ONLY to train."
   echo "════════════════════════════════════════════════════════════"
   exit 0
 fi
 
 # ── 2D-vs-3D comparison plot (only when both arches ran this invocation) ──
-J2="$OUT_DIR/force_2d.json"
-J3="$OUT_DIR/force_3d.json"
-if [ "$ONLY" = "both" ] && [ -f "$J2" ] && [ -f "$J3" ]; then
+J2="$OUT_DIR/${PREFIX}_2d.json"
+J3="$OUT_DIR/${PREFIX}_3d.json"
+if [ "$ONLY" = "both" ] && [ -f "$J2" ] && [ -f "$J3" ] && [ "$TASK" = "regression" ]; then
+  echo "Building 2D-vs-3D regression comparison…"
+  python - "$J2" "$J3" "$OUT_DIR/${PREFIX}_2d_vs_3d.png" <<'PY'
+import json, sys
+import numpy as np
+import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+d2 = json.load(open(sys.argv[1])); d3 = json.load(open(sys.argv[2]))
+models = [("2D", d2), ("3D", d3)]
+fig, ax = plt.subplots(1, 2, figsize=(11, 4.5))
+maes = [d["metrics"]["mae"] for _, d in models]
+base = d2["metrics"]["baseline_mae_predict_mean"]
+ax[0].bar([n for n, _ in models], maes, color=["#4363d8", "#e6194b"])
+ax[0].axhline(base, color="gray", ls=":", label=f"mean-baseline={base:.2f}")
+ax[0].set_ylabel("Test MAE (lower better)"); ax[0].set_title("MAE"); ax[0].legend(fontsize=8)
+x = np.arange(2); w = 0.35
+for i, (n, d) in enumerate(models):
+    ax[1].bar(x + (i-0.5)*w, [d["metrics"]["spearman"], d["metrics"]["r2"]], w,
+              label=n, color=["#4363d8", "#e6194b"][i])
+ax[1].set_xticks(x); ax[1].set_xticklabels(["Spearman", "R²"]); ax[1].axhline(0, color="k", lw=0.6)
+ax[1].set_ylim(-1.05, 1.05); ax[1].set_title("Rank corr / R²"); ax[1].legend(fontsize=8)
+fig.suptitle(f"Force REGRESSION (new data): 2D vs 3D | {d2.get('target_col')}", fontsize=12)
+fig.tight_layout(rect=[0, 0, 1, 0.93]); fig.savefig(sys.argv[3], dpi=150)
+print("Saved", sys.argv[3])
+for n, d in models:
+    m = d["metrics"]
+    print(f"{n}: MAE={m['mae']:.3f} (base {m['baseline_mae_predict_mean']:.3f}) "
+          f"R2={m['r2']:.3f} spearman={m['spearman']:.3f} pearson={m['pearson']:.3f}")
+PY
+elif [ "$ONLY" = "both" ] && [ -f "$J2" ] && [ -f "$J3" ]; then
   echo "Building 2D-vs-3D comparison plot…"
-  python - "$J2" "$J3" "$OUT_DIR/force_2d_vs_3d.png" <<'PY'
+  python - "$J2" "$J3" "$OUT_DIR/${PREFIX}_2d_vs_3d.png" <<'PY'
 import json, sys
 import numpy as np
 import matplotlib
@@ -287,8 +333,9 @@ PY
 fi
 
 echo "════════════════════════════════════════════════════════════"
-echo " Done. Outputs in $OUT_DIR/:"
-echo "   force_2d.json / .png        per-model TEST metrics + figure"
-echo "   force_3d.json / .png"
-echo "   force_2d_vs_3d.png          2D vs 3D comparison"
+echo " Done ($TASK). Outputs in $OUT_DIR/:"
+echo "   ${PREFIX}_2d.json / .png        per-model TEST metrics + figure"
+echo "   ${PREFIX}_3d.json / .png"
+echo "   ${PREFIX}_2d_vs_3d.png          2D vs 3D comparison"
+echo "   ${PREFIX}_ckpt_{2d,3d}.pth      trained weights (for saliency)"
 echo "════════════════════════════════════════════════════════════"

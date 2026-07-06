@@ -21,6 +21,7 @@
 #   N_SAMPLES   SmoothGrad noisy samples   (default: 25)
 #   NOISE       sigma as frac of range     (default: 0.15)
 #   TARGET      pred|high|low class logit  (default: pred)
+#   VIEW        full|crop                  (default: full = whole H×W plane)
 #   N_VOLS      #test vols to visualize    (default: 6)
 #   STEMS       explicit stems (overrides test-vol auto-pick)
 #   ONLY        both|2d|3d                 (default: both)
@@ -50,8 +51,9 @@ except Exception:
     sys.exit(0)
 out = []
 for r in d.get("per_test_replicate", []):
-    for v in r.get("per_volume", []):
+    for v in r.get("per_volume", []):      # classification schema
         out.append(v["stem"])
+    out.extend(r.get("stems", []))         # regression schema
 print(" ".join(out[:n]))
 PY
 }
@@ -63,20 +65,23 @@ run_arch() {
   if [ -z "$stems" ]; then
     stems="$(test_stems "$OUT_DIR/${RESULT_PREFIX:-force}_${dims}.json" "$N_VOLS")"
   fi
+  local sal_dir="$OUT_DIR/saliency_${RESULT_PREFIX:-force}_${dims}"
   local stem_flag=(); [ -n "$stems" ] && stem_flag=(--stems $stems)
+  local view_flag=(--view "${VIEW:-full}")
   echo "[$dims] SmoothGrad on ${stems:-<first $N_VOLS vols>}"
   python gradviz_force.py \
     -c "$cfg" --ckpt "$ckpt" --data_dir "$DATA_DIR" \
     --n_samples "$N_SAMPLES" --noise_level "$NOISE" --target "$TARGET" \
-    --limit "$N_VOLS" "${stem_flag[@]+"${stem_flag[@]}"}" \
-    --output_dir "$OUT_DIR/saliency_${dims}"
-  echo "[$dims] -> $OUT_DIR/saliency_${dims}/"
+    "${view_flag[@]}" --limit "$N_VOLS" "${stem_flag[@]+"${stem_flag[@]}"}" \
+    --output_dir "$sal_dir"
+  echo "[$dims] -> $sal_dir/"
 }
 
+DEF_PFX="${RESULT_PREFIX:-force}"
 if [ "$ONLY" = "both" ] || [ "$ONLY" = "2d" ]; then
-  run_arch 2d configs/gfp_classifier.yaml "${CKPT_2D:-$OUT_DIR/ckpt_2d.pth}"
+  run_arch 2d configs/gfp_classifier.yaml "${CKPT_2D:-$OUT_DIR/${DEF_PFX}_ckpt_2d.pth}"
 fi
 if [ "$ONLY" = "both" ] || [ "$ONLY" = "3d" ]; then
-  run_arch 3d configs/gfp_classifier_3d.yaml "${CKPT_3D:-$OUT_DIR/ckpt_3d.pth}"
+  run_arch 3d configs/gfp_classifier_3d.yaml "${CKPT_3D:-$OUT_DIR/${DEF_PFX}_ckpt_3d.pth}"
 fi
-echo "Done. Saliency panels (GFP | |saliency| | overlay) in $OUT_DIR/saliency_{2d,3d}/"
+echo "Done. Saliency panels in $OUT_DIR/saliency_${DEF_PFX}_{2d,3d}/"

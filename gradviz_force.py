@@ -42,6 +42,8 @@ from src.utils import set_seed
 from src.data.normalization import normalize
 from src.models.gfp_classifier import build_gfp_classifier
 
+MODALITY = "gfp"   # set in main(); used for panel labels
+
 
 def load_norm_volume(path, stats_dir, modality, z_range, apply_timm):
     """Mirror VolumeRegressionDataset._load: crop z_range, percentile-normalize."""
@@ -78,6 +80,27 @@ def _center_patch3d(vol, pd, cs):
     return vol[z0:z0 + pd, y0:y0 + cs, x0:x0 + cs]
 
 
+def _pad_mult(a, m=32):
+    """Reflect-pad the last two dims up to a multiple of m (the encoder's stride),
+    so the WHOLE plane can be run without cropping to a fixed window."""
+    h, w = a.shape[-2:]
+    ph, pw = (m - h % m) % m, (m - w % m) % m
+    if ph or pw:
+        pad = [(0, 0)] * (a.ndim - 2) + [(0, ph), (0, pw)]
+        a = np.pad(a, pad, mode="reflect")
+    return a
+
+
+def _center_depth(vol, pd):
+    """Center pd-slice sub-stack (reflect-pad z if the stack is shallower)."""
+    z = vol.shape[0]
+    if z < pd:
+        vol = np.pad(vol, ((0, pd - z), (0, 0), (0, 0)), mode="reflect")
+        z = pd
+    z0 = (z - pd) // 2
+    return vol[z0:z0 + pd]
+
+
 def smoothgrad(model, x, target_class, n_samples, noise_level, device):
     """x: (1,1,...) tensor already on device. Returns saliency np array shaped
     like x[0,0] and the clean-input logits (np)."""
@@ -103,27 +126,23 @@ def smoothgrad(model, x, target_class, n_samples, noise_level, device):
     return sal, target_class, clean_logits.detach().cpu().numpy()[0]
 
 
-def overlay_panel(gfp2d, sal2d, title, path, classes, tc, logits, class_rep):
+def overlay_panel(gfp2d, sal2d, title, subtitle, path):
     """3-panel: GFP, saliency, overlay. gfp2d/sal2d are 2D arrays."""
     def norm01(a):
         lo, hi = np.percentile(a, 1), np.percentile(a, 99)
         return np.clip((a - lo) / (hi - lo + 1e-8), 0, 1)
     g = norm01(gfp2d)
     s = norm01(sal2d)
-    probs = np.exp(logits - logits.max()); probs = probs / probs.sum()
-    e_force = float(np.dot(probs, class_rep)) if class_rep is not None else float("nan")
 
     fig, ax = plt.subplots(1, 3, figsize=(13.5, 4.6))
-    ax[0].imshow(g, cmap="gray"); ax[0].set_title("GFP (normalized)")
+    ax[0].imshow(g, cmap="gray"); ax[0].set_title(f"{MODALITY.upper()} (normalized)")
     ax[1].imshow(s, cmap="magma"); ax[1].set_title("SmoothGrad |saliency|")
     ax[2].imshow(g, cmap="gray")
     ax[2].imshow(s, cmap="magma", alpha=0.5)
     ax[2].set_title("overlay")
     for a in ax:
         a.set_xticks([]); a.set_yticks([])
-    pstr = ", ".join(f"{classes[i]}={probs[i]:.2f}" for i in range(len(classes)))
-    fig.suptitle(f"{title}\npredicted={classes[tc]}  probs[{pstr}]  "
-                 f"E[force]={e_force:.2f}", fontsize=11)
+    fig.suptitle(f"{title}\n{subtitle}", fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.9])
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -146,6 +165,9 @@ def main():
                    help="Which force class logit to attribute (pred=argmax)")
     p.add_argument("--all_slices", action="store_true",
                    help="2D: average saliency over all Z-slices (else max-signal slice)")
+    p.add_argument("--view", choices=["full", "crop"], default="full",
+                   help="full = render the WHOLE H×W plane (padded to /32); "
+                        "crop = a single center crop_size window (default: full)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output_dir", required=True)
     args = p.parse_args()
@@ -157,22 +179,31 @@ def main():
     dcfg, mcfg = cfg["data"], cfg["model"]
     dims = mcfg.get("dims", "2d")
 
+    global MODALITY
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    is_reg = ckpt.get("task") == "regression" or ckpt.get("n_out") == 1
     n_bins = int(ckpt.get("n_bins", 3))
+    n_out = 1 if is_reg else n_bins
     classes = ckpt.get("classes") or [f"q{i}" for i in range(n_bins)]
     class_rep = np.array(ckpt["class_rep_force"], dtype=np.float64) \
         if ckpt.get("class_rep_force") is not None else None
+    std = ckpt.get("standardize") or {"mu": 0.0, "sd": 1.0}   # regression only
     modality = args.input or ckpt.get("input", "gfp")
+    MODALITY = modality
     state = ckpt.get("model_state_dict", ckpt)
 
-    model = build_gfp_classifier(cfg, n_bins, 2)
+    model = build_gfp_classifier(cfg, n_out, 2)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if any("encoder" in m for m in missing):
         raise SystemExit(f"ckpt is missing encoder weights ({len(missing)} keys) — "
                          "wrong config for this checkpoint?")
     model.to(device).eval()
 
-    target_class = {"pred": None, "low": 0, "high": n_bins - 1}[args.target]
+    # regression -> attribute the single scalar output; classification -> a class.
+    target_class = 0 if is_reg else {"pred": None, "low": 0,
+                                     "high": n_bins - 1}[args.target]
+    print(f"model: {'REGRESSION' if is_reg else f'{n_bins}-class'} "
+          f"({dims}, input={modality})")
 
     stats_dir = os.path.join(args.data_dir, "stats")
     mod_dir = os.path.join(args.data_dir, modality)
@@ -201,12 +232,14 @@ def main():
                                apply_timm)  # (Z,H,W)
         out_png = os.path.join(args.output_dir, f"{stem}.png")
 
+        prep2d = ((lambda s: _pad_mult(s)) if args.view == "full"
+                  else (lambda s: _center_crop2d(s, cs)))
         if dims == "2d":
             if args.all_slices:
                 sals, gfps, tcs, logit_last = [], [], [], None
                 for z in range(vol.shape[0]):
-                    slc = _center_crop2d(vol[z], cs)
-                    x = torch.from_numpy(slc[None, None]).float()
+                    slc = prep2d(vol[z])
+                    x = torch.from_numpy(slc[None, None].copy()).float()
                     sal, tc, lg = smoothgrad(model, x, target_class,
                                              args.n_samples, args.noise_level, device)
                     sals.append(sal); gfps.append(slc); tcs.append(tc); logit_last = lg
@@ -216,23 +249,42 @@ def main():
                 logits = logit_last
             else:
                 zbest = int(np.argmax(vol.reshape(vol.shape[0], -1).mean(1)))
-                slc = _center_crop2d(vol[zbest], cs)
-                x = torch.from_numpy(slc[None, None]).float()
+                slc = prep2d(vol[zbest])
+                x = torch.from_numpy(slc[None, None].copy()).float()
                 sal, tc, logits = smoothgrad(model, x, target_class,
                                              args.n_samples, args.noise_level, device)
                 gfp2d = slc
-            title = f"{stem}  (2D, slice={'mean' if args.all_slices else 'max-signal'})"
+            vw = "full-plane" if args.view == "full" else f"{cs}px crop"
+            title = (f"{stem}  (2D, {vw}, "
+                     f"slice={'mean' if args.all_slices else 'max-signal'})")
         else:
-            patch = _center_patch3d(vol, pd, cs)                 # (D,H,W)
-            x = torch.from_numpy(patch[None, None]).float()      # (1,1,D,H,W)
+            if args.view == "full":
+                patch = _pad_mult(_center_depth(vol, pd))        # (D,fullH,fullW)
+                vw = f"{pd}×{patch.shape[1]}×{patch.shape[2]} full-plane"
+            else:
+                patch = _center_patch3d(vol, pd, cs)             # (D,cs,cs)
+                vw = f"center patch {pd}x{cs}x{cs}"
+            x = torch.from_numpy(patch[None, None].copy()).float()  # (1,1,D,H,W)
             sal3d, tc, logits = smoothgrad(model, x, target_class,
                                            args.n_samples, args.noise_level, device)
             sal = sal3d.max(axis=0)                              # depth MIP of saliency
             gfp2d = patch.max(axis=0)                            # depth MIP of GFP
-            title = f"{stem}  (3D, center patch {pd}x{cs}x{cs}, depth-MIP)"
+            title = f"{stem}  (3D, {vw}, depth-MIP)"
 
-        overlay_panel(gfp2d, sal, title, out_png, classes, tc, logits, class_rep)
-        print(f"  {stem}: pred={classes[tc]} -> {out_png}")
+        if is_reg:
+            pred_force = float(logits[0]) * std["sd"] + std["mu"]
+            subtitle = f"predicted force = {pred_force:.2f}"
+            tag = f"force={pred_force:.2f}"
+        else:
+            probs = np.exp(logits - logits.max()); probs = probs / probs.sum()
+            e_force = (float(np.dot(probs, class_rep))
+                       if class_rep is not None else float("nan"))
+            pstr = ", ".join(f"{classes[i]}={probs[i]:.2f}"
+                             for i in range(len(classes)))
+            subtitle = f"predicted={classes[tc]}  probs[{pstr}]  E[force]={e_force:.2f}"
+            tag = f"pred={classes[tc]}"
+        overlay_panel(gfp2d, sal, title, subtitle, out_png)
+        print(f"  {stem}: {tag} -> {out_png}")
 
     print(f"Done. saliency maps in {args.output_dir}/")
 

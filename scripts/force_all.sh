@@ -47,9 +47,16 @@ export GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
 export N_BINS="${N_BINS:-4}"
 export BIN_SCHEME="${BIN_SCHEME:-quantile}"
 export TEST_FRAC="${TEST_FRAC:-0.25}"
-export VAL_FRAC="${VAL_FRAC:-0}"
+export VAL_FRAC="${VAL_FRAC:-0.2}"   # held-out early stopping (0 = stop on train loss)
 export SEED="${SEED:-42}"
 export ONLY="${ONLY:-both}"
+# TASK: classification | regression (selects trainers, output prefixes, metrics).
+export TASK="${TASK:-classification}"
+case "$TASK" in
+  classification) PREFIX=force; PPREFIX=probe ;;
+  regression)     PREFIX=reg;   PPREFIX=probe_reg ;;
+  *) echo "ERROR: TASK must be classification|regression (got '$TASK')" >&2; exit 1 ;;
+esac
 # The 051826 drop has 1 force row with no staged volume; allow the matched subset.
 export ALLOW_PARTIAL_MATCH="${ALLOW_PARTIAL_MATCH:-1}"
 export PROBE_INPUT="${PROBE_INPUT:-bf}"
@@ -66,19 +73,22 @@ export FORCE="${FORCE:-1}"
 echo "████████████████████████████████████████████████████████████"
 echo " FORCE-FROM-GFP — full pipeline"
 echo "   data=$DATA_DIR"
-echo "   target=$TARGET_COL  groups=$GROUP_COLS  n_bins=$N_BINS  seed=$SEED  ONLY=$ONLY"
-echo "   two-stage: probe_input=$PROBE_INPUT freeze=$FREEZE L2=$PROBE_L2"
+echo "   TASK=$TASK  target=$TARGET_COL  groups=$GROUP_COLS  seed=$SEED  ONLY=$ONLY"
+echo "   two-stage: probe_input=$PROBE_INPUT freeze=$FREEZE L2=$PROBE_L2  val_frac=$VAL_FRAC"
 echo "   partial_match=$ALLOW_PARTIAL_MATCH  retrain(FORCE)=$FORCE"
 echo "████████████████████████████████████████████████████████████"
 
 if [ "${SKIP_DIRECT:-0}" != "1" ]; then
-  echo ""; echo "▶▶▶ STEP 1/3  Direct GFP->force classifier"
+  echo ""; echo "▶▶▶ STEP 1/3  Direct GFP->force ($TASK)"
   bash scripts/force_from_gfp_new.sh
 fi
 
 if [ "${SKIP_SALIENCY:-0}" != "1" ]; then
-  echo ""; echo "▶▶▶ STEP 2/3  SmoothGrad saliency"
-  bash scripts/gradviz_force.sh
+  echo ""; echo "▶▶▶ STEP 2/3  SmoothGrad saliency (direct model)"
+  RESULT_PREFIX="$PREFIX" \
+    CKPT_2D="results/force_from_gfp_new/${PREFIX}_ckpt_2d.pth" \
+    CKPT_3D="results/force_from_gfp_new/${PREFIX}_ckpt_3d.pth" \
+    bash scripts/gradviz_force.sh
 fi
 
 if [ "${SKIP_TWOSTAGE:-0}" != "1" ]; then
@@ -89,39 +99,44 @@ fi
 # ── Unified summary across everything that ran ──
 echo ""; echo "████████████████████████████████████████████████████████████"
 echo " UNIFIED SUMMARY"
-python - <<'PY'
-import json, os
+python - "$TASK" "$PREFIX" "$PPREFIX" <<'PY'
+import json, os, sys
+task, prefix, pprefix = sys.argv[1:4]
 def load(p): return json.load(open(p)) if os.path.exists(p) else None
-def row(name, d):
-    if not d: return None
-    c = d.get("correlation", {})
-    return (name, d.get("replicate_accuracy"), d.get("chance"),
-            (d.get("permutation_test") or {}).get("p_value_accuracy"),
-            c.get("spearman_expected_vs_force"),
-            (d.get("config_flags") or {}).get("weight_decay_l2"))
+def fmt(x, d=3): return "  n/a" if x is None else f"{x:.{d}f}"
 rows = []
 for dims in ("2d", "3d"):
-    rows.append(row(f"direct GFP->force {dims} (fine-tuned)",
-                    load(f"results/force_from_gfp_new/force_{dims}.json")))
-    pr = load(f"results/force_two_stage/probe_{dims}.json")
-    tag = (f"two-stage {dims} (input={pr.get('input')}, "
-           f"freeze={pr.get('freeze_encoder')})") if pr else ""
-    rows.append(row(tag, pr))
-rows = [r for r in rows if r]
-if rows:
-    print(f"  {'model':46s} {'acc':>6} {'chance':>7} {'perm_p':>7} {'spear':>6} {'L2':>6}")
-    for name, acc, ch, p, sp, l2 in rows:
-        f = lambda x, d=3: "  n/a" if x is None else f"{x:.{d}f}"
-        print(f"  {name:46s} {f(acc):>6} {f(ch,2):>7} {f(p):>7} {f(sp,2):>6} {f(l2,3):>6}")
-else:
+    for tag, d in [(f"direct {dims}", load(f"results/force_from_gfp_new/{prefix}_{dims}.json")),
+                   (f"two-stage {dims}", load(f"results/force_two_stage/{pprefix}_{dims}.json"))]:
+        if not d:
+            continue
+        if task == "regression":
+            m = d["metrics"]
+            rows.append((tag, m["mae"], m["r2"], m["spearman"],
+                         m["baseline_mae_predict_mean"]))
+        else:
+            c = d.get("correlation", {})
+            rows.append((tag, d.get("replicate_accuracy"), d.get("chance"),
+                         c.get("spearman_expected_vs_force"),
+                         (d.get("permutation_test") or {}).get("p_value_accuracy")))
+if not rows:
     print("  (no result JSONs found)")
+elif task == "regression":
+    print(f"  {'model':22s} {'MAE':>7} {'R2':>7} {'spear':>7} {'base_MAE':>9}")
+    for n, a, b, c, e in rows:
+        print(f"  {n:22s} {fmt(a):>7} {fmt(b):>7} {fmt(c):>7} {fmt(e):>9}")
+else:
+    print(f"  {'model':22s} {'acc':>7} {'chance':>7} {'spear':>7} {'perm_p':>7}")
+    for n, a, b, c, e in rows:
+        print(f"  {n:22s} {fmt(a):>7} {fmt(b,2):>7} {fmt(c):>7} {fmt(e):>7}")
 print()
+P, PP = prefix, pprefix
 for d, what in [("results/force_from_gfp_new", "direct: metrics + perf plots"),
-                ("results/force_from_gfp_new/saliency_2d", "direct 2D XAI (saliency)"),
-                ("results/force_from_gfp_new/saliency_3d", "direct 3D XAI (saliency)"),
-                ("results/force_two_stage", "two-stage: probe metrics + perf plots + BF->GFP models"),
-                ("results/force_two_stage/saliency_2d", "two-stage 2D XAI (saliency)"),
-                ("results/force_two_stage/saliency_3d", "two-stage 3D XAI (saliency)")]:
+                (f"results/force_from_gfp_new/saliency_{P}_2d", "direct 2D XAI"),
+                (f"results/force_from_gfp_new/saliency_{P}_3d", "direct 3D XAI"),
+                ("results/force_two_stage", "two-stage: probe + BF->GFP models"),
+                (f"results/force_two_stage/saliency_{PP}_2d", "two-stage 2D XAI"),
+                (f"results/force_two_stage/saliency_{PP}_3d", "two-stage 3D XAI")]:
     print(f"  {'[ok]' if os.path.isdir(d) else '[--]'} {d}  ({what})")
 PY
 echo "████████████████████████████████████████████████████████████"

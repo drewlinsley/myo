@@ -56,11 +56,18 @@ GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
 N_BINS="${N_BINS:-4}"   # 4-way is the practical ceiling for a 6-replicate test set
 BIN_SCHEME="${BIN_SCHEME:-quantile}"
 TEST_FRAC="${TEST_FRAC:-0.25}"
-VAL_FRAC="${VAL_FRAC:-0}"
+VAL_FRAC="${VAL_FRAC:-0.2}"   # held-out early stopping (0 = stop on train loss)
 SEED="${SEED:-42}"
 OUT_DIR="${OUT_DIR:-results/force_two_stage}"
 PROBE_INPUT="${PROBE_INPUT:-bf}"
 FREEZE="${FREEZE:-1}"
+# TASK selects the probe trainer + output prefix (classification | regression).
+TASK="${TASK:-classification}"
+case "$TASK" in
+  classification) PPREFIX=probe;     PTRAINER=train_split_force_classifier.py; DPREFIX=force ;;
+  regression)     PPREFIX=probe_reg; PTRAINER=train_split_force_regressor.py;  DPREFIX=reg ;;
+  *) echo "ERROR: TASK must be classification|regression (got '$TASK')" >&2; exit 1 ;;
+esac
 PROBE_L2="${PROBE_L2:-0.05}"   # L2 (AdamW weight decay) on the linear head
 ONLY="${ONLY:-both}"
 
@@ -122,18 +129,20 @@ run_bfgfp() {
 run_probe() {
   local dims="$1" cfg="$2"
   local enc="$OUT_DIR/unet_new_${dims}/best.pth"
-  local out="$OUT_DIR/probe_${dims}.json"
+  local out="$OUT_DIR/${PPREFIX}_${dims}.json"
   if [ -f "$out" ] && [ "${FORCE:-0}" != "1" ]; then
     echo "[probe $dims] exists, skipping: $out"; return 0
   fi
   local freeze_flag=(); [ "$FREEZE" = "1" ] && freeze_flag=(--freeze_encoder)
-  echo ""; echo "# Stage 2 [$dims]: force probe (input=$PROBE_INPUT freeze=$FREEZE)"
-  python train_split_force_classifier.py \
+  local task_flag=(); [ "$TASK" = "regression" ] && task_flag=(--loss "${REG_LOSS:-huber}")
+  echo ""; echo "# Stage 2 [$dims]: $TASK probe (input=$PROBE_INPUT freeze=$FREEZE)"
+  python "$PTRAINER" \
     -c "$cfg" --data_dir "$DATA_DIR" \
     --split_json "$SPLIT" --init_from "$enc" \
     --input "$PROBE_INPUT" "${freeze_flag[@]+"${freeze_flag[@]}"}" \
+    "${task_flag[@]+"${task_flag[@]}"}" \
     --weight_decay "$PROBE_L2" \
-    --save_ckpt "$OUT_DIR/probe_${dims}.pth" \
+    --save_ckpt "$OUT_DIR/${PPREFIX}_ckpt_${dims}.pth" \
     --seed "$SEED" --output "$out"
 }
 
@@ -150,47 +159,50 @@ fi
 # gradviz auto-detects the probe input modality from the saved ckpt (bf/gfp).
 if [ "${SKIP_SALIENCY:-0}" != "1" ]; then
   echo ""; echo "# Stage 3: SmoothGrad saliency of the probe model(s)"
-  OUT_DIR="$OUT_DIR" DATA_DIR="$DATA_DIR" ONLY="$ONLY" RESULT_PREFIX=probe \
-    CKPT_2D="$OUT_DIR/probe_2d.pth" CKPT_3D="$OUT_DIR/probe_3d.pth" \
+  OUT_DIR="$OUT_DIR" DATA_DIR="$DATA_DIR" ONLY="$ONLY" RESULT_PREFIX="$PPREFIX" \
+    CKPT_2D="$OUT_DIR/${PPREFIX}_ckpt_2d.pth" CKPT_3D="$OUT_DIR/${PPREFIX}_ckpt_3d.pth" \
     bash scripts/gradviz_force.sh || echo "  (probe saliency skipped — see above)"
 fi
 
-# ── Compare: two-stage probe (2D/3D) and, if present, the direct GFP->force run ──
+# ── Compare: two-stage probe (2D/3D) vs the direct model (if present) ──
 echo ""; echo "# Comparison"
-python - "$OUT_DIR" "results/force_from_gfp_new" <<'PY'
+python - "$OUT_DIR" "results/force_from_gfp_new" "$TASK" "$PPREFIX" "$DPREFIX" <<'PY'
 import json, os, sys
-two_dir, direct_dir = sys.argv[1], sys.argv[2]
+two_dir, direct_dir, task, pprefix, dprefix = sys.argv[1:6]
 def load(p): return json.load(open(p)) if os.path.exists(p) else None
+def fmt(x, d=3): return "  n/a" if x is None else f"{x:.{d}f}"
 rows = []
 for dims in ("2d", "3d"):
-    pr = load(os.path.join(two_dir, f"probe_{dims}.json"))
-    if pr:
-        c = pr["correlation"]
-        rows.append((f"two-stage probe {dims} (input={pr.get('input')}, "
-                     f"freeze={pr.get('freeze_encoder')})",
-                     pr.get("replicate_accuracy"), pr.get("chance"),
-                     (pr.get("permutation_test") or {}).get("p_value_accuracy"),
-                     c.get("spearman_expected_vs_force")))
-    di = load(os.path.join(direct_dir, f"force_{dims}.json"))
-    if di:
-        c = di["correlation"]
-        rows.append((f"direct GFP->force {dims} (fine-tuned, warm old enc)",
-                     di.get("replicate_accuracy"), di.get("chance"),
-                     (di.get("permutation_test") or {}).get("p_value_accuracy"),
-                     c.get("spearman_expected_vs_force")))
+    for tag, d in [(f"two-stage {dims}", load(f"{two_dir}/{pprefix}_{dims}.json")),
+                   (f"direct {dims}", load(f"{direct_dir}/{dprefix}_{dims}.json"))]:
+        if not d:
+            continue
+        if task == "regression":
+            m = d["metrics"]
+            rows.append((tag, m["mae"], m["r2"], m["spearman"],
+                         m["baseline_mae_predict_mean"]))
+        else:
+            c = d["correlation"]
+            rows.append((tag, d.get("replicate_accuracy"), d.get("chance"),
+                         c.get("spearman_expected_vs_force"),
+                         (d.get("permutation_test") or {}).get("p_value_accuracy")))
 if not rows:
     print("  (no result JSONs found to compare)"); sys.exit(0)
-print(f"  {'model':52s} {'test_acc':>8} {'chance':>7} {'perm_p':>7} {'spearman':>9}")
-for name, acc, ch, p, sp in rows:
-    def f(x, d=3): return "  n/a" if x is None else f"{x:.{d}f}"
-    print(f"  {name:52s} {f(acc):>8} {f(ch,2):>7} {f(p):>7} {f(sp):>9}")
+if task == "regression":
+    print(f"  {'model':22s} {'MAE':>7} {'R2':>7} {'spear':>7} {'base_MAE':>9}")
+    for n, mae, r2, sp, bm in rows:
+        print(f"  {n:22s} {fmt(mae):>7} {fmt(r2):>7} {fmt(sp):>7} {fmt(bm):>9}")
+else:
+    print(f"  {'model':22s} {'acc':>7} {'chance':>7} {'spear':>7} {'perm_p':>7}")
+    for n, acc, ch, sp, p in rows:
+        print(f"  {n:22s} {fmt(acc):>7} {fmt(ch,2):>7} {fmt(sp):>7} {fmt(p):>7}")
 PY
 
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo " Done. Outputs in $OUT_DIR/:"
+echo " Done ($TASK). Outputs in $OUT_DIR/:"
 echo "   force.split.json / force.bfgfp_split.json   the shared leak-free split"
 echo "   unet_new_{2d,3d}/best.pth                    stage-1 BF->GFP models"
-echo "   probe_{2d,3d}.json / .png / .pth             stage-2 force metrics + figures + weights"
-echo "   saliency_{2d,3d}/                            stage-3 SmoothGrad (XAI) panels"
+echo "   ${PPREFIX}_{2d,3d}.json / .png / _ckpt_*.pth  stage-2 metrics + figures + weights"
+echo "   saliency_${PPREFIX}_{2d,3d}/                  stage-3 SmoothGrad (XAI) panels"
 echo "════════════════════════════════════════════════════════════"
