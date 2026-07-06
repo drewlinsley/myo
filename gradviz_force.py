@@ -91,6 +91,18 @@ def _pad_mult(a, m=32):
     return a
 
 
+def _fit_plane(a, max_hw):
+    """Stride-downsample the last two dims so max(H, W) <= max_hw. Keeps the WHOLE
+    plane in view but bounds memory (a full-res forward+backward through the 3D
+    encoder OOMs — the model only ever saw crop_size windows). Returns a at
+    reduced resolution (and the stride used, for the caption)."""
+    hw = max(a.shape[-2:])
+    if not max_hw or hw <= max_hw:
+        return a, 1
+    f = int(np.ceil(hw / max_hw))
+    return a[..., ::f, ::f], f
+
+
 def _center_depth(vol, pd):
     """Center pd-slice sub-stack (reflect-pad z if the stack is shallower)."""
     z = vol.shape[0]
@@ -168,6 +180,9 @@ def main():
     p.add_argument("--view", choices=["full", "crop"], default="full",
                    help="full = render the WHOLE H×W plane (padded to /32); "
                         "crop = a single center crop_size window (default: full)")
+    p.add_argument("--max_hw", type=int, default=None,
+                   help="full-view only: cap plane H/W (downsample above it) to "
+                        "avoid OOM. Default 1024 (2D) / 512 (3D); 0 = no cap.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output_dir", required=True)
     args = p.parse_args()
@@ -211,6 +226,7 @@ def main():
     apply_timm = mcfg.get("encoder_weights") is not None
     cs = dcfg.get("crop_size", 256)
     pd = dcfg.get("patch_depth", 32)
+    max_hw = args.max_hw if args.max_hw is not None else (512 if dims == "3d" else 1024)
 
     if args.stems:
         stems = list(args.stems)
@@ -232,8 +248,11 @@ def main():
                                apply_timm)  # (Z,H,W)
         out_png = os.path.join(args.output_dir, f"{stem}.png")
 
-        prep2d = ((lambda s: _pad_mult(s)) if args.view == "full"
+        # full view: downsample above max_hw (bounds memory), then pad to /32.
+        prep2d = ((lambda s: _pad_mult(_fit_plane(s, max_hw)[0])) if args.view == "full"
                   else (lambda s: _center_crop2d(s, cs)))
+        ds = _fit_plane(vol[0] if dims == "2d" else vol, max_hw)[1] \
+            if args.view == "full" else 1
         if dims == "2d":
             if args.all_slices:
                 sals, gfps, tcs, logit_last = [], [], [], None
@@ -254,13 +273,16 @@ def main():
                 sal, tc, logits = smoothgrad(model, x, target_class,
                                              args.n_samples, args.noise_level, device)
                 gfp2d = slc
-            vw = "full-plane" if args.view == "full" else f"{cs}px crop"
+            vw = (f"full-plane{f' /{ds}' if ds > 1 else ''}"
+                  if args.view == "full" else f"{cs}px crop")
             title = (f"{stem}  (2D, {vw}, "
                      f"slice={'mean' if args.all_slices else 'max-signal'})")
         else:
             if args.view == "full":
-                patch = _pad_mult(_center_depth(vol, pd))        # (D,fullH,fullW)
-                vw = f"{pd}×{patch.shape[1]}×{patch.shape[2]} full-plane"
+                fit, _ = _fit_plane(vol, max_hw)                 # downsample H,W
+                patch = _pad_mult(_center_depth(fit, pd))        # (D,fullH,fullW)
+                vw = (f"{pd}×{patch.shape[1]}×{patch.shape[2]} full-plane"
+                      f"{f' /{ds}' if ds > 1 else ''}")
             else:
                 patch = _center_patch3d(vol, pd, cs)             # (D,cs,cs)
                 vw = f"center patch {pd}x{cs}x{cs}"
@@ -285,6 +307,8 @@ def main():
             tag = f"pred={classes[tc]}"
         overlay_panel(gfp2d, sal, title, subtitle, out_png)
         print(f"  {stem}: {tag} -> {out_png}")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     print(f"Done. saliency maps in {args.output_dir}/")
 
