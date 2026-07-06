@@ -52,7 +52,9 @@ export PROBE_INPUT="${PROBE_INPUT:-bf}"
 export FREEZE="${FREEZE:-1}"
 export PROBE_L2="${PROBE_L2:-0.05}"
 [ -n "${WEIGHT_DECAY:-}" ] && export WEIGHT_DECAY
-[ -n "${FORCE:-}" ] && export FORCE
+# force_all.sh RETRAINS from scratch by default (redoes stats, split, BF->GFP, and
+# every classifier). Set FORCE=0 to instead reuse any outputs that already exist.
+export FORCE="${FORCE:-1}"
 # SmoothGrad knobs (N_SAMPLES/NOISE/TARGET/N_VOLS) and any other VAR=value you pass
 # on the command line are already in the environment, so the sub-scripts inherit
 # them automatically — nothing to forward here.
