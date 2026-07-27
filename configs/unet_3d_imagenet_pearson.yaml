@@ -1,7 +1,16 @@
 base: base.yaml
 experiment_name: unet_3d_imagenet_pearson
 
+data:
+  # base.yaml sets cache_volumes: true, which makes each 3D DataLoader worker keep
+  # its own full-volume RAM cache -> host OOM (SIGKILL) partway through epoch 1.
+  # mmap instead (this is what the 2D SliceDataset already does).
+  cache_volumes: false
+
 training:
+  # fewer workers so peak host RAM stays bounded (num_workers is read from the
+  # training section, not data).
+  num_workers: 2
   losses:
     pearson: 1.0
   checkpoint_dir: ckpts/unet_3d_imagenet_pearson
