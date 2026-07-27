@@ -339,8 +339,10 @@ def main(config_path, resume_from=None, split_json=None, data_dir=None,
     ckpt_dir = tcfg["checkpoint_dir"]
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Save config snapshot
-    shutil.copy2(config_path, os.path.join(ckpt_dir, "config.yaml"))
+    # Save config snapshot. copyfile (not copy2) copies bytes only — copy2 also
+    # replicates timestamps via copystat, which raises PermissionError on network
+    # filesystems (EFS/NFS) that disallow utime. The snapshot itself is all we need.
+    shutil.copyfile(config_path, os.path.join(ckpt_dir, "config.yaml"))
 
     # Datasets
     train_ds, val_ds, train_stems, val_stems = build_datasets(cfg, split_stems)
