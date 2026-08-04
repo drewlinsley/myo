@@ -8,9 +8,9 @@ data:
   cache_volumes: false
 
 training:
-  # fewer workers so peak host RAM stays bounded (num_workers is read from the
-  # training section, not data).
-  num_workers: 2
+  # cache_volumes is off (mmap), so workers hold almost no RAM -> 4 is safe and
+  # keeps the 3D GPU fed (num_workers is read from the training section, not data).
+  num_workers: 4
   losses:
     pearson: 1.0
   checkpoint_dir: ckpts/unet_3d_imagenet_pearson
