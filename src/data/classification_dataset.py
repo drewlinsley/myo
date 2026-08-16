@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.normalization import normalize
+from src.data.zband import resolve_z_range
 
 
 CONTROL_KEYWORDS = {"control", "ctrl", "no", "none", "untreated", "vehicle",
@@ -80,10 +81,11 @@ class GFPClassificationDataset(Dataset):
         self.index_map = []
         if mode == "2d":
             for i, gfp_path in enumerate(gfp_files):
-                vol = np.load(gfp_path, mmap_mode="r")
-                n_z_total = vol.shape[0]
+                n_z_total = np.load(gfp_path, mmap_mode="r").shape[0]
                 if z_range is not None:
-                    n_z = min(n_z_total, z_range[1]) - max(0, z_range[0])
+                    z_lo, z_hi = resolve_z_range(z_range, self.stats[i],
+                                                 n_z_total)
+                    n_z = z_hi - z_lo
                 else:
                     n_z = n_z_total
                 for z in range(n_z):
@@ -100,8 +102,8 @@ class GFPClassificationDataset(Dataset):
             return self._cache[file_idx]
         gfp_raw = np.load(self.gfp_files[file_idx])
         if self.z_range is not None:
-            z_lo = max(0, self.z_range[0])
-            z_hi = min(gfp_raw.shape[0], self.z_range[1])
+            z_lo, z_hi = resolve_z_range(self.z_range, self.stats[file_idx],
+                                         gfp_raw.shape[0])
             gfp_raw = gfp_raw[z_lo:z_hi]
         st = self.stats[file_idx]
         gfp = normalize(gfp_raw, st[self.modality]["p_low"],

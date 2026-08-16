@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.normalization import normalize
+from src.data.zband import resolve_z_range
 
 
 class VolumeRegressionDataset(Dataset):
@@ -41,20 +42,22 @@ class VolumeRegressionDataset(Dataset):
 
         self.index_map = []
         self.file_idx_map = []  # parallel: file index for each entry
+
+        def usable_z(i, path):
+            n_z = np.load(path, mmap_mode="r").shape[0]
+            if z_range is not None:
+                z_lo, z_hi = resolve_z_range(z_range, self.stats[i], n_z)
+                n_z = z_hi - z_lo
+            return n_z
+
         if mode == "2d":
             for i, path in enumerate(files):
-                vol = np.load(path, mmap_mode="r")
-                n_z = vol.shape[0]
-                if z_range is not None:
-                    n_z = min(n_z, z_range[1]) - max(0, z_range[0])
-                for z in range(n_z):
+                for z in range(usable_z(i, path)):
                     self.index_map.append((i, z))
                     self.file_idx_map.append(i)
         else:
             for i, path in enumerate(files):
-                n_z = np.load(path, mmap_mode="r").shape[0]
-                if z_range is not None:
-                    n_z = min(n_z, z_range[1]) - max(0, z_range[0])
+                n_z = usable_z(i, path)
                 if n_z < 1:
                     # 0 z-planes after the z_range crop — skip this file (mirror
                     # the 2D path) so the downstream count==0 exclusion engages
@@ -79,8 +82,8 @@ class VolumeRegressionDataset(Dataset):
             return self._cache[file_idx]
         raw = np.load(self.files[file_idx], mmap_mode="r")
         if self.z_range is not None:
-            z_lo = max(0, self.z_range[0])
-            z_hi = min(raw.shape[0], self.z_range[1])
+            z_lo, z_hi = resolve_z_range(self.z_range, self.stats[file_idx],
+                                         raw.shape[0])
             raw = raw[z_lo:z_hi]
         self._cache[file_idx] = raw
         return raw

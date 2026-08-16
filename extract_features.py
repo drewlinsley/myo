@@ -30,6 +30,7 @@ from src.config import load_config
 from src.models.factory import build_model
 from src.utils import load_checkpoint
 from src.data.normalization import normalize
+from src.data.zband import resolve_z_range
 
 # Dataset column → which label column to use for that subset
 DATASET_LABEL_COL = {
@@ -408,8 +409,7 @@ def main():
             # Load and normalize BF
             bf_raw = np.load(bf_path)
             if z_range is not None:
-                z_lo = max(0, z_range[0])
-                z_hi = min(bf_raw.shape[0], z_range[1])
+                z_lo, z_hi = resolve_z_range(z_range, stats, bf_raw.shape[0])
                 bf_raw = bf_raw[z_lo:z_hi]
             bf = normalize(bf_raw, stats["bf"]["p_low"], stats["bf"]["p_high"],
                            apply_timm=apply_timm)

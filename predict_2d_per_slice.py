@@ -23,6 +23,7 @@ from src.config import load_config, resolve_ckpt_config
 from src.utils import prepare_env, load_checkpoint
 from src.models import build_model
 from src.data.normalization import normalize, denormalize
+from src.data.zband import resolve_z_range
 from src.data.foreground_mask import compute_bf_foreground_mask
 from predict import predict_2d
 
@@ -92,8 +93,7 @@ def main():
 
             bf_raw = np.load(bf_path)
             if z_range is not None:
-                z_lo = max(0, z_range[0])
-                z_hi = min(bf_raw.shape[0], z_range[1])
+                z_lo, z_hi = resolve_z_range(z_range, stats, bf_raw.shape[0])
                 bf_raw = bf_raw[z_lo:z_hi]
             bf = normalize(bf_raw, stats["bf"]["p_low"], stats["bf"]["p_high"],
                            apply_timm=apply_timm)

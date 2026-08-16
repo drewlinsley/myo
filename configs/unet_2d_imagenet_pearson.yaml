@@ -1,6 +1,12 @@
 base: base.yaml
 experiment_name: unet_2d_imagenet_pearson
 
+data:
+  # Per-volume adaptive Z-band (stats z_auto from compute_stats.py) instead of
+  # base.yaml's fixed [70, 105] — the 051826 stacks vary from Z=70 to Z=183, so
+  # fixed indices drop shallow stacks and pad others.
+  z_range: auto
+
 model:
   dims: 2d
   encoder_weights: imagenet

@@ -50,6 +50,7 @@ from torch.utils.data import Dataset
 from src.config import load_config, validate_config
 from src.utils import set_seed, tune_cudnn
 from src.data.normalization import normalize
+from src.data.zband import resolve_z_range
 from src.data.regression_dataset import VolumeRegressionDataset
 from src.models.gfp_classifier import build_gfp_classifier
 from train_loo_force_classifier import (
@@ -94,7 +95,8 @@ class PairedAttrDataset(Dataset):
         for i, path in enumerate(files):
             n_z = np.load(path, mmap_mode="r").shape[0]
             if z_range is not None:
-                n_z = min(n_z, z_range[1]) - max(0, z_range[0])
+                z_lo, z_hi = resolve_z_range(z_range, self.stats[i], n_z)
+                n_z = z_hi - z_lo
             if n_z < 1:
                 continue
             if mode == "2d":
@@ -113,8 +115,8 @@ class PairedAttrDataset(Dataset):
             return self._cache[i]
         raw = np.load(self.files[i], mmap_mode="r")
         if self.z_range is not None:
-            z_lo = max(0, self.z_range[0])
-            z_hi = min(raw.shape[0], self.z_range[1])
+            z_lo, z_hi = resolve_z_range(self.z_range, self.stats[i],
+                                         raw.shape[0])
             raw = raw[z_lo:z_hi]
         attr = np.load(self.attr_files[i], mmap_mode="r")
         if tuple(attr.shape) != tuple(raw.shape):

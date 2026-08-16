@@ -23,6 +23,7 @@ from src.config import load_config
 from src.models.factory import build_model
 from src.utils import load_checkpoint, make_train_val_split
 from src.data.normalization import normalize
+from src.data.zband import resolve_z_range
 
 FRACTIONS = [
     ("frac000", "0%"),
@@ -126,8 +127,7 @@ def main():
             gfp_raw = np.load(os.path.join(gfp_dir, f"{stem}.npy"))
 
             if z_range is not None:
-                z_lo = max(0, z_range[0])
-                z_hi = min(bf_raw.shape[0], z_range[1])
+                z_lo, z_hi = resolve_z_range(z_range, stats, bf_raw.shape[0])
                 bf_raw = bf_raw[z_lo:z_hi]
                 gfp_raw = gfp_raw[z_lo:z_hi]
 

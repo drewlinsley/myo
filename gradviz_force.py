@@ -40,20 +40,21 @@ import matplotlib.pyplot as plt
 from src.config import load_config, validate_config
 from src.utils import set_seed
 from src.data.normalization import normalize
+from src.data.zband import resolve_z_range
 from src.models.gfp_classifier import build_gfp_classifier
 
 MODALITY = "gfp"   # set in main(); used for panel labels
 
 
 def load_norm_volume(path, stats_dir, modality, z_range, apply_timm):
-    """Mirror VolumeRegressionDataset._load: crop z_range, percentile-normalize."""
+    """Mirror VolumeRegressionDataset._load: crop z_range (fixed [lo, hi] or
+    per-volume 'auto' band from the stats JSON), percentile-normalize."""
     stem = os.path.splitext(os.path.basename(path))[0]
     with open(os.path.join(stats_dir, f"{stem}.json")) as f:
         st = json.load(f)
     raw = np.load(path)
     if z_range is not None:
-        z_lo = max(0, z_range[0])
-        z_hi = min(raw.shape[0], z_range[1])
+        z_lo, z_hi = resolve_z_range(z_range, st, raw.shape[0])
         raw = raw[z_lo:z_hi]
     img = normalize(raw, st[modality]["p_low"], st[modality]["p_high"],
                     apply_timm=apply_timm)

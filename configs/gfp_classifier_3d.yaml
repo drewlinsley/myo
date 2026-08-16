@@ -3,6 +3,8 @@ experiment_name: gfp_classifier_3d
 
 data:
   data_dir: data
+  # Per-volume adaptive Z-band (stats z_auto) — see unet_*_imagenet_pearson.yaml
+  z_range: auto
 
 model:
   dims: 3d

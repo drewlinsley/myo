@@ -2,6 +2,10 @@ base: base.yaml
 experiment_name: unet_3d_imagenet_pearson
 
 data:
+  # Per-volume adaptive Z-band (stats z_auto from compute_stats.py) instead of
+  # base.yaml's fixed [70, 105] — the 051826 stacks vary from Z=70 to Z=183, so
+  # fixed indices drop shallow stacks and pad others.
+  z_range: auto
   # base.yaml sets cache_volumes: true -> every worker holds its own full-volume
   # RAM cache -> host OOM (SIGKILL). With cache off the dataset mmaps and (since
   # the crop-first fast path) reads/normalizes only each patch's pages. If the

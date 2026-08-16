@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.normalization import normalize, normalize_auto
+from src.data.zband import resolve_z_range
 
 
 class BaseDataset(Dataset):
@@ -76,10 +77,11 @@ class BaseDataset(Dataset):
         bf_raw = np.load(self.bf_files[idx], mmap_mode=None if self.cache_volumes else "r")
         gfp_raw = np.load(self.gfp_files[idx], mmap_mode=None if self.cache_volumes else "r")
 
-        # Restrict Z range if specified
+        # Restrict Z range if specified ([lo, hi] fixed, or "auto" = this
+        # volume's stats z_auto band)
         if self.z_range is not None:
-            z_lo = max(0, self.z_range[0])
-            z_hi = min(bf_raw.shape[0], self.z_range[1])
+            z_lo, z_hi = resolve_z_range(self.z_range, self.stats[idx],
+                                         bf_raw.shape[0])
             bf_raw = bf_raw[z_lo:z_hi]
             gfp_raw = gfp_raw[z_lo:z_hi]
 
@@ -139,8 +141,8 @@ class BaseDataset(Dataset):
         bf = np.load(self.bf_files[idx], mmap_mode=mm)
         gfp = np.load(self.gfp_files[idx], mmap_mode=mm)
         if self.z_range is not None:
-            z_lo = max(0, self.z_range[0])
-            z_hi = min(bf.shape[0], self.z_range[1])
+            z_lo, z_hi = resolve_z_range(self.z_range, self.stats[idx],
+                                         bf.shape[0])
             bf = bf[z_lo:z_hi]
             gfp = gfp[z_lo:z_hi]
         self._raw_cache[idx] = (bf, gfp)
@@ -199,10 +201,10 @@ class SliceDataset(BaseDataset):
         # z_idx is relative to the (possibly z-clipped) volume
         self.index_map = []
         for i, bf_path in enumerate(bf_files):
-            bf = np.load(bf_path, mmap_mode="r")
-            n_z_total = bf.shape[0]
+            n_z_total = np.load(bf_path, mmap_mode="r").shape[0]
             if z_range is not None:
-                n_z = min(n_z_total, z_range[1]) - max(0, z_range[0])
+                z_lo, z_hi = resolve_z_range(z_range, self.stats[i], n_z_total)
+                n_z = z_hi - z_lo
             else:
                 n_z = n_z_total
             for z in range(n_z):

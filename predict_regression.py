@@ -27,6 +27,7 @@ from src.config import load_config, resolve_ckpt_config
 from src.utils import prepare_env
 from src.models.gfp_regressor import build_gfp_regressor
 from src.data.normalization import normalize
+from src.data.zband import resolve_z_range
 
 
 def grid_starts(total, step, overlap):
@@ -151,8 +152,8 @@ def main():
                     stats = json.load(f)
                 bf_raw = np.load(os.path.join(bf_dir, f"{stem}.npy"))
                 if z_range is not None:
-                    z_lo = max(0, z_range[0])
-                    z_hi = min(bf_raw.shape[0], z_range[1])
+                    z_lo, z_hi = resolve_z_range(z_range, stats,
+                                                 bf_raw.shape[0])
                     bf_raw = bf_raw[z_lo:z_hi]
                 bf = normalize(bf_raw, stats["bf"]["p_low"],
                                stats["bf"]["p_high"], apply_timm=apply_timm)

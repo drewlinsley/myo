@@ -185,27 +185,49 @@ def main():
     crop_size = dcfg.get("crop_size", 256)
     hdr(f"3. z_range funnel — config {args.config}: z_range={z_range}, "
         f"patch_depth={patch_depth}, crop_size={crop_size}")
-    dropped_z, shallow_z, small_hw = [], [], []
+    auto = isinstance(z_range, str) and z_range == "auto"
+    dropped_z, shallow_z, small_hw, missing_band, bands = [], [], [], [], []
     for s in paired:
         v = shapes.get(s, {}).get("bf")
         if not v:
             continue
         z, h, w = v["shape"][:3]
-        usable = (min(z, z_range[1]) - max(0, z_range[0])) if z_range else z
-        if usable <= 0:
+        if auto:
+            try:
+                with open(os.path.join(stats_dir, f"{s}.json")) as f:
+                    band = json.load(f).get("z_auto")
+            except Exception:
+                band = None
+            if band is None:
+                missing_band.append(s)
+                usable = 0
+            else:
+                usable = min(z, band[1]) - max(0, band[0])
+                bands.append((s, band, usable))
+        else:
+            usable = (min(z, z_range[1]) - max(0, z_range[0])) if z_range else z
+        if usable <= 0 and s not in missing_band:
             dropped_z.append((s, z))
-        elif usable < patch_depth:
+        elif 0 < usable < patch_depth:
             shallow_z.append((s, usable))
         if h < crop_size or w < crop_size:
             small_hw.append((s, (h, w)))
-    n_usable = len(paired) - len(dropped_z)
+    n_usable = len(paired) - len(dropped_z) - len(missing_band)
     print(f"usable after z_range: {n_usable}/{len(paired)}")
+    if auto and missing_band:
+        print(f"  !! {len(missing_band)} volume(s) with NO z_auto band in "
+              f"stats — rerun compute_stats.py (it upgrades stats in place): "
+              f"{missing_band[:6]}")
+    if auto and bands:
+        los = [b[1][0] for b in bands]
+        print(f"  adaptive bands: start ranges {min(los)}..{max(los)}, "
+              f"window lengths {sorted({b[2] for b in bands})}")
     if dropped_z:
         print(f"  !! {len(dropped_z)} volume(s) SILENTLY DROPPED — stack has "
               f"fewer Z-planes than z_range needs (0 slices survive the crop):")
         for s, z in dropped_z[:8]:
-            print(f"    {s}: Z={z} < z_lo={z_range[0]}")
-        print("  -> fix: lower z_range in the config, or re-acquire/restage.")
+            print(f"    {s}: Z={z}")
+        print("  -> fix: adjust z_range in the config, or re-acquire/restage.")
     if shallow_z:
         print(f"  note: {len(shallow_z)} volume(s) usable-Z < patch_depth "
               f"({patch_depth}) — reflect-padded in depth, e.g. "
@@ -216,7 +238,9 @@ def main():
     if not dropped_z:
         print("  no volumes lost to z_range ✓")
     report["z_range"] = {"z_range": z_range, "dropped": dropped_z,
-                         "shallow": shallow_z, "small_hw": small_hw}
+                         "shallow": shallow_z, "small_hw": small_hw,
+                         "missing_z_auto": missing_band,
+                         "bands": [(s, b) for s, b, _ in bands]}
     funnel.append(("usable after z_range", n_usable))
 
     # ------------------------------------------------------------------
