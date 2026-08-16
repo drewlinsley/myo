@@ -20,7 +20,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.config import load_config, validate_config
-from src.utils import set_seed, prepare_env, save_checkpoint, load_checkpoint, make_train_val_split, get_git_hash
+from src.utils import set_seed, prepare_env, save_checkpoint, load_checkpoint, make_train_val_split, get_git_hash, tune_cudnn
 from src.models import build_model
 from src.losses import build_loss
 from src.metrics import psnr as compute_psnr
@@ -272,6 +272,7 @@ def build_datasets(cfg, split_stems=None):
         val_bf, val_gfp,
         transform=build_transforms(cfg, train=False),
         **common_kwargs, **extra_kwargs,
+        **({"patch_sampling": "center"} if dims == "3d" else {}),
     )
 
     return train_ds, val_ds, train_stems, val_stems
@@ -324,8 +325,11 @@ def main(config_path, resume_from=None, split_json=None, data_dir=None,
     tcfg = cfg["training"]
     experiment_name = cfg.get("experiment_name", "default")
 
-    # Seeding
+    # Seeding (then re-enable cuDNN autotune: fixed batch shapes make benchmark
+    # mode a large 3D-conv win; training.cudnn_benchmark: false restores strict
+    # bitwise determinism).
     set_seed(cfg.get("seed", 42))
+    tune_cudnn(cfg["training"].get("cudnn_benchmark", True))
 
     # Environment
     accelerator, device, tqdm = prepare_env(
@@ -358,15 +362,23 @@ def main(config_path, resume_from=None, split_json=None, data_dir=None,
     with open(os.path.join(ckpt_dir, "split.json"), "w") as f:
         json.dump({"train": train_stems, "val": val_stems}, f, indent=2)
 
+    nw = tcfg.get("num_workers", 4)
+    # persistent_workers keeps worker processes (and their mmap handles / raw
+    # caches) alive across epochs instead of re-forking + re-opening every file;
+    # prefetch keeps the GPU fed between batches.
+    loader_kwargs = dict(num_workers=nw)
+    if nw > 0:
+        loader_kwargs.update(persistent_workers=True,
+                             prefetch_factor=tcfg.get("prefetch_factor", 4))
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=tcfg["batch_size"],
         shuffle=True, drop_last=True, pin_memory=True,
-        num_workers=tcfg.get("num_workers", 4),
+        **loader_kwargs,
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=tcfg["batch_size"],
-        shuffle=False, drop_last=False,
-        num_workers=tcfg.get("num_workers", 4),
+        shuffle=False, drop_last=False, pin_memory=True,
+        **loader_kwargs,
     )
 
     # Model

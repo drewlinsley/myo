@@ -19,6 +19,17 @@ def set_seed(seed):
         torch.backends.cudnn.benchmark = False
 
 
+def tune_cudnn(enable=True):
+    """Enable cuDNN autotuning for fixed-shape training (every batch here is the
+    same (B, C, crop, crop[, D]) shape, the best case for benchmark mode). This
+    trades bitwise run-to-run reproducibility (set_seed's deterministic flag)
+    for a large 3D-conv speedup; pass enable=False (cfg training.cudnn_benchmark:
+    false) to keep strict determinism instead."""
+    if enable and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+
+
 def read_config(cfg_file):
     """Read a YAML config file and return its contents."""
     assert cfg_file is not None, "No config file provided."

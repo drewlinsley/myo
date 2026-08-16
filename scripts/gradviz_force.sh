@@ -23,6 +23,7 @@
 #   TARGET      pred|high|low class logit  (default: pred)
 #   VIEW        full|crop                  (default: full = whole H×W plane)
 #   MAX_HW      full-view H/W cap (OOM)    (default: 1024 2D / 512 3D; 0=no cap)
+#   SAL_SMOOTH  Gaussian sigma (px) on the final map (default: 1.0; 0=off)
 #   N_VOLS      #test vols to visualize    (default: 6)
 #   STEMS       explicit stems (overrides test-vol auto-pick)
 #   ONLY        both|2d|3d                 (default: both)
@@ -70,6 +71,7 @@ run_arch() {
   local stem_flag=(); [ -n "$stems" ] && stem_flag=(--stems $stems)
   local view_flag=(--view "${VIEW:-full}")
   [ -n "${MAX_HW:-}" ] && view_flag+=(--max_hw "$MAX_HW")
+  [ -n "${SAL_SMOOTH:-}" ] && view_flag+=(--sal_smooth "$SAL_SMOOTH")
   echo "[$dims] SmoothGrad on ${stems:-<first $N_VOLS vols>}"
   python gradviz_force.py \
     -c "$cfg" --ckpt "$ckpt" --data_dir "$DATA_DIR" \

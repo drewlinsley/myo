@@ -50,7 +50,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.config import load_config, validate_config
-from src.utils import set_seed, prepare_env, make_train_val_split
+from src.utils import set_seed, prepare_env, make_train_val_split, tune_cudnn
 from src.data.regression_dataset import VolumeRegressionDataset
 from src.models.gfp_classifier import build_gfp_classifier
 from src.data.force_metadata import build_force_groups
@@ -200,6 +200,7 @@ def main():
     dcfg = cfg["data"]
     seed = args.seed if args.seed is not None else cfg.get("seed", 42)
     set_seed(seed)
+    tune_cudnn(tcfg.get("cudnn_benchmark", True))
 
     data_dir = args.data_dir or dcfg["data_dir"]
     stats_dir = os.path.join(data_dir, "stats")
@@ -431,11 +432,14 @@ def main():
 
     gen = torch.Generator()
     gen.manual_seed(seed * 1000 + 1)
+    nw = tcfg.get("num_workers", 4)
+    wkw = ({"persistent_workers": True,
+            "prefetch_factor": tcfg.get("prefetch_factor", 4)} if nw > 0 else {})
     train_loader = torch.utils.data.DataLoader(
         make_ds(train_stems, True),
         batch_size=tcfg["batch_size"], shuffle=True, drop_last=True,
-        pin_memory=True, num_workers=tcfg.get("num_workers", 4),
-        worker_init_fn=_seed_worker, generator=gen)
+        pin_memory=True, num_workers=nw,
+        worker_init_fn=_seed_worker, generator=gen, **wkw)
     test_loader = torch.utils.data.DataLoader(
         make_ds(test_stems, False),
         batch_size=tcfg["batch_size"], shuffle=False, num_workers=0)

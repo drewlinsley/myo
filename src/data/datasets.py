@@ -49,6 +49,7 @@ class BaseDataset(Dataset):
         self.percentile_clip = tuple(percentile_clip)
         self.mask_threshold_method = mask_threshold_method  # None | "minimum" | "otsu" | "li" | "triangle"
         self._cache = {}
+        self._raw_cache = {}
 
         # Load stats for all volumes
         self.stats = []
@@ -113,6 +114,52 @@ class BaseDataset(Dataset):
 
         return bf, gfp, mask
 
+    # ------------------------------------------------------------------
+    # Fast path: crop/slice the RAW mmap first, normalize only the patch.
+    #
+    # _load_volume normalizes the ENTIRE volume (normalize() materializes the
+    # whole mmap as float32) on every cache miss — with cache_volumes off that
+    # made each 3D __getitem__ cost a full-volume read + two full-volume float
+    # copies just to cut out one (D, cs, cs) patch. Volume-stats normalization
+    # is element-wise, so crop-then-normalize is mathematically identical and
+    # touches only the patch's pages.
+    # ------------------------------------------------------------------
+    def _fast_ok(self):
+        """Fast path needs element-wise (per-volume-stats) normalization and no
+        foreground mask (the mask threshold is a full-volume statistic)."""
+        return self.mask_threshold_method is None
+
+    def _load_raw(self, idx):
+        """Raw (z-cropped) BF/GFP arrays, mmap-backed. With cache_volumes the
+        raw uint16 pair is materialized once per worker (half the RAM of the old
+        normalized-float32 cache); otherwise only the mmap handles are kept."""
+        if idx in self._raw_cache:
+            return self._raw_cache[idx]
+        mm = None if self.cache_volumes else "r"
+        bf = np.load(self.bf_files[idx], mmap_mode=mm)
+        gfp = np.load(self.gfp_files[idx], mmap_mode=mm)
+        if self.z_range is not None:
+            z_lo = max(0, self.z_range[0])
+            z_hi = min(bf.shape[0], self.z_range[1])
+            bf = bf[z_lo:z_hi]
+            gfp = gfp[z_lo:z_hi]
+        self._raw_cache[idx] = (bf, gfp)
+        return bf, gfp
+
+    def _normalize_pair(self, bf_patch, gfp_patch, file_idx):
+        """Normalize a raw BF/GFP patch pair with the volume's stats. GFP is
+        left raw (float32) in per_patch mode — the caller normalizes after the
+        crop, exactly like the slow path."""
+        st = self.stats[file_idx]
+        bf = normalize(bf_patch, st["bf"]["p_low"], st["bf"]["p_high"],
+                       apply_timm=self.apply_timm)
+        if self.gfp_norm_mode == "volume":
+            gfp = normalize(gfp_patch, st["gfp"]["p_low"], st["gfp"]["p_high"],
+                            apply_timm=False)
+        else:
+            gfp = np.asarray(gfp_patch, dtype=np.float32)
+        return bf, gfp
+
     def _normalize_patch_gfp(self, gfp_tensor):
         """Percentile-normalize a cropped GFP tensor to [0,1] using its own stats.
 
@@ -166,30 +213,50 @@ class SliceDataset(BaseDataset):
             n_before = len(self.index_map)
             filtered = []
             for file_idx, z_idx in self.index_map:
-                _, gfp, _ = self._load_volume(file_idx)
-                gfp_slice = gfp[z_idx]
-                # For volume mode, GFP is already [0,1]; for per_z/per_patch, auto-normalize
-                if self.gfp_norm_mode != "volume":
+                if self._fast_ok():
+                    _, gfp_slice = self._get_slice(file_idx, z_idx)
+                else:
+                    _, gfp, _ = self._load_volume(file_idx)
+                    gfp_slice = gfp[z_idx]
+                # For volume mode, GFP is already [0,1]; per_z was normalized by
+                # _get_slice; for per_patch (raw) auto-normalize just for the check
+                if self.gfp_norm_mode == "per_patch" or (
+                        not self._fast_ok() and self.gfp_norm_mode != "volume"):
                     gfp_slice, _, _ = normalize_auto(gfp_slice, self.percentile_clip)
                 if gfp_slice.mean() >= empty_gfp_threshold:
                     filtered.append((file_idx, z_idx))
             self.index_map = filtered
             self.n_filtered = n_before - len(self.index_map)
 
+    def _get_slice(self, file_idx, z_idx):
+        """Fast path: materialize + normalize a single Z-slice from the raw
+        mmap (per_z GFP is normalized here; per_patch GFP stays raw, matching
+        the slow path's post-transform normalization)."""
+        bf_raw, gfp_raw = self._load_raw(file_idx)
+        bf_slice, gfp_slice = self._normalize_pair(
+            np.asarray(bf_raw[z_idx]), np.asarray(gfp_raw[z_idx]), file_idx)
+        if self.gfp_norm_mode == "per_z":
+            gfp_slice, _, _ = normalize_auto(gfp_slice, self.percentile_clip)
+        return bf_slice, gfp_slice
+
     def __len__(self):
         return len(self.index_map)
 
     def __getitem__(self, idx):
         file_idx, z_idx = self.index_map[idx]
-        bf, gfp, mask = self._load_volume(file_idx)
+        if self._fast_ok():
+            bf_slice, gfp_slice = self._get_slice(file_idx, z_idx)
+            mask = None
+        else:
+            bf, gfp, mask = self._load_volume(file_idx)
 
-        # Extract single slice: (H, W)
-        bf_slice = bf[z_idx]
-        gfp_slice = gfp[z_idx]
+            # Extract single slice: (H, W)
+            bf_slice = bf[z_idx]
+            gfp_slice = gfp[z_idx]
 
-        # per_z: normalize this slice's GFP before combining
-        if self.gfp_norm_mode == "per_z":
-            gfp_slice, _, _ = normalize_auto(gfp_slice, self.percentile_clip)
+            # per_z: normalize this slice's GFP before combining
+            if self.gfp_norm_mode == "per_z":
+                gfp_slice, _, _ = normalize_auto(gfp_slice, self.percentile_clip)
 
         if mask is not None:
             mask_slice = mask[z_idx].astype(np.float32)
@@ -237,7 +304,7 @@ class VolumeDataset(BaseDataset):
                  patch_depth=32, crop_size=256, patches_per_volume=32, z_range=None,
                  gfp_norm_mode="volume", filter_empty_gfp=False,
                  empty_gfp_threshold=0.01, percentile_clip=(0.5, 99.5),
-                 mask_threshold_method=None):
+                 mask_threshold_method=None, patch_sampling="random"):
         super().__init__(bf_files, gfp_files, stats_dir, apply_timm,
                          transform, cache_volumes, z_range=z_range,
                          gfp_norm_mode=gfp_norm_mode,
@@ -248,6 +315,15 @@ class VolumeDataset(BaseDataset):
         self.patch_depth = patch_depth
         self.crop_size = crop_size
         self.patches_per_volume = patches_per_volume
+        # 'random' (train) or 'center' (val) — only used by the fast path, which
+        # crops BEFORE the transform pipeline (whose Random/CenterCrop3D then
+        # no-op on the already-exact-size patch).
+        self.patch_sampling = patch_sampling
+
+    def _fast_ok(self):
+        # per_z normalizes each FULL slice before cropping — percentiles over a
+        # crop differ, so that mode must keep the slow full-volume path.
+        return super()._fast_ok() and self.gfp_norm_mode != "per_z"
 
         # Build index: (file_idx, patch_idx)
         self.index_map = []
@@ -264,6 +340,8 @@ class VolumeDataset(BaseDataset):
         Returns (bf_out, gfp_out, mask_out) tensors. mask_out is all-ones
         when masking is disabled.
         """
+        if self._fast_ok():
+            return self._extract_patch_fast(file_idx)
         bf, gfp, mask = self._load_volume(file_idx)
 
         # per_z: normalize each Z-slice of raw GFP independently
@@ -320,6 +398,45 @@ class VolumeDataset(BaseDataset):
         if self.gfp_norm_mode == "per_patch":
             gfp_out = self._normalize_patch_gfp(gfp_out)
 
+        return bf_out, gfp_out, mask_out
+
+    def _extract_patch_fast(self, file_idx):
+        """Crop the raw mmap first, then normalize ONLY the patch. Per-sample
+        cost drops from O(volume) to O(patch); the transform pipeline's
+        Random/CenterCrop3D no-op on the already-exact-size patch, so the
+        downstream flips/rot90/jitter/ToTensor apply unchanged."""
+        bf_raw, gfp_raw = self._load_raw(file_idx)
+        z, h, w = bf_raw.shape
+        pd, cs = self.patch_depth, self.crop_size
+        if self.patch_sampling == "center":
+            zd, yh, xw = max(0, (z - pd) // 2), max(0, (h - cs) // 2), \
+                max(0, (w - cs) // 2)
+        else:
+            zd = np.random.randint(0, max(z - pd, 0) + 1)
+            yh = np.random.randint(0, max(h - cs, 0) + 1)
+            xw = np.random.randint(0, max(w - cs, 0) + 1)
+        bf_p = np.asarray(bf_raw[zd:zd + pd, yh:yh + cs, xw:xw + cs])
+        gfp_p = np.asarray(gfp_raw[zd:zd + pd, yh:yh + cs, xw:xw + cs])
+        pad = ((0, pd - bf_p.shape[0]), (0, cs - bf_p.shape[1]),
+               (0, cs - bf_p.shape[2]))
+        if any(p[1] > 0 for p in pad):
+            bf_p = np.pad(bf_p, pad, mode="reflect")
+            gfp_p = np.pad(gfp_p, pad, mode="reflect")
+        bf_n, gfp_n = self._normalize_pair(bf_p, gfp_p, file_idx)
+        combined = np.stack([bf_n, gfp_n], axis=-1)  # (D, cs, cs, 2)
+
+        if self.transform:
+            combined = self.transform(combined)      # (C, H, W, D) after ToTensor3D
+            bf_out = combined[:1]
+            gfp_out = combined[1:2]
+        else:
+            patch = combined.transpose(3, 1, 2, 0)   # (C, H, W, D)
+            bf_out = torch.from_numpy(patch[:1].copy()).float()
+            gfp_out = torch.from_numpy(patch[1:2].copy()).float()
+        mask_out = torch.ones_like(gfp_out)
+
+        if self.gfp_norm_mode == "per_patch":
+            gfp_out = self._normalize_patch_gfp(gfp_out)
         return bf_out, gfp_out, mask_out
 
     def __getitem__(self, idx):

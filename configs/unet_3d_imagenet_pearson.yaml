@@ -2,9 +2,11 @@ base: base.yaml
 experiment_name: unet_3d_imagenet_pearson
 
 data:
-  # base.yaml sets cache_volumes: true, which makes each 3D DataLoader worker keep
-  # its own full-volume RAM cache -> host OOM (SIGKILL) partway through epoch 1.
-  # mmap instead (this is what the 2D SliceDataset already does).
+  # base.yaml sets cache_volumes: true -> every worker holds its own full-volume
+  # RAM cache -> host OOM (SIGKILL). With cache off the dataset mmaps and (since
+  # the crop-first fast path) reads/normalizes only each patch's pages. If the
+  # data lives on EFS/NFS, run scripts/localize_data.sh first so those random
+  # page reads hit local disk instead of the network.
   cache_volumes: false
 
 training:

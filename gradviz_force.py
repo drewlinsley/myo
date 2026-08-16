@@ -92,15 +92,21 @@ def _pad_mult(a, m=32):
 
 
 def _fit_plane(a, max_hw):
-    """Stride-downsample the last two dims so max(H, W) <= max_hw. Keeps the WHOLE
-    plane in view but bounds memory (a full-res forward+backward through the 3D
-    encoder OOMs — the model only ever saw crop_size windows). Returns a at
-    reduced resolution (and the stride used, for the caption)."""
+    """Block-average-downsample the last two dims so max(H, W) <= max_hw. Keeps
+    the WHOLE plane in view but bounds memory (a full-res forward+backward
+    through the encoder OOMs — the model only ever saw crop_size windows).
+    Averaging (not stride-decimating) is anti-aliased: naive a[::f, ::f] folds
+    the high-frequency myotube texture into aliasing noise, which then shows up
+    directly in the saliency. Returns (a at reduced resolution, the factor)."""
     hw = max(a.shape[-2:])
     if not max_hw or hw <= max_hw:
         return a, 1
     f = int(np.ceil(hw / max_hw))
-    return a[..., ::f, ::f], f
+    h, w = a.shape[-2:]
+    th, tw = h - h % f, w - w % f
+    a = a[..., :th, :tw]
+    sh = a.shape[:-2] + (th // f, f, tw // f, f)
+    return a.reshape(sh).mean(axis=(-3, -1), dtype=np.float32), f
 
 
 def _center_depth(vol, pd):
@@ -183,6 +189,10 @@ def main():
     p.add_argument("--max_hw", type=int, default=None,
                    help="full-view only: cap plane H/W (downsample above it) to "
                         "avoid OOM. Default 1024 (2D) / 512 (3D); 0 = no cap.")
+    p.add_argument("--sal_smooth", type=float, default=1.0,
+                   help="Gaussian sigma (px) applied to the final saliency map. "
+                        "Raw |grad| of a strided CNN checkerboards at the pixel "
+                        "level; a ~1-2 px blur shows the structure. 0 = off.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output_dir", required=True)
     args = p.parse_args()
@@ -292,6 +302,10 @@ def main():
             sal = sal3d.max(axis=0)                              # depth MIP of saliency
             gfp2d = patch.max(axis=0)                            # depth MIP of GFP
             title = f"{stem}  (3D, {vw}, depth-MIP)"
+
+        if args.sal_smooth > 0:
+            from scipy.ndimage import gaussian_filter
+            sal = gaussian_filter(sal, sigma=args.sal_smooth)
 
         if is_reg:
             pred_force = float(logits[0]) * std["sd"] + std["mu"]

@@ -68,26 +68,34 @@ class VolumeRegressionDataset(Dataset):
     def __len__(self):
         return len(self.index_map)
 
-    def _load(self, file_idx):
+    def _load_raw(self, file_idx):
+        """Raw (z-cropped) volume, mmap-backed. Only the mmap handle is cached:
+        slicing a crop/slice out of it materializes just those pages, and the
+        per-volume-stats normalization is element-wise, so normalizing the crop
+        afterwards is identical to the old normalize-whole-volume-then-crop —
+        without the full-volume read + float32 copy per sample (which also blew
+        up worker RAM via the old unbounded normalized-volume cache)."""
         if file_idx in self._cache:
             return self._cache[file_idx]
-        raw = np.load(self.files[file_idx])
+        raw = np.load(self.files[file_idx], mmap_mode="r")
         if self.z_range is not None:
             z_lo = max(0, self.z_range[0])
             z_hi = min(raw.shape[0], self.z_range[1])
             raw = raw[z_lo:z_hi]
+        self._cache[file_idx] = raw
+        return raw
+
+    def _normalize(self, patch, file_idx):
         st = self.stats[file_idx]
-        img = normalize(raw, st[self.modality]["p_low"],
-                        st[self.modality]["p_high"],
-                        apply_timm=self.apply_timm)
-        self._cache[file_idx] = img
-        return img
+        return normalize(patch, st[self.modality]["p_low"],
+                         st[self.modality]["p_high"],
+                         apply_timm=self.apply_timm)
 
     def __getitem__(self, idx):
         file_idx, slot = self.index_map[idx]
-        img = self._load(file_idx)
+        raw = self._load_raw(file_idx)
         if self.mode == "2d":
-            slc = img[slot]
+            slc = self._normalize(np.asarray(raw[slot]), file_idx)
             # Pad sub-crop FOVs up to crop_size (mirror the 3D branch) so the
             # 2D RandomCrop/CenterCrop don't get a negative crop range.
             cs = self.crop_size
@@ -100,20 +108,20 @@ class VolumeRegressionDataset(Dataset):
             else:
                 t = torch.from_numpy(slc[np.newaxis].copy()).float()
         else:
-            z, h, w = img.shape
+            z, h, w = raw.shape
             pd, cs = self.patch_depth, self.crop_size
-            pad_z = max(0, pd - z)
-            pad_h = max(0, cs - h)
-            pad_w = max(0, cs - w)
-            vol = img
-            if pad_z or pad_h or pad_w:
-                vol = np.pad(vol, ((0, pad_z), (0, pad_h), (0, pad_w)),
-                             mode="reflect")
-            z, h, w = vol.shape
-            zd = np.random.randint(0, z - pd + 1)
-            yh = np.random.randint(0, h - cs + 1)
-            xw = np.random.randint(0, w - cs + 1)
-            patch = vol[zd:zd + pd, yh:yh + cs, xw:xw + cs]
+            # Same np.random draw order/ranges as the old padded-volume version
+            # (max(z, pd) - pd + 1 == max(z - pd, 0) + 1), so seeded eval
+            # patches (_eval_det) are bitwise-identical.
+            zd = np.random.randint(0, max(z - pd, 0) + 1)
+            yh = np.random.randint(0, max(h - cs, 0) + 1)
+            xw = np.random.randint(0, max(w - cs, 0) + 1)
+            patch = np.asarray(raw[zd:zd + pd, yh:yh + cs, xw:xw + cs])
+            pad = ((0, pd - patch.shape[0]), (0, cs - patch.shape[1]),
+                   (0, cs - patch.shape[2]))
+            if any(p[1] > 0 for p in pad):
+                patch = np.pad(patch, pad, mode="reflect")
+            patch = self._normalize(patch, file_idx)
             if self.transform:
                 t = self.transform(patch[..., None])
             else:
