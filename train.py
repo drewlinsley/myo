@@ -20,7 +20,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.config import load_config, validate_config
-from src.utils import set_seed, prepare_env, save_checkpoint, load_checkpoint, make_train_val_split, get_git_hash, tune_cudnn
+from src.utils import (set_seed, prepare_env, save_checkpoint, load_checkpoint,
+                       make_train_val_split, get_git_hash, tune_cudnn,
+                       resolve_resume)
 from src.models import build_model
 from src.losses import build_loss
 from src.metrics import psnr as compute_psnr
@@ -402,15 +404,24 @@ def main(config_path, resume_from=None, split_json=None, data_dir=None,
     patience = tcfg.get("patience", 50)
     epochs_without_improvement = 0
 
-    # Resume
+    # Resume. Bare --resume (resume_from == "auto") picks up this run's own
+    # latest.pth if it exists, so a killed job restarts where it stopped.
     start_epoch = 0
     best_val_loss = float("inf")
-    if resume_from:
-        accelerator.print(f"Resuming from {resume_from}")
-        ckpt = load_checkpoint(resume_from, model, optimizer)
+    resume_path = resolve_resume(resume_from, os.path.join(ckpt_dir, "latest.pth"))
+    if resume_path:
+        accelerator.print(f"Resuming from {resume_path}")
+        ckpt = load_checkpoint(resume_path, model, optimizer, scheduler)
         start_epoch = ckpt.get("epoch", 0) + 1
         best_val_loss = ckpt.get("val_loss", float("inf"))
+        if "scheduler_state_dict" not in ckpt and scheduler:
+            accelerator.print("  note: checkpoint predates scheduler saving — "
+                              "the LR schedule restarts from warmup")
         accelerator.print(f"  Resuming from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+    elif resume_from:
+        accelerator.print(f"--resume: no checkpoint at "
+                          f"{os.path.join(ckpt_dir, 'latest.pth')} yet — "
+                          f"starting fresh")
 
     # Prepare for distributed / mixed precision
     model, optimizer, train_loader, val_loader = accelerator.prepare(
@@ -423,7 +434,7 @@ def main(config_path, resume_from=None, split_json=None, data_dir=None,
 
     # CSV logger
     csv_path = os.path.join(ckpt_dir, "log.csv")
-    csv_exists = os.path.exists(csv_path) and resume_from
+    csv_exists = os.path.exists(csv_path) and resume_path
     csv_file = open(csv_path, "a" if csv_exists else "w", newline="")
     csv_writer = csv.writer(csv_file)
     if not csv_exists:
@@ -508,9 +519,11 @@ def main(config_path, resume_from=None, split_json=None, data_dir=None,
             save_checkpoint(model, optimizer, epoch, mean_val, cfg,
                             os.path.join(ckpt_dir, f"epoch_{epoch+1}.pth"), accelerator)
 
-        # Always save latest (for resume)
+        # Always save latest (for resume) — includes scheduler state so the LR
+        # schedule continues rather than restarting at warmup.
         save_checkpoint(model, optimizer, epoch, mean_val, cfg,
-                        os.path.join(ckpt_dir, "latest.pth"), accelerator)
+                        os.path.join(ckpt_dir, "latest.pth"), accelerator,
+                        scheduler=scheduler)
 
     csv_file.close()
     accelerator.print("Training complete.")
@@ -520,8 +533,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train BF -> GFP model")
     parser.add_argument("-c", "--config", required=True, type=str,
                         help="Path to experiment config YAML")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume from")
+    parser.add_argument("--resume", nargs="?", const="auto", default=None,
+                        help="Resume training. Bare --resume picks up this "
+                             "run's own <ckpt_dir>/latest.pth (starting fresh "
+                             "if absent); or pass an explicit checkpoint path.")
     parser.add_argument("--split_json", type=str, default=None,
                         help="JSON with {'train':[stems],'val':[stems]} to force an "
                              "explicit split (leak-free BF->GFP for the two-stage "

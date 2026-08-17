@@ -50,7 +50,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.config import load_config, validate_config
-from src.utils import set_seed, prepare_env, make_train_val_split, tune_cudnn
+from src.utils import (set_seed, prepare_env, make_train_val_split, tune_cudnn,
+                       save_train_state, load_train_state, resolve_resume)
 from src.data.regression_dataset import VolumeRegressionDataset
 from src.models.gfp_classifier import build_gfp_classifier
 from src.data.force_metadata import build_force_groups
@@ -186,6 +187,12 @@ def main():
                         "prior --plan_only run, so this probe uses the IDENTICAL "
                         "replicate split as a paired BF->GFP stage. Skips metadata "
                         "matching + re-splitting (test stays leak-free).")
+    p.add_argument("--resume", nargs="?", const="auto", default=None,
+                   help="Resume from a training state written by a previous "
+                        "run. Bare --resume auto-detects <output>.state.pth "
+                        "(fresh start if absent); or pass an explicit path.")
+    p.add_argument("--state_every", type=int, default=1,
+                   help="Write the resumable state every N epochs (default 1).")
     p.add_argument("--weight_decay", type=float, default=None,
                    help="L2 regularization (AdamW decoupled weight decay) on the "
                         "TRAINED params; overrides cfg.training.weight_decay. With "
@@ -484,9 +491,54 @@ def main():
 
     best_sig = float("inf")
     best_probs = best_counts = None
+    probs = counts = None
     best_epoch = 0
     no_improve = 0
-    for ep in range(epochs):
+
+    # ---- resumable state (crash recovery) ----
+    state_path = os.path.splitext(args.output)[0] + ".state.pth"
+    fingerprint = {
+        "config": args.config, "split_json": args.split_json,
+        "target_col": args.target_col, "input": args.input, "dims": dims,
+        "n_bins": int(n_bins), "seed": int(seed), "epochs": int(epochs),
+        "init_from": args.init_from, "freeze_encoder": bool(args.freeze_encoder),
+        "weight_decay": float(wd),
+    }
+    start_epoch, done = 0, False
+    unwrapped_model = accelerator.unwrap_model(model)
+    resume_path = resolve_resume(args.resume, state_path)
+    if resume_path:
+        st = load_train_state(resume_path, unwrapped_model, optimizer,
+                              fingerprint=fingerprint)
+        ex = st["extra"]
+        start_epoch = int(st["epoch"])
+        best_sig = ex.get("best_sig", float("inf"))
+        best_epoch = ex.get("best_epoch", 0)
+        no_improve = ex.get("no_improve", 0)
+        best_probs = ex.get("best_probs")
+        best_counts = ex.get("best_counts")
+        done = bool(ex.get("done", False))
+        gen.manual_seed(seed * 1000 + 1 + start_epoch)
+        accelerator.print(
+            f"resumed {resume_path}: {start_epoch} epoch(s) done, best "
+            f"{best_sig:.4f} @ ep{best_epoch}"
+            + (" — already COMPLETE, re-emitting results" if done
+               else f", continuing to {epochs}"))
+    elif args.resume:
+        accelerator.print(f"--resume: no state at {state_path} yet — "
+                          f"starting fresh")
+
+    def _write_state(ep_done, is_done=False):
+        if not accelerator.is_main_process:
+            return
+        save_train_state(
+            state_path, accelerator.unwrap_model(model), optimizer, ep_done,
+            fingerprint,
+            extra={"best_sig": best_sig, "best_epoch": best_epoch,
+                   "no_improve": no_improve, "best_probs": best_probs,
+                   "best_counts": best_counts, "done": is_done})
+
+    for ep in range(start_epoch, epochs if not done else start_epoch):
         model.train()
         if args.freeze_encoder:
             # keep BN running stats frozen so the "frozen" features don't drift
@@ -535,10 +587,21 @@ def main():
                 accelerator.print(
                     f"  early stop ep{ep+1} ({sig_name}={best_sig:.4f} "
                     f"@ ep{best_epoch})")
+                _write_state(ep + 1, is_done=True)
                 break
+        if args.state_every > 0 and (ep + 1) % args.state_every == 0:
+            _write_state(ep + 1)
+    else:
+        if not done:
+            _write_state(epochs, is_done=True)
 
     if best_probs is None:
+        if probs is None:
+            raise SystemExit(
+                "resumed a completed run with no saved test predictions — "
+                f"delete {state_path} and retrain.")
         best_probs, best_counts = probs, counts
+    best_probs, best_counts = np.asarray(best_probs), np.asarray(best_counts)
 
     valid = best_counts > 0
     for s, c in zip(test_stems, best_counts):

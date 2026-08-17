@@ -178,6 +178,10 @@ run_arch() {
     && extra_flag+=(--save_ckpt "$OUT_DIR/${PREFIX}_ckpt_${dims}.pth")
   # Optional L2 override (AdamW weight decay); default uses the config's 0.01.
   [ -n "${WEIGHT_DECAY:-}" ] && extra_flag+=(--weight_decay "$WEIGHT_DECAY")
+  # Crash recovery: resume this run's own <output>.state.pth if a previous
+  # attempt died mid-training (no-op on a fresh run). RESUME=0 disables.
+  [ "${RESUME:-1}" = "1" ] && [ "${PLAN_ONLY:-0}" != "1" ] \
+    && [ "$TASK" = "classification" ] && extra_flag+=(--resume)
 
   # Task-specific args: bins for classification, loss for regression.
   local task_flag=()

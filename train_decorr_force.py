@@ -48,7 +48,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 
 from src.config import load_config, validate_config
-from src.utils import set_seed, tune_cudnn
+from src.utils import (set_seed, tune_cudnn, save_train_state, load_train_state,
+                       resolve_resume)
 from src.data.normalization import normalize
 from src.data.zband import resolve_z_range
 from src.data.regression_dataset import VolumeRegressionDataset
@@ -254,6 +255,16 @@ def main():
     p.add_argument("--n_permutations", type=int, default=10000)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--save_ckpt", default=None)
+    p.add_argument("--resume", nargs="?", const="auto", default=None,
+                   help="Resume from a training state written by a previous "
+                        "run. Bare --resume auto-detects <output>.state.pth "
+                        "(and starts fresh if absent); pass a path for an "
+                        "explicit file. Restores weights, optimizer moments, "
+                        "epoch, early-stopping bookkeeping and RNG.")
+    p.add_argument("--state_every", type=int, default=1,
+                   help="Write the resumable state every N epochs (default 1: "
+                        "lose at most one epoch; raise it if the ~600MB/epoch "
+                        "write is slow on network storage).")
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
@@ -366,10 +377,53 @@ def main():
         probs[valid] = sums[valid] / counts[valid, None]
         return probs, counts
 
+    # ---- resumable state (crash recovery) ----
+    state_path = os.path.splitext(args.output)[0] + ".state.pth"
+    fingerprint = {
+        "config": args.config, "split_json": args.split_json,
+        "attr_dir": args.attr_dir, "attr_lambda": float(args.attr_lambda),
+        "attr_score": args.attr_score, "input": args.input, "dims": dims,
+        "n_bins": int(n_bins), "seed": int(seed), "batch_size": int(bs),
+        "epochs": int(epochs), "init_from": args.init_from,
+    }
     history = []
     best_sig, best_probs, best_counts, best_epoch, no_improve = \
         float("inf"), None, None, 0, 0
-    for ep in range(epochs):
+    probs = counts = None          # last epoch's test predictions (fallback)
+    start_epoch, done = 0, False
+    resume_path = resolve_resume(args.resume, state_path)
+    if resume_path:
+        st = load_train_state(resume_path, model, optimizer,
+                              fingerprint=fingerprint)
+        ex = st["extra"]
+        start_epoch = int(st["epoch"])
+        history = ex.get("history", [])
+        best_sig = ex.get("best_sig", float("inf"))
+        best_epoch = ex.get("best_epoch", 0)
+        no_improve = ex.get("no_improve", 0)
+        best_probs = ex.get("best_probs")
+        best_counts = ex.get("best_counts")
+        done = bool(ex.get("done", False))
+        model.to(device)
+        # A resumed run replays the augmentation stream from the generator's
+        # seed, so offset it by the epoch to avoid repeating epoch 0's crops.
+        gen.manual_seed(seed * 1000 + 7 + start_epoch)
+        print(f"resumed {resume_path}: {start_epoch} epoch(s) done, "
+              f"best {best_sig:.4f} @ ep{best_epoch}"
+              + (" — training already COMPLETE, re-emitting results"
+                 if done else f", continuing to {epochs}"))
+    elif args.resume:
+        print(f"--resume: no state at {state_path} yet — starting fresh")
+
+    def _write_state(ep_done, is_done=False):
+        save_train_state(
+            state_path, model, optimizer, ep_done, fingerprint,
+            extra={"history": history, "best_sig": best_sig,
+                   "best_epoch": best_epoch, "no_improve": no_improve,
+                   "best_probs": best_probs, "best_counts": best_counts,
+                   "done": is_done})
+
+    for ep in range(start_epoch, epochs if not done else start_epoch):
         model.train()
         ces, pens = [], []
         for img, ref, tgt, _ in train_loader:
@@ -426,10 +480,21 @@ def main():
             if no_improve >= patience:
                 print(f"  early stop ep{ep+1} ({sig_name}={best_sig:.4f} "
                       f"@ ep{best_epoch})")
+                _write_state(ep + 1, is_done=True)
                 break
+        if args.state_every > 0 and (ep + 1) % args.state_every == 0:
+            _write_state(ep + 1)
+    else:
+        if not done:
+            _write_state(epochs, is_done=True)   # ran out the epoch budget
 
     if best_probs is None:
+        if probs is None:
+            raise SystemExit(
+                "resumed a completed run with no saved test predictions — "
+                f"delete {state_path} and retrain.")
         best_probs, best_counts = probs, counts
+    best_probs, best_counts = np.asarray(best_probs), np.asarray(best_counts)
 
     # ---- per-volume -> per-replicate aggregation on TEST ----
     valid = best_counts > 0

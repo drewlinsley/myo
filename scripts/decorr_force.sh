@@ -32,6 +32,9 @@
 #   BATCH_2D/BATCH_3D   override batch size (double backprop ~2x memory)
 #   ENC_CKPT_2D/3D      BF->GFP warm-start ckpts (auto-discovered)
 #   FORCE       (0)     1 = recompute maps + retrain
+#   RESUME      (1)     1 = resume a student that died mid-training from its
+#                       <output>.state.pth; 0 = always restart from epoch 0
+#   STATE_EVERY (1)     write the resume state every N epochs
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -113,6 +116,10 @@ run_student() {
   [ -n "$enc" ] && flags+=(--init_from "$enc") \
     || echo "[$dims] WARNING: no BF->GFP encoder found — training from ImageNet init"
   [ -n "$bs" ] && flags+=(--batch_size "$bs")
+  # Crash recovery: resume this student's own <output>.state.pth if an earlier
+  # attempt died partway (no-op on a fresh run). RESUME=0 to start over.
+  [ "${RESUME:-1}" = "1" ] && flags+=(--resume)
+  [ -n "${STATE_EVERY:-}" ] && flags+=(--state_every "$STATE_EVERY")
   echo "[$dims] training decorrelated student (lambda=$LAMBDA)"
   python train_decorr_force.py -c "$cfg" \
     --split_json "$SPLIT_JSON" --data_dir "$DATA_DIR" \

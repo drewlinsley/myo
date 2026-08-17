@@ -119,9 +119,12 @@ run_bfgfp() {
     echo "[bf->gfp $dims] exists, skipping: $ck/best.pth"; return 0
   fi
   echo ""; echo "# Stage 1 [$dims]: BF->GFP translation ($cfg)"
+  # --resume picks up this stage's own latest.pth if a previous attempt died
+  # partway (no-op on a fresh run). RESUME=0 to force restarting from epoch 0.
+  local resume_flag=(); [ "${RESUME:-1}" = "1" ] && resume_flag=(--resume)
   python train.py -c "$cfg" \
     --data_dir "$DATA_DIR" --ckpt_dir "$ck" \
-    --split_json "$BFGFP_SPLIT"
+    --split_json "$BFGFP_SPLIT" "${resume_flag[@]+"${resume_flag[@]}"}"
   [ -f "$ck/best.pth" ] || { echo "ERROR: $ck/best.pth not produced." >&2; exit 1; }
 }
 
@@ -136,6 +139,11 @@ run_probe() {
   local freeze_flag=(); [ "$FREEZE" = "1" ] && freeze_flag=(--freeze_encoder)
   local task_flag=(); [ "$TASK" = "regression" ] && task_flag=(--loss "${REG_LOSS:-huber}")
   echo ""; echo "# Stage 2 [$dims]: $TASK probe (input=$PROBE_INPUT freeze=$FREEZE)"
+  # Resume this probe's own <output>.state.pth if an earlier attempt died
+  # (classification trainer only; the regressor has no resume yet).
+  local resume_flag=()
+  [ "${RESUME:-1}" = "1" ] && [ "$TASK" = "classification" ] \
+    && resume_flag=(--resume)
   python "$PTRAINER" \
     -c "$cfg" --data_dir "$DATA_DIR" \
     --split_json "$SPLIT" --init_from "$enc" \
@@ -143,6 +151,7 @@ run_probe() {
     "${task_flag[@]+"${task_flag[@]}"}" \
     --weight_decay "$PROBE_L2" \
     --save_ckpt "$OUT_DIR/${PPREFIX}_ckpt_${dims}.pth" \
+    "${resume_flag[@]+"${resume_flag[@]}"}" \
     --seed "$SEED" --output "$out"
 }
 
