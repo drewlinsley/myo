@@ -233,6 +233,13 @@ def main():
                    help="Modality fed to the encoder (force-from-GFP => gfp)")
     p.add_argument("--data_dir", default=None,
                    help="Override cfg.data.data_dir (root with <input>/ + stats/)")
+    p.add_argument("--freeze_encoder", action="store_true",
+                   help="Linear-probe mode: freeze the encoder (incl. BN running "
+                        "stats) and train only the classification head. With "
+                        "~20 replicates a full ResNeXt-50 has far more capacity "
+                        "than the label set can constrain; a probe on frozen "
+                        "BF->GFP features is the right-sized model. Requires "
+                        "--init_from to be meaningful.")
     p.add_argument("--init_from", default=None,
                    help="BF->GFP U-Net checkpoint to warm-start the encoder")
     p.add_argument("--output", required=True)
@@ -246,6 +253,22 @@ def main():
                    help="Fraction of training groups held as inner val for early "
                         "stopping (outer held-out group never used). 0 disables.")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None,
+                   help="Override training.epochs from the config.")
+    p.add_argument("--patience", type=int, default=None,
+                   help="Override training.patience (early-stopping patience "
+                        "on the inner-val CE).")
+    p.add_argument("--min_epochs", type=int, default=0,
+                   help="Early stopping cannot fire before this many epochs. "
+                        "The inner-val set is a handful of replicates, so its "
+                        "CE is noisy enough for patience to trip on noise "
+                        "alone in the first few epochs.")
+    p.add_argument("--fold_cache", default=None,
+                   help="Directory of per-fold result JSONs. Completed folds "
+                        "are reloaded and skipped, so a 20-fold run that dies "
+                        "at fold 17 resumes at fold 17 instead of fold 0.")
+    p.add_argument("--force_folds", action="store_true",
+                   help="Ignore --fold_cache entries and recompute every fold.")
     p.add_argument("--save_ckpt_dir", default=None,
                    help="If set, save each fold's best weights + bin metadata to "
                         "<dir>/<group>/best.pth")
@@ -358,9 +381,12 @@ def main():
                                 if train else 8),
             crop_size=dcfg.get("crop_size", 256), modality=args.input)
 
-    epochs = tcfg.get("epochs", 100)
-    patience = tcfg.get("patience", 15)
+    epochs = args.epochs or tcfg.get("epochs", 100)
+    patience = args.patience or tcfg.get("patience", 15)
     min_delta = tcfg.get("min_delta", 1e-3)
+    min_epochs = max(0, int(args.min_epochs))
+    if args.fold_cache:
+        os.makedirs(args.fold_cache, exist_ok=True)
     lr = tcfg["lr"]
 
     results = []  # one entry per held-out replicate
@@ -406,6 +432,23 @@ def main():
             f"edges={[round(float(e),3) for e in fold_edges]}, "
             f"n_held_vols={len(held_stems)}, n_inner_val_grp={len(inner_val_groups)}) ──")
 
+        fold_key = re.sub(r"[^A-Za-z0-9._-]", "_", str(held_g))
+        fold_cache_path = (os.path.join(args.fold_cache, f"{fold_key}.json")
+                           if args.fold_cache else None)
+        if (fold_cache_path and os.path.exists(fold_cache_path)
+                and not args.force_folds):
+            with open(fold_cache_path) as f:
+                cached = json.load(f)
+            if cached.get("true_bin") == true_bin:
+                results.append(cached)
+                accelerator.print(
+                    f"  cached (fold_cache): pred={classes[cached['pred_bin']]} "
+                    f"correct={cached['correct']} — skipping")
+                continue
+            accelerator.print(
+                "  fold_cache entry disagrees with this fold's bin edges "
+                "(n_bins or metadata changed) — recomputing")
+
         fold_ckpt_path = None
         if args.save_ckpt_dir:
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(held_g))
@@ -434,8 +477,28 @@ def main():
                     "architecture mismatch? Refusing to train an un-warm-started "
                     "model while claiming a warm start.")
 
+        # Linear-probe: freeze the encoder BEFORE building the optimizer and
+        # before accelerator.prepare, so only head params are ever stepped.
+        # (BN running stats are frozen in the loop via encoder.eval().)
+        if args.freeze_encoder:
+            for pm in model.encoder.parameters():
+                pm.requires_grad = False
+            trainable = [pm for pm in model.parameters() if pm.requires_grad]
+            if fold_idx == 0:
+                n_tr = sum(pm.numel() for pm in trainable)
+                n_enc = sum(pm.numel() for pm in model.encoder.parameters())
+                accelerator.print(
+                    f"  freeze_encoder: linear probe — {n_tr:,} head params "
+                    f"trainable, encoder frozen ({n_enc:,})")
+                if not args.init_from:
+                    accelerator.print(
+                        "  WARNING: --freeze_encoder without --init_from freezes "
+                        "a RANDOM encoder; features will be uninformative.")
+        else:
+            trainable = model.parameters()
+
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=lr,
+            trainable, lr=lr,
             weight_decay=tcfg.get("weight_decay", 0.01))
         criterion = nn.CrossEntropyLoss()
 
@@ -498,6 +561,8 @@ def main():
         no_improve = 0
         for ep in range(epochs):
             model.train()
+            if args.freeze_encoder:
+                accelerator.unwrap_model(model).encoder.eval()
             losses = []
             for img, tgt, _ in train_loader:
                 lex, _lpt = model(img)
@@ -541,7 +606,7 @@ def main():
                     os.replace(tmp, fold_ckpt_path)
             else:
                 no_improve += 1
-                if no_improve >= patience:
+                if no_improve >= patience and (ep + 1) >= min_epochs:
                     accelerator.print(
                         f"  early stop ep{ep+1} ({sig_name}={best_sig:.4f} "
                         f"@ ep{best_epoch})")
@@ -595,6 +660,14 @@ def main():
             "class_rep_force": class_rep.tolist(),
             "per_volume": vol_records,
         })
+
+        # Persist this fold immediately: a 20-fold 3D LOO is many hours, and a
+        # crash at fold 17 should not throw away folds 1-16.
+        if fold_cache_path and accelerator.is_main_process:
+            tmp = fold_cache_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(results[-1], f, indent=2)
+            os.replace(tmp, fold_cache_path)
 
     # ------------------------------ metrics ------------------------------
     true_bins = np.array([r["true_bin"] for r in results])
@@ -667,6 +740,7 @@ def main():
         "target_col": args.target_col,
         "input": args.input, "dims": dims,
         "init_from": args.init_from, "warm_started": warm_started,
+        "freeze_encoder": bool(args.freeze_encoder),
         "seed": int(seed), "cv_unit": args.cv_unit,
         "n_bins": n_bins, "bin_scheme": args.bin_scheme,
         "edges_are_per_fold": True,

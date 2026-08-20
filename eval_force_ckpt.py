@@ -116,7 +116,7 @@ def main():
     print(f"\n  n_bins={n_bins}  chance={chance:.3f}  "
           f"CE at chance = ln({n_bins}) = {math.log(n_bins):.4f}")
     print(f"  {'split':6s} {'reps':>5} {'vols':>5} {'vol_acc':>8} "
-          f"{'rep_acc':>8} {'patch_CE':>9}")
+          f"{'rep_acc':>8} {'patch_CE':>9}   pred-dist / confidence")
 
     out = {"ckpt": args.ckpt, "split_json": args.split_json,
            "n_bins": n_bins, "chance": chance, "splits": {}}
@@ -155,17 +155,38 @@ def main():
             rep_ok.append(int(probs[idx].mean(axis=0).argmax()) == group_bin[g])
         rep_acc = float(np.mean(rep_ok)) if rep_ok else float("nan")
 
+        # Collapse check. A model that emits one class regardless of input
+        # scores at chance but has a CE far ABOVE chance, because it is
+        # confidently wrong on every other class. That looks nothing like a
+        # model that simply failed to learn, and it needs a different fix.
+        hist = np.bincount(pred_vol[seen], minlength=n_bins) if seen.any() \
+            else np.zeros(n_bins, dtype=int)
+        conf = float(probs[seen].max(axis=1).mean()) if seen.any() else float("nan")
+        top_frac = float(hist.max() / max(hist.sum(), 1))
+
         print(f"  {name:6s} {len(gs):>5} {int(seen.sum()):>5} {vol_acc:>8.3f} "
-              f"{rep_acc:>8.3f} {ce:>9.4f}")
+              f"{rep_acc:>8.3f} {ce:>9.4f}   "
+              f"pred={list(hist)} conf={conf:.2f}")
         out["splits"][name] = {"n_replicates": len(gs),
                                "n_volumes": int(seen.sum()),
                                "volume_accuracy": vol_acc,
                                "replicate_accuracy": rep_acc,
-                               "patch_ce": float(ce)}
+                               "patch_ce": float(ce),
+                               "pred_histogram": [int(h) for h in hist],
+                               "mean_confidence": conf,
+                               "top_class_fraction": top_frac}
 
     tr = out["splits"].get("train", {})
     tr_acc = tr.get("volume_accuracy")
     print("")
+    tr_ce, tr_top = tr.get("patch_ce"), tr.get("top_class_fraction")
+    if tr_ce is not None and tr_ce > math.log(n_bins) * 1.15:
+        print(f"  NOTE: train CE {tr_ce:.3f} is well ABOVE chance "
+              f"({math.log(n_bins):.3f}) — the model is confidently WRONG on "
+              f"data it was allowed to memorize.")
+        if tr_top is not None and tr_top > 0.6:
+            print(f"        {tr_top*100:.0f}% of train volumes get the same "
+                  f"predicted class: it has collapsed to a constant predictor.")
     if tr_acc is None or (isinstance(tr_acc, float) and math.isnan(tr_acc)):
         verdict = "could not score the training split"
     elif tr_acc > chance + 0.25:
