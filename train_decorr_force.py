@@ -201,12 +201,19 @@ class PairedAttrDataset(Dataset):
 # ---------------------------------------------------------------------------
 # The decorrelation penalty
 # ---------------------------------------------------------------------------
-def attr_corr_penalty(model, x, target, ref_attr, score_mode):
-    """Returns (logits, mean |pearson(|dS/dx|, ref_attr)| over valid samples).
+def attr_corr_penalty(model, x, target, ref_attr, score_mode, margin=0.0):
+    """Returns (logits, mean hinge(|pearson(|dS/dx|, ref_attr)|) over samples).
 
     S is the chosen class logit per sample; the gradient is taken with
     create_graph=True so the penalty trains the model (double backprop).
     Samples whose reference patch is (near-)constant contribute no penalty.
+
+    margin: penalize only correlation ABOVE this value, i.e. relu(|r| - margin).
+        The reference map is broadly tissue-shaped, and any model that looks at
+        the tissue at all inherits some correlation with it. Driving |r| to 0
+        therefore pushes the student OFF the tissue — which reads as noisy,
+        background-focused saliency and costs accuracy. A margin concedes that
+        unavoidable overlap and penalizes only the excess.
     """
     x = x.requires_grad_(True)
     logits, _ = model(x)
@@ -226,7 +233,8 @@ def attr_corr_penalty(model, x, target, ref_attr, score_mode):
     corr = (gz * az).sum(dim=1) / (denom + 1e-12)
     valid = (az.norm(dim=1) > 1e-8) & (gz.norm(dim=1) > 1e-8)
     if valid.any():
-        pen = corr[valid].abs().mean()
+        a = corr[valid].abs()
+        pen = (a - margin).clamp(min=0).mean() if margin > 0 else a.mean()
     else:
         pen = torch.zeros((), device=x.device)
     return logits, pen
@@ -246,6 +254,20 @@ def main():
                    help="Weight of the decorrelation penalty (0 = plain CE)")
     p.add_argument("--attr_score", choices=["true", "pred"], default="true",
                    help="Which logit's input-gradient to decorrelate")
+    p.add_argument("--attr_margin", type=float, default=0.0,
+                   help="Penalize only |corr| above this (relu(|r|-margin)). "
+                        "The reference map is tissue-shaped, so ANY model that "
+                        "looks at tissue correlates with it; 0 demands the "
+                        "student leave the tissue entirely. Try 0.1-0.2.")
+    p.add_argument("--lambda_warmup", type=int, default=5,
+                   help="Ramp the penalty linearly 0 -> attr_lambda over the "
+                        "first N epochs. At full strength from step 0 the "
+                        "penalty dominates CE before the classifier has learned "
+                        "anything. Best-checkpoint selection starts only once "
+                        "the ramp finishes, so a warm-up epoch (low lambda, "
+                        "low CE) can't win the early-stopping contest.")
+    p.add_argument("--min_epochs", type=int, default=20,
+                   help="Early stopping cannot fire before this many epochs.")
     p.add_argument("--input", choices=["bf", "gfp"], default="gfp")
     p.add_argument("--init_from", default=None,
                    help="BF->GFP U-Net ckpt to warm-start the encoder")
@@ -351,8 +373,9 @@ def main():
     patience = tcfg.get("patience", 15)
     min_delta = tcfg.get("min_delta", 1e-3)
     print(f"training {dims} student: lambda={args.attr_lambda} "
-          f"score={args.attr_score} bs={bs} epochs<={epochs} fp32 "
-          f"(double backprop)")
+          f"(warmup {args.lambda_warmup} ep) margin={args.attr_margin} "
+          f"score={args.attr_score} bs={bs} epochs {args.min_epochs}..{epochs} "
+          f"patience={patience} fp32 (double backprop)")
 
     def eval_loss_on(loader):
         model.eval()
@@ -385,6 +408,9 @@ def main():
         "attr_score": args.attr_score, "input": args.input, "dims": dims,
         "n_bins": int(n_bins), "seed": int(seed), "batch_size": int(bs),
         "epochs": int(epochs), "init_from": args.init_from,
+        "attr_margin": float(args.attr_margin),
+        "lambda_warmup": int(args.lambda_warmup),
+        "min_epochs": int(args.min_epochs),
     }
     history = []
     best_sig, best_probs, best_counts, best_epoch, no_improve = \
@@ -423,21 +449,33 @@ def main():
                    "best_probs": best_probs, "best_counts": best_counts,
                    "done": is_done})
 
+    # Ramp the penalty in, and don't let a warm-up epoch win the checkpoint:
+    # during the ramp lambda is small, so CE is at its lowest there. Selecting
+    # on val CE across ALL epochs would therefore save a barely-decorrelated
+    # model. Selection opens only once lambda has reached full strength.
+    warmup = max(0, int(args.lambda_warmup))
+    if warmup >= epochs:       # a short --epochs run must still select something
+        warmup = max(0, epochs - 1)
+        print(f"  (lambda_warmup clamped to {warmup} — only {epochs} epochs)")
+    sel_start = warmup if args.attr_lambda > 0 else 0
+
     for ep in range(start_epoch, epochs if not done else start_epoch):
         model.train()
+        lam = args.attr_lambda * (min(1.0, ep / warmup) if warmup > 0 else 1.0)
         ces, pens = [], []
         for img, ref, tgt, _ in train_loader:
             img = img.to(device, non_blocking=True)
             ref = ref.to(device, non_blocking=True)
             target = tgt.long().to(device)
-            if args.attr_lambda > 0:
+            if lam > 0:
                 logits, pen = attr_corr_penalty(model, img, target, ref,
-                                                args.attr_score)
+                                                args.attr_score,
+                                                args.attr_margin)
             else:
                 logits, _ = model(img)
                 pen = torch.zeros((), device=device)
             ce = criterion(logits, target)
-            loss = ce + args.attr_lambda * pen
+            loss = ce + lam * pen
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -453,10 +491,17 @@ def main():
         probs, counts = _eval_det(
             lambda: predict_probs(test_loader, len(test_stems)), eval_seed)
         history.append({"epoch": ep + 1, "train_ce": tr_ce,
-                        "attr_corr": tr_pen, sig_name: sig})
+                        "attr_corr": tr_pen, "lambda": lam, sig_name: sig})
         if (ep + 1) % 5 == 0 or ep == epochs - 1:
-            print(f"  ep{ep+1}/{epochs} train_ce={tr_ce:.4f} "
-                  f"attr_corr={tr_pen:.4f} {sig_name}={sig:.4f}")
+            print(f"  ep{ep+1}/{epochs} lam={lam:.3f} train_ce={tr_ce:.4f} "
+                  f"attr_corr={tr_pen:.4f} {sig_name}={sig:.4f}"
+                  + ("  [warmup — not selecting]" if ep < sel_start else ""))
+        if ep < sel_start:
+            # Penalty not yet at full strength: this epoch is not a candidate
+            # for the checkpoint and does not count toward early stopping.
+            if args.state_every > 0 and (ep + 1) % args.state_every == 0:
+                _write_state(ep + 1)
+            continue
         if sig < best_sig - min_delta:
             best_sig, best_probs, best_counts, best_epoch = sig, probs, counts, ep + 1
             no_improve = 0
@@ -477,7 +522,7 @@ def main():
                 os.replace(tmp, args.save_ckpt)
         else:
             no_improve += 1
-            if no_improve >= patience:
+            if no_improve >= patience and (ep + 1) >= args.min_epochs:
                 print(f"  early stop ep{ep+1} ({sig_name}={best_sig:.4f} "
                       f"@ ep{best_epoch})")
                 _write_state(ep + 1, is_done=True)

@@ -25,6 +25,12 @@
 #   REF_CFG     (configs/gfp_classifier_3d.yaml)  its architecture config
 #   SPLIT_JSON  ($BASE_DIR/force_3d.split.json, falls back to force_2d)
 #   LAMBDA      (1.0)   decorrelation weight
+#   LAMBDA_WARMUP (5)   ramp lambda 0->LAMBDA over N epochs; checkpoint
+#                       selection starts only after the ramp
+#   ATTR_MARGIN (0.1)   penalize only |corr| above this. 0 demands ZERO overlap
+#                       with a tissue-shaped reference map, which drives the
+#                       student off the tissue (noisy saliency, bad accuracy)
+#   MIN_EPOCHS  (20)    early stopping cannot fire before this
 #   ATTR_SCORE  (true)  true|pred — which logit's gradient to decorrelate
 #   N_SAMPLES   (8)     SmoothGrad samples per tile for the reference maps
 #   NOISE       (0.1)
@@ -46,6 +52,9 @@ OUT_DIR="${OUT_DIR:-results/force_decorr}"
 REF_CKPT="${REF_CKPT:-$BASE_DIR/force_ckpt_3d.pth}"
 REF_CFG="${REF_CFG:-configs/gfp_classifier_3d.yaml}"
 LAMBDA="${LAMBDA:-1.0}"
+LAMBDA_WARMUP="${LAMBDA_WARMUP:-5}"
+ATTR_MARGIN="${ATTR_MARGIN:-0.1}"
+MIN_EPOCHS="${MIN_EPOCHS:-20}"
 ATTR_SCORE="${ATTR_SCORE:-true}"
 N_SAMPLES="${N_SAMPLES:-8}"
 NOISE="${NOISE:-0.1}"
@@ -124,6 +133,8 @@ run_student() {
   python train_decorr_force.py -c "$cfg" \
     --split_json "$SPLIT_JSON" --data_dir "$DATA_DIR" \
     --attr_dir "$ATTR_DIR" --attr_lambda "$LAMBDA" --attr_score "$ATTR_SCORE" \
+    --attr_margin "$ATTR_MARGIN" --lambda_warmup "$LAMBDA_WARMUP" \
+    --min_epochs "$MIN_EPOCHS" \
     --save_ckpt "$OUT_DIR/decorr_ckpt_${dims}.pth" \
     "${flags[@]+"${flags[@]}"}" --output "$out"
   echo "[$dims] done -> $out"
@@ -141,7 +152,8 @@ python - "$BASE_DIR" "$OUT_DIR" <<'PY'
 import json, os, sys
 base, out = sys.argv[1], sys.argv[2]
 def load(p): return json.load(open(p)) if os.path.exists(p) else None
-print(f"  {'model':22s} {'acc':>6} {'chance':>7} {'spear':>7} {'perm_p':>7} {'attr_corr':>10}")
+print(f"  {'model':22s} {'acc':>6} {'chance':>7} {'spear':>7} {'perm_p':>7} "
+      f"{'attr_corr':>10} {'best_ep':>9}")
 for dims in ("2d", "3d"):
     for tag, d in [(f"baseline {dims}", load(f"{base}/force_{dims}.json")),
                    (f"decorr   {dims}", load(f"{out}/decorr_{dims}.json"))]:
@@ -149,12 +161,17 @@ for dims in ("2d", "3d"):
             continue
         c = d.get("correlation", {})
         pp = (d.get("permutation_test") or {}).get("p_value_accuracy")
-        ac = d.get("history", [{}])[-1].get("attr_corr") if "history" in d else None
+        # attr_corr AT the selected epoch, not at the last one run — after an
+        # early stop those are different epochs.
+        hist, be = d.get("history") or [], d.get("best_epoch")
+        row = next((h for h in hist if h.get("epoch") == be), hist[-1] if hist else {})
+        ac = row.get("attr_corr")
+        ep = f"{be}/{len(hist)}" if be and hist else "n/a"
         f = lambda x, k=3: "   n/a" if x is None else f"{x:.{k}f}"
         print(f"  {tag:22s} {f(d.get('replicate_accuracy')):>6} "
               f"{f(d.get('chance'),2):>7} "
               f"{f(c.get('spearman_expected_vs_force')):>7} {f(pp):>7} "
-              f"{f(ac,4):>10}")
+              f"{f(ac,4):>10} {ep:>9}")
 print("\n  saliency of a decorrelated model (reuses the baseline test-vol pick):")
 print("    OUT_DIR=results/force_decorr RESULT_PREFIX=decorr \\")
 print("      CKPT_2D=results/force_decorr/decorr_ckpt_2d.pth \\")
