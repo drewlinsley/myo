@@ -46,6 +46,12 @@
 #   EPOCHS_FT     (150)  PATIENCE_FT    (25)
 #   MIN_EPOCHS    (20)   early stopping cannot fire before this
 #   INNER_VAL     (0.2)  fraction of TRAIN replicates held out for early stopping
+#   ALLOW_PARTIAL (1)   tolerate force-labeled spreadsheet rows whose volume
+#                       was never staged. This drop has exactly one
+#                       (261805_20X_12L_R003), so strict mode blocks every
+#                       run for a file that simply is not on disk. Set 0 to
+#                       fail instead — worth doing on a NEW drop, where many
+#                       unmatched rows would mean broken filename matching.
 #   SEED          (42)
 #   FORCE         (0)    1 = ignore cached folds and recompute
 #   PLAN_ONLY     (0)
@@ -68,6 +74,7 @@ EPOCHS_FT="${EPOCHS_FT:-150}"
 PATIENCE_FT="${PATIENCE_FT:-25}"
 MIN_EPOCHS="${MIN_EPOCHS:-20}"
 INNER_VAL="${INNER_VAL:-0.2}"
+ALLOW_PARTIAL="${ALLOW_PARTIAL:-1}"
 SEED="${SEED:-42}"
 FORCE="${FORCE:-0}"
 PLAN_ONLY="${PLAN_ONLY:-0}"
@@ -102,7 +109,8 @@ echo " Force, leave-one-replicate-out"
 echo "   data=$DATA_DIR  metadata=$METADATA"
 echo "   target=$TARGET_COL  groups=$GROUP_COLS"
 echo "   n_bins=$N_BINS (chance $(python -c "print(f'{1/$N_BINS:.3f}')"))"
-echo "   arms=[$ARMS]  modes=[$MODES]  seed=$SEED"
+echo "   arms=[$ARMS]  modes=[$MODES]  seed=$SEED  allow_partial=$ALLOW_PARTIAL"
+[ "$ALLOW_PARTIAL" = "1" ] && echo "   (check the match report below: expect ~53 matched / 20 replicates)"
 echo "   encoder 2d: ${ENC_2D:-<none found>}"
 echo "   encoder 3d: ${ENC_3D:-<none found>}"
 echo "════════════════════════════════════════════════════════════════"
@@ -142,6 +150,7 @@ run_arm() {
   fi
   [ "$mode" = "probe" ] && flags+=(--freeze_encoder)
   [ "$FORCE" = "1" ] && flags+=(--force_folds)
+  [ "$ALLOW_PARTIAL" = "1" ] && flags+=(--allow_partial_match)
 
   echo ""
   echo "──────────────────────────────────────────────────────────────"
