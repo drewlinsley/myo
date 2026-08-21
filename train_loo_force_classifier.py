@@ -73,6 +73,7 @@ from src.data.grouping import stem_to_group
 from src.models.gfp_classifier import build_gfp_classifier
 from src.data import transforms as T
 from extract_features import load_metadata
+from src.data.force_metadata import build_force_groups
 
 
 def build_transforms(cfg, train):
@@ -222,6 +223,20 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("-c", "--config", required=True)
     p.add_argument("--metadata", default="data_mapping_drew.csv")
+    p.add_argument("--group_cols", default="",
+                   help="Comma-separated spreadsheet columns that identify one "
+                        "replicate, e.g. 'plate,Tissue'. Setting this selects "
+                        "the NEW-drop metadata path (build_force_groups, the "
+                        "same loader train_split_force_classifier.py uses), so "
+                        "LOO and the split runs group tissues identically. "
+                        "Leave empty for the legacy calcium-dataset schema "
+                        "(load_metadata + stem_to_group).")
+    p.add_argument("--file_col", default="file",
+                   help="Spreadsheet column holding the source filename "
+                        "(new-drop path only).")
+    p.add_argument("--allow_partial_match", action="store_true",
+                   help="Permit force-labeled metadata rows that match no "
+                        "staged volume (new-drop path only).")
     p.add_argument("--target_col", default="peak_amplitude_week_5",
                    help="Numeric force column to discretize and classify")
     p.add_argument("--n_bins", type=int, default=3,
@@ -287,19 +302,57 @@ def main():
     stats_dir = os.path.join(data_dir, "stats")
     mod_dir = os.path.join(data_dir, args.input)
 
-    metadata = load_metadata(args.metadata)
-
-    # Force value per stem (volumes lacking the numeric column are dropped).
-    forces = {}
-    for stem, row in metadata.items():
-        v = parse_target(row.get(args.target_col))
-        if v is not None:
-            forces[stem] = v
-
+    group_cols = [c.strip() for c in (args.group_cols or "").split(",") if c.strip()]
     all_stems = sorted(os.path.splitext(os.path.basename(f))[0]
                        for f in glob(os.path.join(mod_dir, "*.npy")))
-    stems = [s for s in all_stems if s in forces]
     n_total = len(all_stems)
+
+    if group_cols:
+        # NEW-drop schema. Replicate identity comes from --group_cols in the
+        # mapping spreadsheet, matched to staged volumes by canonicalized
+        # filename. This is the same loader train_split_force_classifier.py
+        # uses, so a LOO run and a split run group tissues identically.
+        data = build_force_groups(
+            args.metadata, data_dir, args.target_col,
+            file_col=args.file_col, group_cols=tuple(group_cols),
+            modality=args.input)
+        accelerator.print("\n".join(data["report"]))
+        if data["n_matched"] == 0:
+            raise SystemExit(
+                "No metadata force rows matched any staged volume — check "
+                "--file_col and that the spreadsheet filenames correspond to "
+                "the staged .npy names (see the unmatched examples above).")
+        if data["unmatched_meta"] and not args.allow_partial_match:
+            raise SystemExit(
+                f"{len(data['unmatched_meta'])} force-labeled metadata row(s) "
+                "matched NO staged volume (examples above). Fix the filename "
+                "mapping, or pass --allow_partial_match to proceed anyway.")
+        forces = dict(data["forces"])
+        stems = sorted(forces)
+        if args.cv_unit == "volume":
+            groups = {s: [s] for s in stems}
+        else:
+            groups = {g: sorted(v) for g, v in data["groups"].items()}
+    else:
+        # LEGACY calcium-dataset schema (scripts/force_from_gfp.sh).
+        metadata = load_metadata(args.metadata)
+        forces = {}
+        for stem, row in metadata.items():
+            v = parse_target(row.get(args.target_col))
+            if v is not None:
+                forces[stem] = v
+        stems = [s for s in all_stems if s in forces]
+        # Force lives in the perturbation dataset, so the grouping task hint is
+        # 'perturbation' (replicate id = "{Perturbation}_tissue={T}").
+        groups = {}
+        for s in stems:
+            g = stem_to_group(s, metadata, args.cv_unit, task="perturbation")
+            if g is None:
+                accelerator.print(
+                    f"  skip {s}: no group id for cv_unit={args.cv_unit}")
+                continue
+            groups.setdefault(g, []).append(s)
+
     n_dropped = n_total - len(stems)
     accelerator.print(
         f"using {len(stems)}/{n_total} volumes with numeric "
@@ -307,17 +360,11 @@ def main():
     if len(stems) < 2:
         raise SystemExit(
             f"Need >=2 vols with numeric '{args.target_col}', got {len(stems)} "
-            f"(looked in {mod_dir}/)")
-
-    # Group by CV unit. Force lives in the perturbation dataset, so the grouping
-    # task hint is 'perturbation' (replicate id = "{Perturbation}_tissue={T}").
-    groups = {}
-    for s in stems:
-        g = stem_to_group(s, metadata, args.cv_unit, task="perturbation")
-        if g is None:
-            accelerator.print(f"  skip {s}: no group id for cv_unit={args.cv_unit}")
-            continue
-        groups.setdefault(g, []).append(s)
+            f"(looked in {mod_dir}/)"
+            + ("" if group_cols else
+               "\n  NOTE: no --group_cols given, so the LEGACY metadata schema "
+               "was used. The phalloidin/MHC drop needs "
+               "--group_cols plate,Tissue."))
     if len(groups) < 2:
         raise SystemExit(
             f"cv_unit={args.cv_unit} produced {len(groups)} group(s); need >= 2.")

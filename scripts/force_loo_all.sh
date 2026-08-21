@@ -34,8 +34,9 @@
 # Env knobs (defaults in parens)
 #   DATA_DIR      (data_phalloidin_mhc_051826_staged)
 #   OUT_DIR       (results/force_loo)
-#   METADATA      (data_mapping_drew.csv)
-#   TARGET_COL    (peak_amplitude_week_5)
+#   METADATA      (phalloidin_mhc_mapping_051426_SS edit.xlsx)
+#   TARGET_COL    (peak_amplitude_week3)
+#   GROUP_COLS    (plate,Tissue)  spreadsheet columns = one replicate
 #   N_BINS        (4)   keep 4: under LOO, 4 bins reach p<0.05 at 45% accuracy
 #                       while 2 bins need 75% — lower chance buys more power
 #                       than the easier task costs
@@ -55,9 +56,10 @@ cd "$ROOT"
 
 DATA_DIR="${DATA_DIR:-data_phalloidin_mhc_051826_staged}"
 OUT_DIR="${OUT_DIR:-results/force_loo}"
-METADATA="${METADATA:-data_mapping_drew.csv}"
-TARGET_COL="${TARGET_COL:-peak_amplitude_week_5}"
+METADATA="${METADATA:-phalloidin_mhc_mapping_051426_SS edit.xlsx}"
+TARGET_COL="${TARGET_COL:-peak_amplitude_week3}"
 N_BINS="${N_BINS:-4}"
+GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
 ARMS="${ARMS:-gfp:2d gfp:3d bf:2d bf:3d}"
 MODES="${MODES:-probe}"
 EPOCHS_PROBE="${EPOCHS_PROBE:-200}"
@@ -97,7 +99,8 @@ ENC_3D="${ENC_3D:-$(find_ckpt 3d)}"
 mkdir -p "$OUT_DIR"
 echo "════════════════════════════════════════════════════════════════"
 echo " Force, leave-one-replicate-out"
-echo "   data=$DATA_DIR  metadata=$METADATA  target=$TARGET_COL"
+echo "   data=$DATA_DIR  metadata=$METADATA"
+echo "   target=$TARGET_COL  groups=$GROUP_COLS"
 echo "   n_bins=$N_BINS (chance $(python -c "print(f'{1/$N_BINS:.3f}')"))"
 echo "   arms=[$ARMS]  modes=[$MODES]  seed=$SEED"
 echo "   encoder 2d: ${ENC_2D:-<none found>}"
@@ -150,6 +153,7 @@ run_arm() {
 
   python train_loo_force_classifier.py -c "$cfg" \
     --metadata "$METADATA" --target_col "$TARGET_COL" \
+    --group_cols "$GROUP_COLS" \
     --data_dir "$DATA_DIR" --input "$input" \
     --cv_unit replicate --n_bins "$N_BINS" \
     --epochs "$epochs" --patience "$patience" --min_epochs "$MIN_EPOCHS" \
