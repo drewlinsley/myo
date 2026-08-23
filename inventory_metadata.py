@@ -200,6 +200,56 @@ def main():
             "eta2_null": None if np.isnan(null) else float(null),
             "omega2_plate": None if np.isnan(w2) else float(w2)}
 
+    # ---- categorical label columns (treated/not, perturbed/not, ...) ----
+    print("\n  categorical label columns (candidate classification targets)")
+    print(f"    {'column':30s} {'reps':>4} {'classes':>7} {'balance':>9} "
+          f"{'plate->label':>12}")
+    out["categorical"] = {}
+    for h in header:
+        if str(h) in out["labels"]:
+            continue                       # already reported as numeric
+        vals, pls, seen = [], [], {}
+        for r in rows:
+            s = str(r.get(h) or "").strip()
+            if not s or s.lower() in ("na", "nan", "none", "-", "#n/a"):
+                continue
+            rk = tuple(str(r.get(g) or "NA") for g in rep_hs) if rep_hs else None
+            if rk is not None and rk in seen:
+                continue
+            if rk is not None:
+                seen[rk] = True
+            vals.append(s)
+            pls.append(str(r.get(plate_h) or "NA") if plate_h else "NA")
+        n_cls = len(set(vals))
+        if not (2 <= n_cls <= 6) or len(vals) < 6:
+            continue
+        cnt = {c: vals.count(c) for c in set(vals)}
+        bal = max(cnt.values()) / len(vals)
+        # Can plate ALONE predict the label? If it can, a model that only
+        # learns acquisition batch scores perfectly and means nothing.
+        hit = 0
+        for pl in set(pls):
+            sub = [v for v, q in zip(vals, pls) if q == pl]
+            hit += max(sub.count(c) for c in set(sub))
+        pacc = hit / len(vals)
+        flag = ""
+        if pacc > 0.95:
+            flag = "  CONFOUNDED: plate determines this label"
+        elif pacc - bal < 0.1:
+            flag = "  <-- plate adds little: testable"
+        print(f"    {str(h):30s} {len(vals):>4} {n_cls:>7} {bal:>8.2f} "
+              f"{pacc:>11.2f}{flag}")
+        out["categorical"][str(h)] = {
+            "n": len(vals), "n_classes": n_cls, "classes": sorted(set(vals)),
+            "majority_frac": bal, "plate_predicts_label": pacc}
+    print("    balance      = fraction in the largest class (chance for a")
+    print("                   majority-class guesser)")
+    print("    plate->label = accuracy of predicting the label from plate")
+    print("                   ALONE. Near 1.0 means the label IS the plate:")
+    print("                   any batch-encoding feature 'predicts' it, and")
+    print("                   --deconfound plate will remove the whole signal")
+    print("                   because there is nothing else there.")
+
     # ---- how many rows correspond to real volumes ----
     if args.data_dir:
         mod_dir = os.path.join(args.data_dir, args.modality)

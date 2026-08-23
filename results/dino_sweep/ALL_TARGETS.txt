@@ -1,0 +1,480 @@
+======================================================================
+ /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/synth2/meta2.csv
+======================================================================
+  72 non-empty rows, 6 columns
+  columns: file, plate, Tissue, peak_amplitude_week1, treated, perturbed
+
+  grouping structure
+    plate                           4 distinct   <-- plate (the batch unit)
+    Tissue                          6 distinct   <-- part of --group_cols
+    peak_amplitude_week1           24 distinct
+    treated                         2 distinct
+    perturbed                       2 distinct
+
+  plates: 4 -> p0(18 rows), p1(18 rows), p2(18 rows), p3(18 rows)
+    NOTE: 4 plates means leave-one-plate-out has only 4 folds — that is the number of genuinely independent
+          acquisition batches, and it caps what any model on this data can be shown to generalize across.
+
+  numeric label columns (candidate prediction targets)
+    column                         reps       min    median       max    eta2    null   omega2
+    peak_amplitude_week1             24      5.47     11.16     16.88   0.038   0.130    0.000  <-- no more plate structure than chance: testable
+
+  categorical label columns (candidate classification targets)
+    column                         reps classes   balance plate->label
+    plate                            24       4     0.25        1.00  CONFOUNDED: plate determines this label
+    Tissue                           24       6     0.17        0.17  <-- plate adds little: testable
+    treated                          24       2     0.58        0.67  <-- plate adds little: testable
+    perturbed                        24       2     0.50        1.00  CONFOUNDED: plate determines this label
+    balance      = fraction in the largest class (chance for a
+                   majority-class guesser)
+    plate->label = accuracy of predicting the label from plate
+                   ALONE. Near 1.0 means the label IS the plate:
+                   any batch-encoding feature 'predicts' it, and
+                   --deconfound plate will remove the whole signal
+                   because there is nothing else there.
+
+  staged 'gfp' volumes on disk: 72
+
+  how to read these
+    eta2   raw between-plate share of variance. BIASED UPWARD: with
+           k plates and n replicates its expected value under NO
+           plate effect is (k-1)/(n-1), shown as 'null'. Never
+           compare eta2 to zero.
+    omega2 eta2 corrected for that bias. ~0 means the label has no
+           more plate structure than chance -> testable. Large means
+           the label is largely a plate property, so any batch-
+           encoding feature predicts it and holding plates out
+           leaves too few independent units.
+
+  saved results/dino_sweep/metadata_inventory.json
+
+════════════════════════════════════════════════════════════════
+ TARGET: peak_amplitude_week1   (numeric)
+════════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════
+ Frozen DINOv2 -> force
+   target=peak_amplitude_week1 (numeric)   deconfound=plate   task=regression
+   results -> /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/peak_amplitude_week1_regression_b4_s42_3539602658
+   model=vit_base_patch14_reg4_dinov2.lvd142m
+   modalities=[gfp] framings=tiled
+   tokens=[patch_mean_fg patch_mean_fg,patch_std_fg]
+   aggs=[fgmean fgmean+std]  fg_min=0.75  aggregate=label
+   (fg acts at 3 levels: --fg_min selects views, --agg fgmean weights views,
+    patch_mean_fg weights tokens within a view)
+════════════════════════════════════════════════════════════════
+
+▶ A. skipped (SKIP_EXTRACT=1)
+
+▶ B. probing
+  [gfp_tiled_patch_mean_fg_fgmean_dc-none]
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.500 (chance 0.250, 12/24)  binom_p=0.0072 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  spearman(pred, true force) = 0.384   perm_p=0.0464
+  null: mean -0.084, 95% CI [-0.608, +0.431]  (150 permutations)
+  detectable only if spearman > +0.362 (alpha=0.05, this config alone)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/peak_amplitude_week1_regression_b4_s42_3539602658/gfp_tiled_patch_mean_fg_fgmean_dc-none.json
+  [gfp_tiled_patch_mean_fg_fgmean_dc-plate]
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.417 (chance 0.250, 10/24)  binom_p=0.0547 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  spearman(pred, true force) = 0.458   perm_p=0.0728
+  null: mean +0.023, 95% CI [-0.421, +0.571]  (150 permutations)
+  detectable only if spearman > +0.512 (alpha=0.05, this config alone)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/peak_amplitude_week1_regression_b4_s42_3539602658/gfp_tiled_patch_mean_fg_fgmean_dc-plate.json
+  [gfp_tiled_patch_mean_fg_fgmean-std_dc-none]
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.458 (chance 0.250, 11/24)  binom_p=0.0213 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  spearman(pred, true force) = 0.130   perm_p=0.1854
+  null: mean -0.104, 95% CI [-0.563, +0.451]  (150 permutations)
+  detectable only if spearman > +0.331 (alpha=0.05, this config alone)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/peak_amplitude_week1_regression_b4_s42_3539602658/gfp_tiled_patch_mean_fg_fgmean-std_dc-none.json
+  [gfp_tiled_patch_mean_fg_fgmean-std_dc-plate]
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.458 (chance 0.250, 11/24)  binom_p=0.0213 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  spearman(pred, true force) = 0.288   perm_p=0.1921
+  null: mean +0.015, 95% CI [-0.473, +0.499]  (150 permutations)
+  detectable only if spearman > +0.460 (alpha=0.05, this config alone)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/peak_amplitude_week1_regression_b4_s42_3539602658/gfp_tiled_patch_mean_fg_fgmean-std_dc-plate.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-none]
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.417 (chance 0.250, 10/24)  binom_p=0.0547 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  spearman(pred, true force) = 0.185   perm_p=0.1854
+  null: mean -0.100, 95% CI [-0.628, +0.466]  (150 permutations)
+  detectable only if spearman > +0.331 (alpha=0.05, this config alone)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/peak_amplitude_week1_regression_b4_s42_3539602658/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-none.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-plate]
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.167 (chance 0.250, 4/24)  binom_p=0.8850 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  spearman(pred, true force) = 0.015   perm_p=0.5099
+  null: mean +0.030, 95% CI [-0.481, +0.490]  (150 permutations)
+  detectable only if spearman > +0.441 (alpha=0.05, this config alone)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/peak_amplitude_week1_regression_b4_s42_3539602658/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-plate.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-none]
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.292 (chance 0.250, 7/24)  binom_p=0.3926 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  spearman(pred, true force) = 0.088   perm_p=0.2450
+  null: mean -0.112, 95% CI [-0.619, +0.426]  (150 permutations)
+  detectable only if spearman > +0.347 (alpha=0.05, this config alone)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/peak_amplitude_week1_regression_b4_s42_3539602658/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-none.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-plate]
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.458 (chance 0.250, 11/24)  binom_p=0.0213 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  spearman(pred, true force) = 0.358   perm_p=0.1060
+  null: mean +0.043, 95% CI [-0.458, +0.556]  (150 permutations)
+  detectable only if spearman > +0.496 (alpha=0.05, this config alone)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/peak_amplitude_week1_regression_b4_s42_3539602658/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-plate.json
+  [control: shuffled labels]
+/private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/synth2/gfp_tiled_volume_cafe/P0_T0_R000.npz: no ['patch_mean'] array(s) (has ['patch_mean_fg', 'patch_std_fg', 'view_fg_frac'])
+
+▶ C. summary
+  config                                   n    acc  spearman   perm_p  null_mean
+  gfp_tiled_patch_mean_fg_fgmean_dc-plate  24  0.417     0.458   0.0728      0.023
+  gfp_tiled_patch_mean_fg_fgmean_dc-none  24  0.500     0.384   0.0464     -0.084
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-plate  24  0.458     0.358   0.1060      0.043
+  gfp_tiled_patch_mean_fg_fgmean-std_dc-plate  24  0.458     0.288   0.1921      0.015
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-none  24  0.417     0.185   0.1854     -0.100
+  gfp_tiled_patch_mean_fg_fgmean-std_dc-none  24  0.458     0.130   0.1854     -0.104
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-none  24  0.292     0.088   0.2450     -0.112
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-plate  24  0.167     0.015   0.5099      0.030
+
+  FAMILY-WISE (max-statistic over 8 configs, 150 matched permutations)
+    best observed spearman = +0.458  (one-sided; signed)
+    null max spearman: mean +0.225, 95th pct +0.599
+    NOTE the null is centered near -0.036 — near zero, so
+    this config's null does NOT carry the usual leave-one-out
+    anti-correlation; rho may be read in the ordinary direction.
+    family-wise p = 0.1854
+    -> does NOT survive. The best row is what a sweep of this
+       size produces by chance; do not report it as a finding.
+
+    POWER: to clear alpha=0.05 after correcting for these
+    8 configs, a config needed spearman > +0.599.
+    The best here reached +0.458. So this run rules out an
+    effect large enough to survive that bar — it does NOT rule
+    out a real but weaker association. Distinguishing those
+    needs more replicates, not more configs: the threshold is
+    set by n=24, not by the model.
+════════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════════
+ TARGET: treated   (categorical)
+════════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════
+ Frozen DINOv2 -> force
+   target=treated (categorical)   deconfound=plate   task=classification
+   results -> /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/treated_classification_b4_s42_231559542
+   model=vit_base_patch14_reg4_dinov2.lvd142m
+   modalities=[gfp] framings=tiled
+   tokens=[patch_mean_fg patch_mean_fg,patch_std_fg]
+   aggs=[fgmean fgmean+std]  fg_min=0.75  aggregate=label
+   (fg acts at 3 levels: --fg_min selects views, --agg fgmean weights views,
+    patch_mean_fg weights tokens within a view)
+════════════════════════════════════════════════════════════════
+
+▶ A. skipped (SKIP_EXTRACT=1)
+
+▶ B. probing
+  [gfp_tiled_patch_mean_fg_fgmean_dc-none]
+  target_type=categorical -> n_bins=2 (classes: treated, untreated)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.292 (chance 0.500, 7/24)  binom_p=0.9887 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  accuracy perm_p=0.9801 (150 permutations)
+  null accuracy mean 0.492; detectable only if accuracy > 0.690 (alpha=0.05, this config)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/treated_classification_b4_s42_231559542/gfp_tiled_patch_mean_fg_fgmean_dc-none.json
+  [gfp_tiled_patch_mean_fg_fgmean_dc-plate]
+  target_type=categorical -> n_bins=2 (classes: treated, untreated)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.292 (chance 0.500, 7/24)  binom_p=0.9887 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  accuracy perm_p=0.9934 (150 permutations)
+  null accuracy mean 0.501; detectable only if accuracy > 0.708 (alpha=0.05, this config)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/treated_classification_b4_s42_231559542/gfp_tiled_patch_mean_fg_fgmean_dc-plate.json
+  [gfp_tiled_patch_mean_fg_fgmean-std_dc-none]
+  target_type=categorical -> n_bins=2 (classes: treated, untreated)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.333 (chance 0.500, 8/24)  binom_p=0.9680 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  accuracy perm_p=0.9139 (150 permutations)
+  null accuracy mean 0.482; detectable only if accuracy > 0.708 (alpha=0.05, this config)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/treated_classification_b4_s42_231559542/gfp_tiled_patch_mean_fg_fgmean-std_dc-none.json
+  [gfp_tiled_patch_mean_fg_fgmean-std_dc-plate]
+  target_type=categorical -> n_bins=2 (classes: treated, untreated)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.375 (chance 0.500, 9/24)  binom_p=0.9242 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  accuracy perm_p=0.8344 (150 permutations)
+  null accuracy mean 0.492; detectable only if accuracy > 0.667 (alpha=0.05, this config)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/treated_classification_b4_s42_231559542/gfp_tiled_patch_mean_fg_fgmean-std_dc-plate.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-none]
+  target_type=categorical -> n_bins=2 (classes: treated, untreated)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.583 (chance 0.500, 14/24)  binom_p=0.2706 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  accuracy perm_p=0.2848 (150 permutations)
+  null accuracy mean 0.501; detectable only if accuracy > 0.667 (alpha=0.05, this config)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/treated_classification_b4_s42_231559542/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-none.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-plate]
+  target_type=categorical -> n_bins=2 (classes: treated, untreated)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.542 (chance 0.500, 13/24)  binom_p=0.4194 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  accuracy perm_p=0.4702 (150 permutations)
+  null accuracy mean 0.501; detectable only if accuracy > 0.667 (alpha=0.05, this config)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/treated_classification_b4_s42_231559542/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-plate.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-none]
+  target_type=categorical -> n_bins=2 (classes: treated, untreated)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.458 (chance 0.500, 11/24)  binom_p=0.7294 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  accuracy perm_p=0.7417 (150 permutations)
+  null accuracy mean 0.503; detectable only if accuracy > 0.690 (alpha=0.05, this config)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/treated_classification_b4_s42_231559542/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-none.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-plate]
+  target_type=categorical -> n_bins=2 (classes: treated, untreated)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  LOO n=24  acc=0.500 (chance 0.500, 12/24)  binom_p=0.5806 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  accuracy perm_p=0.4768 (150 permutations)
+  null accuracy mean 0.480; detectable only if accuracy > 0.667 (alpha=0.05, this config)
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/treated_classification_b4_s42_231559542/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-plate.json
+  [control: shuffled labels]
+  target_type=categorical -> n_bins=2 (classes: treated, untreated)
+/private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/synth2/gfp_tiled_volume_cafe/P0_T0_R000.npz: no ['patch_mean'] array(s) (has ['patch_mean_fg', 'patch_std_fg', 'view_fg_frac'])
+
+▶ C. summary
+  config                                   n    acc  accuracy   perm_p  null_mean
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-none  24  0.583     0.583   0.2848      0.501
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-plate  24  0.542     0.542   0.4702      0.501
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-plate  24  0.500     0.500   0.4768      0.480
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-none  24  0.458     0.458   0.7417      0.503
+  gfp_tiled_patch_mean_fg_fgmean-std_dc-plate  24  0.375     0.375   0.8344      0.492
+  gfp_tiled_patch_mean_fg_fgmean-std_dc-none  24  0.333     0.333   0.9139      0.482
+  gfp_tiled_patch_mean_fg_fgmean_dc-none  24  0.292     0.292   0.9801      0.492
+  gfp_tiled_patch_mean_fg_fgmean_dc-plate  24  0.292     0.292   0.9934      0.501
+
+  FAMILY-WISE (max-statistic over 8 configs, 150 matched permutations)
+    best observed accuracy = +0.583  (one-sided; signed)
+    null max accuracy: mean +0.619, 95th pct +0.792
+    null accuracy centres at 0.494 (majority-class rate);
+    only accuracy above the bar above means anything.
+    family-wise p = 0.7152
+    -> does NOT survive. The best row is what a sweep of this
+       size produces by chance; do not report it as a finding.
+
+    POWER: to clear alpha=0.05 after correcting for these
+    8 configs, a config needed accuracy > +0.792.
+    The best here reached +0.583. So this run rules out an
+    effect large enough to survive that bar — it does NOT rule
+    out a real but weaker association. Distinguishing those
+    needs more replicates, not more configs: the threshold is
+    set by n=24, not by the model.
+════════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════════
+ TARGET: perturbed   (categorical)
+════════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════
+ Frozen DINOv2 -> force
+   target=perturbed (categorical)   deconfound=plate   task=classification
+   results -> /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/perturbed_classification_b4_s42_1697911049
+   model=vit_base_patch14_reg4_dinov2.lvd142m
+   modalities=[gfp] framings=tiled
+   tokens=[patch_mean_fg patch_mean_fg,patch_std_fg]
+   aggs=[fgmean fgmean+std]  fg_min=0.75  aggregate=label
+   (fg acts at 3 levels: --fg_min selects views, --agg fgmean weights views,
+    patch_mean_fg weights tokens within a view)
+════════════════════════════════════════════════════════════════
+
+▶ A. skipped (SKIP_EXTRACT=1)
+
+▶ B. probing
+  [gfp_tiled_patch_mean_fg_fgmean_dc-none]
+  target_type=categorical -> n_bins=2 (classes: control, perturbed)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  *** 'perturbed' is CONSTANT within every plate.
+      Within-stratum permutation cannot move it, so the null is identical to
+      the observed value and any p it reports is an artifact. This label is
+      fully confounded with the stratum: nothing in the images can be shown
+      to predict it BEYOND the batch. Use --perm_scope free to ask the
+      weaker question (does anything predict it at all), knowing that plate
+      alone would answer yes.
+
+  LOO n=24  acc=0.958 (chance 0.500, 23/24)  binom_p=0.0000 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/perturbed_classification_b4_s42_1697911049/gfp_tiled_patch_mean_fg_fgmean_dc-none.json
+  [gfp_tiled_patch_mean_fg_fgmean_dc-plate]
+  target_type=categorical -> n_bins=2 (classes: control, perturbed)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  *** 'perturbed' is CONSTANT within every plate.
+      Within-stratum permutation cannot move it, so the null is identical to
+      the observed value and any p it reports is an artifact. This label is
+      fully confounded with the stratum: nothing in the images can be shown
+      to predict it BEYOND the batch. Use --perm_scope free to ask the
+      weaker question (does anything predict it at all), knowing that plate
+      alone would answer yes.
+
+  LOO n=24  acc=0.500 (chance 0.500, 12/24)  binom_p=0.5806 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/perturbed_classification_b4_s42_1697911049/gfp_tiled_patch_mean_fg_fgmean_dc-plate.json
+  [gfp_tiled_patch_mean_fg_fgmean-std_dc-none]
+  target_type=categorical -> n_bins=2 (classes: control, perturbed)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  *** 'perturbed' is CONSTANT within every plate.
+      Within-stratum permutation cannot move it, so the null is identical to
+      the observed value and any p it reports is an artifact. This label is
+      fully confounded with the stratum: nothing in the images can be shown
+      to predict it BEYOND the batch. Use --perm_scope free to ask the
+      weaker question (does anything predict it at all), knowing that plate
+      alone would answer yes.
+
+  LOO n=24  acc=0.875 (chance 0.500, 21/24)  binom_p=0.0001 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/perturbed_classification_b4_s42_1697911049/gfp_tiled_patch_mean_fg_fgmean-std_dc-none.json
+  [gfp_tiled_patch_mean_fg_fgmean-std_dc-plate]
+  target_type=categorical -> n_bins=2 (classes: control, perturbed)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  *** 'perturbed' is CONSTANT within every plate.
+      Within-stratum permutation cannot move it, so the null is identical to
+      the observed value and any p it reports is an artifact. This label is
+      fully confounded with the stratum: nothing in the images can be shown
+      to predict it BEYOND the batch. Use --perm_scope free to ask the
+      weaker question (does anything predict it at all), knowing that plate
+      alone would answer yes.
+
+  LOO n=24  acc=0.500 (chance 0.500, 12/24)  binom_p=0.5806 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/perturbed_classification_b4_s42_1697911049/gfp_tiled_patch_mean_fg_fgmean-std_dc-plate.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-none]
+  target_type=categorical -> n_bins=2 (classes: control, perturbed)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  *** 'perturbed' is CONSTANT within every plate.
+      Within-stratum permutation cannot move it, so the null is identical to
+      the observed value and any p it reports is an artifact. This label is
+      fully confounded with the stratum: nothing in the images can be shown
+      to predict it BEYOND the batch. Use --perm_scope free to ask the
+      weaker question (does anything predict it at all), knowing that plate
+      alone would answer yes.
+
+  LOO n=24  acc=0.708 (chance 0.500, 17/24)  binom_p=0.0320 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/perturbed_classification_b4_s42_1697911049/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-none.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-plate]
+  target_type=categorical -> n_bins=2 (classes: control, perturbed)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  *** 'perturbed' is CONSTANT within every plate.
+      Within-stratum permutation cannot move it, so the null is identical to
+      the observed value and any p it reports is an artifact. This label is
+      fully confounded with the stratum: nothing in the images can be shown
+      to predict it BEYOND the batch. Use --perm_scope free to ask the
+      weaker question (does anything predict it at all), knowing that plate
+      alone would answer yes.
+
+  LOO n=24  acc=0.500 (chance 0.500, 12/24)  binom_p=0.5806 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/perturbed_classification_b4_s42_1697911049/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-plate.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-none]
+  target_type=categorical -> n_bins=2 (classes: control, perturbed)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  *** 'perturbed' is CONSTANT within every plate.
+      Within-stratum permutation cannot move it, so the null is identical to
+      the observed value and any p it reports is an artifact. This label is
+      fully confounded with the stratum: nothing in the images can be shown
+      to predict it BEYOND the batch. Use --perm_scope free to ask the
+      weaker question (does anything predict it at all), knowing that plate
+      alone would answer yes.
+
+  LOO n=24  acc=0.792 (chance 0.500, 19/24)  binom_p=0.0033 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/perturbed_classification_b4_s42_1697911049/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-none.json
+  [gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-plate]
+  target_type=categorical -> n_bins=2 (classes: control, perturbed)
+  views: foreground fraction median 0.402, p75 0.588, p90 0.738, p95 0.817, max 0.985
+  fg_min=0.75: kept 958/10368 views (9.2%), 72 volume(s) usable
+  aggregate=label: 72 volumes -> 24 rows, one per force value (3-3 FOVs each)
+
+  *** 'perturbed' is CONSTANT within every plate.
+      Within-stratum permutation cannot move it, so the null is identical to
+      the observed value and any p it reports is an artifact. This label is
+      fully confounded with the stratum: nothing in the images can be shown
+      to predict it BEYOND the batch. Use --perm_scope free to ask the
+      weaker question (does anything predict it at all), knowing that plate
+      alone would answer yes.
+
+  LOO n=24  acc=0.500 (chance 0.500, 12/24)  binom_p=0.5806 [anti-conservative: assumes 20 independent trials; trust perm_p]
+  saved /private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/out_all/perturbed_classification_b4_s42_1697911049/gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-plate.json
+  [control: shuffled labels]
+  target_type=categorical -> n_bins=2 (classes: control, perturbed)
+/private/tmp/claude-501/-Users-drewlinsley-Documents-myo/de368501-f06f-42d5-a90e-34def9a653b3/scratchpad/synth2/gfp_tiled_volume_cafe/P0_T0_R000.npz: no ['patch_mean'] array(s) (has ['patch_mean_fg', 'patch_std_fg', 'view_fg_frac'])
+
+▶ C. summary
+  config                                   n    acc  accuracy   perm_p  null_mean
+  gfp_tiled_patch_mean_fg_fgmean_dc-none  24  0.958     0.958      n/a        n/a
+  gfp_tiled_patch_mean_fg_fgmean-std_dc-none  24  0.875     0.875      n/a        n/a
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-none  24  0.792     0.792      n/a        n/a
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-none  24  0.708     0.708      n/a        n/a
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean-std_dc-plate  24  0.500     0.500      n/a        n/a
+  gfp_tiled_patch_mean_fg+patch_std_fg_fgmean_dc-plate  24  0.500     0.500      n/a        n/a
+  gfp_tiled_patch_mean_fg_fgmean-std_dc-plate  24  0.500     0.500      n/a        n/a
+  gfp_tiled_patch_mean_fg_fgmean_dc-plate  24  0.500     0.500      n/a        n/a
+
+  NO FAMILY-WISE p — AND NONE IS POSSIBLE.
+  'perturbed' is constant within every plate, so the restricted
+  permutation cannot move it. This target is fully confounded
+  with acquisition batch: no image feature can be shown to
+  predict it BEYOND plate, because plate already determines it.
+  This is a property of the experimental design, NOT a result.
+════════════════════════════════════════════════════════════════

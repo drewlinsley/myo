@@ -261,7 +261,7 @@ def load_dino_features(feature_dir, stems, token, agg, fg_min):
 # the LOO probe
 # --------------------------------------------------------------------------
 def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
-            seed=0, fixed_alpha=None, deconfound=None):
+            seed=0, fixed_alpha=None, deconfound=None, categorical=False):
     """Leave-one-group-out; returns per-replicate predictions.
 
     X            (n_vol, D)   volume-level features
@@ -307,7 +307,12 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
                 mu_y = float(yf[m_tr].mean()) if m_tr.any() else gmu_y
                 m_all = dc == lvl
                 Xf[m_all] -= mu_X
-                yf[m_all] -= mu_y
+                if not categorical:
+                    # Centring a 0/1 class code turns it into a continuous
+                    # residual and the classes stop existing. For a categorical
+                    # target the confound control belongs on the FEATURES only:
+                    # remove each plate's feature offset, keep the labels.
+                    yf[m_all] -= mu_y
 
         # Sample weights: a 4-FOV tissue must not outvote a 1-FOV one. These
         # have to apply to the STANDARDIZATION and the PCA too, not just the
@@ -341,9 +346,18 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
             fold_rep_force.setdefault(g, float(v))
         for g, v in zip(np.asarray(vol_group)[te], yf[te]):
             fold_rep_force.setdefault(g, float(v))
-        edges = compute_bin_edges(
-            [fold_rep_force[g] for g in sorted(set(tr_groups))], n_bins)
-        ytr_bin = np.array([assign_bin(v, edges) for v in ytr_force])
+        if categorical:
+            # The class code IS the bin. Quantile edges on a 0/1 column are
+            # degenerate: percentile([0,1], 50) lands ON a class, and
+            # searchsorted(..., side="right") then puts BOTH classes in bin 1,
+            # so every fold would train on a single-class target.
+            edges = None
+            _bin = lambda v: int(round(float(v)))
+        else:
+            edges = compute_bin_edges(
+                [fold_rep_force[g] for g in sorted(set(tr_groups))], n_bins)
+            _bin = lambda v: assign_bin(v, edges)
+        ytr_bin = np.array([_bin(v) for v in ytr_force])
 
         if task == "regression":
             # centered force is signed, so log10 only applies to the raw target
@@ -392,17 +406,28 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
         for g in sorted(set(te_groups)):
             sel = te_groups == g
             y_true_g = fold_rep_force[g]
-            tb = assign_bin(y_true_g, edges)
+            tb = _bin(y_true_g)
             if task == "regression":
                 mp = float(np.mean(p[sel]))
                 pred_force.append(mp)
-                pb = assign_bin(mp if deconfound is not None else 10 ** mp, edges)
+                pb = _bin(mp if deconfound is not None else 10 ** mp)
             else:
                 pr = p[sel].mean(axis=0)
-                pb = int(np.argmax(pr))
-                pred_force.append(float(np.dot(pr, _bin_reps(
-                    edges, n_bins,
-                    [fold_rep_force[q] for q in sorted(set(tr_groups))]))))
+                pb = int(m.classes_[int(np.argmax(pr))])
+                if categorical:
+                    # No numeric "bin representative" exists for a nominal
+                    # class -- averaging class codes would invent an ordering.
+                    # Use P(positive class) for binary (a usable continuous
+                    # score), else the predicted code. Either way `categorical`
+                    # runs are scored by ACCURACY, not by rank correlation.
+                    cls = list(m.classes_)
+                    pred_force.append(float(pr[cls.index(1)])
+                                      if len(cls) == 2 and 1 in cls
+                                      else float(pb))
+                else:
+                    pred_force.append(float(np.dot(pr, _bin_reps(
+                        edges, n_bins,
+                        [fold_rep_force[q] for q in sorted(set(tr_groups))]))))
             held_reps.append(g)
             true_force.append(y_true_g)
             pred_bin.append(pb)
@@ -532,6 +557,13 @@ def main():
                         "below this (removes pure-background tiles).")
     p.add_argument("--metadata", required=True)
     p.add_argument("--target_col", default="peak_amplitude_week3")
+    p.add_argument("--target_type", choices=["numeric", "categorical"],
+                   default="numeric",
+                   help="'categorical' for a string label column such as "
+                        "treated/untreated or perturbed/unperturbed. Forces "
+                        "--task classification, sets n_bins to the number of "
+                        "classes, and scores by accuracy rather than by rank "
+                        "correlation (a nominal label has no ordering).")
     p.add_argument("--file_col", default="file")
     p.add_argument("--group_cols", default="plate,Tissue")
     p.add_argument("--modality", choices=["bf", "gfp"], default="gfp")
@@ -604,7 +636,23 @@ def main():
 
     data = build_force_groups(args.metadata, args.data_dir, args.target_col,
                               file_col=args.file_col, group_cols=group_cols,
-                              modality=args.modality, staged_stems=avail)
+                              modality=args.modality, staged_stems=avail,
+                              target_type=args.target_type)
+    _cat = args.target_type == "categorical"
+    if _cat:
+        # A nominal target has no ordering, so a rank correlation between
+        # predicted and "true" class codes is meaningless -- 0 vs 1 vs 2 is not
+        # a scale. Score it as classification and let the permutation test run
+        # on ACCURACY.
+        if args.task != "classification":
+            print(f"  target_type=categorical -> forcing --task classification "
+                  f"(was {args.task})")
+            args.task = "classification"
+        n_cls = len(data["classes"])
+        if args.n_bins != n_cls:
+            print(f"  target_type=categorical -> n_bins={n_cls} "
+                  f"(classes: {', '.join(data['classes'])})")
+            args.n_bins = n_cls
     if not args.quiet:
         print("\n".join(data["report"]))
     if data["n_matched"] == 0:
@@ -749,6 +797,7 @@ def main():
     # would compare a tuned model against untuned nulls.
     res = run_loo(X, vol_group, vol_force, cv_groups, args.task,
                   args.n_bins, args.pca_dim, args.seed, deconfound=deconf,
+                  categorical=_cat,
                   fixed_alpha=(None if args.tune_alpha else args.alpha))
     out = score(res, args.n_bins, args.task)
 
@@ -766,13 +815,41 @@ def main():
     # The hyperparameter is FIXED across observed and permuted runs — selecting
     # it on real data but not under permutation would bias the null the other
     # way.
+    # Restricted permutation for the nested design unless explicitly freed.
+    perm_strata = (None if args.perm_scope == "free"
+                   else [plate_of(g) for g in vol_group])
+    if args.n_perm > 0 and perm_strata is not None:
+        # A restricted permutation can only shuffle labels that VARY inside a
+        # stratum. If every plate carries one label value (a treatment applied
+        # plate-wise, say), within-plate permutation is the identity: the null
+        # equals the observed exactly and p is 1.0 by construction. That is not
+        # a negative result, it is an untestable design, and it must not be
+        # reported as "does not survive correction".
+        _by = {}
+        for _g, _f, _s in zip(vol_group, vol_force, perm_strata):
+            _by.setdefault(_s, set()).add(round(float(_f), 9))
+        _varies = [s for s, v in _by.items() if len(v) > 1]
+        if not _varies:
+            out["degenerate_permutation"] = True
+            print(f"\n  *** '{args.target_col}' is CONSTANT within every "
+                  f"{args.perm_scope.replace('within_', '')}.")
+            print(f"      Within-stratum permutation cannot move it, so the "
+                  f"null is identical to")
+            print(f"      the observed value and any p it reports is an "
+                  f"artifact. This label is")
+            print(f"      fully confounded with the stratum: nothing in the "
+                  f"images can be shown")
+            print(f"      to predict it BEYOND the batch. Use "
+                  f"--perm_scope free to ask the")
+            print(f"      weaker question (does anything predict it at all), "
+                  f"knowing that plate")
+            print(f"      alone would answer yes.")
+            args.n_perm = 0
+
     if args.n_perm > 0 and out["n_replicates"] >= 3:
         rng = np.random.default_rng(args.seed)
         obs_rho, obs_acc = out["spearman_pred_vs_force"], out["replicate_accuracy"]
         fixed = args.alpha          # same value for observed AND permuted
-        # Restricted permutation for the nested design unless explicitly freed.
-        perm_strata = (None if args.perm_scope == "free"
-                       else [plate_of(g) for g in vol_group])
         if perm_strata is not None and not args.quiet:
             n_lv = len(set(perm_strata))
             print(f"  permutation null: RESTRICTED within {n_lv} plate(s) — "
@@ -783,7 +860,7 @@ def main():
                                           strata=perm_strata)
             r = run_loo(X, vol_group, vf, cv_groups, args.task, args.n_bins,
                         args.pca_dim, args.seed, fixed_alpha=fixed,
-                        deconfound=deconf)
+                        deconfound=deconf, categorical=_cat)
             if not len(r["true_bin"]):
                 continue
             null_rho.append(spearman(r["true_force"], r["pred_score"]))
@@ -849,6 +926,8 @@ def main():
     out.update({"deconfound": args.deconfound,
                 "features": args.features, "modality": args.modality,
                 "target_col": args.target_col, "cv_group": args.cv_group,
+                "target_type": args.target_type,
+                "aggregate": args.aggregate, "fg_min": args.fg_min,
                 "canary": args.canary, "shuffled": bool(args.shuffle),
                 "n_volumes": len(stems), "feature_dim": int(X.shape[1]),
                 "feature_names": names[:32],
@@ -864,6 +943,26 @@ def main():
           f"{out['n_correct']}/{out['n_replicates']})  "
           f"binom_p={out['binomial_p']:.4f} [anti-conservative: assumes 20 "
           f"independent trials; trust perm_p]")
+    if args.target_type == "categorical":
+        # Rank correlation on a nominal label is not a result. Lead with
+        # accuracy and put the permutation test on accuracy too.
+        if "permutation_p_accuracy" in out:
+            print(f"  accuracy perm_p={out['permutation_p_accuracy']:.4f} "
+                  f"({out.get('n_permutations', 0)} permutations)")
+        if "mde_accuracy_95" in out:
+            print(f"  null accuracy mean {out['null_accuracy_mean']:.3f}; "
+                  f"detectable only if accuracy > "
+                  f"{out['mde_accuracy_95']:.3f} (alpha=0.05, this config)")
+        if args.shuffle:
+            print("  ^ labels were SHUFFLED: this must be at chance. If it is "
+                  "not,\n    the fold logic leaks and every other number is "
+                  "void.")
+        if args.output:
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            with open(args.output, "w") as f:
+                json.dump(out, f, indent=2)
+            print(f"  saved {args.output}")
+        return
     print(f"  spearman(pred, true force) = {out['spearman_pred_vs_force']:.3f}"
           + (f"   perm_p={out['permutation_p_spearman']:.4f}"
              if "permutation_p_spearman" in out else ""))

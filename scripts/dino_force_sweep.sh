@@ -34,6 +34,11 @@ cd "$ROOT"
 DATA_DIR="${DATA_DIR:-data_phalloidin_mhc_051826_staged}"
 METADATA="${METADATA:-phalloidin_mhc_mapping_051426_SS edit.xlsx}"
 TARGET_COL="${TARGET_COL:-peak_amplitude_week1}"
+# 'categorical' for a string label (treated/untreated, perturbed/control).
+# Run inventory_metadata.py first: it lists the categorical columns and, for
+# each, how well PLATE ALONE predicts it. A column plate determines is not a
+# usable target -- any batch-encoding feature scores on it.
+TARGET_TYPE="${TARGET_TYPE:-numeric}"
 GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
 FEAT_DIR="${FEAT_DIR:-results/dino_features}"
 OUT_DIR="${OUT_DIR:-results/dino_sweep}"   # per-target subdir added below
@@ -93,7 +98,7 @@ OUT_DIR="$OUT_DIR/${TARGET_COL}_${TASK}_b${N_BINS}_s${SEED}_${RUN_KEY}"
 mkdir -p "$OUT_DIR"
 echo "════════════════════════════════════════════════════════════════"
 echo " Frozen DINOv2 -> force"
-echo "   target=$TARGET_COL   deconfound=$DECONFOUND   task=$TASK"
+echo "   target=$TARGET_COL ($TARGET_TYPE)   deconfound=$DECONFOUND   task=$TASK"
 echo "   results -> $OUT_DIR"
 echo "   model=$MODEL"
 echo "   modalities=[$MODALITIES] framings=$FRAMINGS"
@@ -166,6 +171,7 @@ print(' '.join(np.load(f[0]).files) if f else '')
           --target_col "$TARGET_COL" --group_cols "$GROUP_COLS" \
           --modality "$mod" --task "$TASK" --n_bins "$N_BINS" \
           --agg "$agg" --fg_min "$FG_MIN" --aggregate "$AGGREGATE" \
+          --target_type "$TARGET_TYPE" \
           --deconfound "$dc" --n_perm "$N_PERM" --seed "$SEED" --quiet \
           --output "$out" || echo "    (failed — continuing)"
         n_cfg=$((n_cfg+1))
@@ -185,7 +191,7 @@ if [ -n "$ctrl_dir" ] && [ -d "$ctrl_dir" ]; then
     --modality "$(echo $MODALITIES | cut -d' ' -f1)" \
     --task "$TASK" --n_bins "$N_BINS" --deconfound "$DECONFOUND" \
     --agg "$(echo $AGGS | cut -d' ' -f1)" --fg_min "$FG_MIN" \
-    --aggregate "$AGGREGATE" \
+    --aggregate "$AGGREGATE" --target_type "$TARGET_TYPE" \
     --shuffle --n_perm "$N_PERM" --seed "$SEED" --quiet \
     --output "$OUT_DIR/_control_shuffled.json" || true
 fi
@@ -201,13 +207,24 @@ files = sorted(f for f in glob.glob(os.path.join(d, "*.json"))
 if not files:
     print("  (no results)"); raise SystemExit
 rows, nulls = [], []
+# A nominal label has no ordering, so rank correlation is not a result for it.
+# Rank and family-wise-correct on ACCURACY instead, against the accuracy null.
+CAT = False
+for f in files:
+    if json.load(open(f)).get("target_type") == "categorical":
+        CAT = True
+        break
+STAT = "replicate_accuracy" if CAT else "spearman_pred_vs_force"
+NULLK = "null_accuracy" if CAT else "null_spearman"
+PK = "permutation_p_accuracy" if CAT else "permutation_p_spearman"
+MK = "null_accuracy_mean" if CAT else "null_spearman_mean"
 for f in files:
     r = json.load(open(f))
-    rho = r.get("spearman_pred_vs_force")
+    rho = r.get(STAT)
     if rho is None:
         continue
     rows.append((os.path.basename(f)[:-5], r))
-    ns = r.get("null_spearman")
+    ns = r.get(NULLK)
     if ns:
         # SIGNED, not |.|: the leave-one-out null sits well below zero, so an
         # anti-correlated model would otherwise be selected as the family best.
@@ -235,33 +252,33 @@ if len(keys) > 1:
 # non-finite rho cannot be ranked; drop with a notice rather than letting
 # max() return NaN depending on list order
 bad = [n for n, r in rows
-       if not isinstance(r.get("spearman_pred_vs_force"), (int, float))
-       or r.get("spearman_pred_vs_force") != r.get("spearman_pred_vs_force")]
+       if not isinstance(r.get(STAT), (int, float))
+       or r.get(STAT) != r.get(STAT)]
 if bad:
     print(f"  NOTE: {len(bad)} config(s) produced a non-finite spearman "
           f"(degenerate features?) and are excluded: {bad[:3]}")
     rows = [(n, r) for n, r in rows if n not in bad]
     nulls = nulls[:len(rows)]
 
-rows.sort(key=lambda t: -(t[1].get("spearman_pred_vs_force") or -9))
-print(f"  {'config':38s} {'n':>3} {'acc':>6} {'spearman':>9} {'perm_p':>8} "
+rows.sort(key=lambda t: -(t[1].get(STAT) if t[1].get(STAT) is not None else -9))
+print(f"  {'config':38s} {'n':>3} {'acc':>6} {('accuracy' if CAT else 'spearman'):>9} {'perm_p':>8} "
       f"{'null_mean':>10}")
 for name, r in rows:
     f = lambda x, k=3: "     n/a" if x is None else f"{x:.{k}f}"
     print(f"  {name:38s} {r.get('n_replicates',0):>3} "
           f"{f(r.get('replicate_accuracy')):>6} "
-          f"{f(r.get('spearman_pred_vs_force')):>9} "
-          f"{f(r.get('permutation_p_spearman'),4):>8} "
-          f"{f(r.get('null_spearman_mean')):>10}")
+          f"{f(r.get(STAT)):>9} "
+          f"{f(r.get(PK),4):>8} "
+          f"{f(r.get(MK)):>10}")
 
 ctrl = os.path.join(d, "_control_shuffled.json")
 if os.path.exists(ctrl):
     c = json.load(open(ctrl))
-    cs = c.get("spearman_pred_vs_force")
+    cs = c.get(STAT)
     print("\n  control (shuffled labels): spearman="
           + ("n/a" if cs is None else f"{cs:.3f}")
-          + f" perm_p={c.get('permutation_p_spearman')}")
-    if (c.get("permutation_p_spearman") or 1) < 0.05:
+          + f" perm_p={c.get(PK)}")
+    if (c.get(PK) or 1) < 0.05:
         print("  *** the shuffled control is SIGNIFICANT — the folds leak.")
         print("      Every number above is void until that is fixed.")
 
@@ -269,12 +286,15 @@ if nulls and len(nulls) == len(rows):
     m = min(len(n) for n in nulls)
     stack = np.stack([n[:m] for n in nulls])       # (n_cfg, n_perm)
     maxnull = stack.max(axis=0)                    # best config per permutation
-    obs = max((r.get("spearman_pred_vs_force") or -9) for _, r in rows)
+    obs = max((r.get(STAT) if r.get(STAT) is not None else -9)
+              for _, r in rows)
     fw = float((np.sum(maxnull >= obs) + 1) / (len(maxnull) + 1))
     print(f"\n  FAMILY-WISE (max-statistic over {len(rows)} configs, "
           f"{m} matched permutations)")
-    print(f"    best observed spearman = {obs:+.3f}  (one-sided; signed)")
-    print(f"    null max spearman: mean {maxnull.mean():+.3f}, "
+    print(f"    best observed {'accuracy' if CAT else 'spearman'} = "
+          f"{obs:+.3f}  (one-sided; signed)")
+    print(f"    null max {'accuracy' if CAT else 'spearman'}: "
+          f"mean {maxnull.mean():+.3f}, "
           f"95th pct {np.percentile(maxnull,95):+.3f}")
     # Do NOT hardcode the direction of this claim. Plain leave-one-out IS
     # structurally anti-correlated (holding a point out pulls the training
@@ -282,15 +302,21 @@ if nulls and len(nulls) == len(rows):
     # the null back to ~0. Read it off the permutations instead of asserting
     # it, or the caveat contradicts the numbers printed beside it.
     _nm = float(np.mean(np.concatenate(list(stack))))
-    print(f"    NOTE the null is centered near {_nm:+.3f}", end="")
-    if _nm < -0.1:
-        print(" — leave-one-out is structurally")
-        print("    anti-correlated here, so a NEGATIVE observed value is the")
-        print("    null, never a finding.")
+    if CAT:
+        # The anti-correlation caveat is about a RANK statistic. Accuracy's
+        # null centres on the majority-class rate, and calling that "near
+        # zero" is nonsense.
+        print(f"    null accuracy centres at {_nm:.3f} (majority-class rate);")
+        print(f"    only accuracy above the bar above means anything.")
+    elif _nm < -0.1:
+        print(f"    NOTE the null is centered near {_nm:+.3f} — "
+              f"leave-one-out is")
+        print("    structurally anti-correlated here, so a NEGATIVE observed")
+        print("    value is the null, never a finding.")
     else:
-        print(" — near zero, so this config's")
-        print("    null does NOT carry the usual leave-one-out anti-correlation")
-        print("    and rho may be read in the ordinary direction.")
+        print(f"    NOTE the null is centered near {_nm:+.3f} — near zero, so")
+        print("    this config's null does NOT carry the usual leave-one-out")
+        print("    anti-correlation; rho may be read in the ordinary direction.")
     print(f"    family-wise p = {fw:.4f}")
     if fw < 0.05:
         print("    -> survives correction for the whole sweep. Validate next by:")
@@ -304,18 +330,32 @@ if nulls and len(nulls) == len(rows):
         # same, and at n=22 replicates they are very different conclusions.
         thr = float(np.percentile(maxnull, 95))
         print(f"\n    POWER: to clear alpha=0.05 after correcting for these")
-        print(f"    {len(rows)} configs, a config needed spearman > {thr:+.3f}.")
+        print(f"    {len(rows)} configs, a config needed "
+              f"{'accuracy' if CAT else 'spearman'} > {thr:+.3f}.")
         print(f"    The best here reached {obs:+.3f}. So this run rules out an")
         print(f"    effect large enough to survive that bar — it does NOT rule")
         print(f"    out a real but weaker association. Distinguishing those")
         print(f"    needs more replicates, not more configs: the threshold is")
         print(f"    set by n={rows[0][1].get('n_replicates')}, not by the model.")
 else:
-    print(f"\n  FAMILY-WISE p UNAVAILABLE: {len(nulls)} of {len(rows)} configs "
-          f"carry a null distribution.")
-    print("  Without it the best row is uncorrected and must NOT be reported as")
-    print("  a finding. Rerun the missing configs with --n_perm > 0.")
-    if nulls == [] and any(r.get("permutation_p_spearman") is not None
+    if any(r.get("degenerate_permutation") for _, r in rows):
+        # Distinguish "you forgot to permute" from "permutation is impossible
+        # here". Telling someone to rerun with --n_perm > 0 when the label is
+        # constant within every stratum sends them in a circle.
+        print(f"\n  NO FAMILY-WISE p — AND NONE IS POSSIBLE.")
+        print(f"  '{rows[0][1].get('target_col')}' is constant within every "
+              f"plate, so the restricted")
+        print("  permutation cannot move it. This target is fully confounded")
+        print("  with acquisition batch: no image feature can be shown to")
+        print("  predict it BEYOND plate, because plate already determines it.")
+        print("  This is a property of the experimental design, NOT a result.")
+    else:
+        print(f"\n  FAMILY-WISE p UNAVAILABLE: {len(nulls)} of {len(rows)} "
+              f"configs carry a null distribution.")
+        print("  Without it the best row is uncorrected and must NOT be "
+              "reported as")
+        print("  a finding. Rerun the missing configs with --n_perm > 0.")
+    if nulls == [] and any(r.get(PK) is not None
                            for _, r in rows):
         print("  (Configs DO report perm_p but carry no 'null_spearman' array.")
         print("   That combination means stale JSONs written before the")

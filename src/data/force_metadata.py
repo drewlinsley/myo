@@ -113,7 +113,8 @@ def list_staged_stems(staged_dir, modality="gfp"):
 
 def build_force_groups(metadata_path, staged_dir, force_col,
                        file_col="file", group_cols=("plate", "Tissue"),
-                       modality="gfp", staged_stems=None):
+                       modality="gfp", staged_stems=None,
+                       target_type="numeric"):
     """Match spreadsheet force labels to staged volumes and group by replicate.
 
     Returns a dict with:
@@ -133,6 +134,10 @@ def build_force_groups(metadata_path, staged_dir, force_col,
     header, rows = _read_rows(metadata_path)
     if not header:
         raise ValueError(f"{metadata_path}: no header row found")
+
+    if target_type not in ("numeric", "categorical"):
+        raise ValueError(f"target_type must be numeric|categorical, "
+                         f"got {target_type!r}")
 
     file_h = _ci_resolve(header, file_col)
     if file_h is None:
@@ -180,11 +185,40 @@ def build_force_groups(metadata_path, staged_dir, force_col,
     fallback_examples = []
     dup_stem_conflicts = []
 
+    classes = None
+    if target_type == "categorical":
+        # A treated/untreated or perturbed/unperturbed column is a STRING.
+        # _to_float returns None on it, and the loop below skips None -- so
+        # without this the whole run matches zero volumes and reports it as a
+        # metadata problem. Map the distinct values to codes instead, sorted so
+        # the coding is stable across runs (a code flip would silently invert
+        # every per-class number).
+        seen = []
+        for row in rows:
+            s = _cell_str(row.get(force_h))
+            if s != "" and s.upper() != "NA" and s.lower() != "nan":
+                if s not in seen:
+                    seen.append(s)
+        classes = sorted(seen)
+        if len(classes) < 2:
+            raise ValueError(
+                f"{metadata_path}: target column '{force_col}' has "
+                f"{len(classes)} distinct value(s) {classes} — nothing to "
+                f"classify.")
+
+    def _target(row):
+        if target_type == "numeric":
+            return _to_float(row.get(force_h))
+        s = _cell_str(row.get(force_h))
+        if s == "" or s.upper() == "NA" or s.lower() == "nan":
+            return None
+        return float(classes.index(s))
+
     for row in rows:
         fval = _cell_str(row.get(file_h))
         if fval == "":
             continue
-        force = _to_float(row.get(force_h))
+        force = _target(row)
         if force is None:
             continue                       # "some files are empty -- exclude those"
         n_rows_force += 1
@@ -288,4 +322,6 @@ def build_force_groups(metadata_path, staged_dir, force_col,
         "dup_stem_conflicts": dup_stem_conflicts,
         "columns": {"file": file_h, "force": force_h,
                     "groups": [h for _, h in group_hs]},
+        "target_type": target_type,
+        "classes": classes,          # None for numeric; code i == classes[i]
     }
