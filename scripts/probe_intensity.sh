@@ -160,10 +160,24 @@ if wip:
     if wp is not None and wp < 0.05:
         print("  -> Inside a single batch, this feature ranks which tissues pull")
         print("     harder. That is a real result and cannot be a plate effect.")
+    elif e2 is not None and e2 > 0.5:
+        # confounded target: no within-plate signal is uninterpretable, because
+        # there is barely any within-plate variation to predict in the first place
+        print("  -> No within-plate signal, AND this target is mostly a plate")
+        print("     property (eta^2 = %.3f). There is little within-plate" % e2)
+        print("     variation to predict, so this tells you nothing about the")
+        print("     images. Switch to a lower-eta^2 target column before")
+        print("     concluding anything; more plates is the structural fix.")
     else:
-        print("  -> No within-plate signal. Combined with the arms above, force")
-        print("     is a plate-level property in this drop, so a model trained")
-        print("     here would be learning batch, not biology. More plates is")
-        print("     the fix, not a bigger encoder.")
+        # well-posed target, uninformative features: this IS interpretable
+        print("  -> No within-plate signal from THESE features. Note the target")
+        print("     itself is well posed (eta^2 = %.3f), and the plate canary is"
+              % (e2 if e2 is not None else float("nan")))
+        print("     at chance, so this is not a confound problem — it is a")
+        print("     feature problem. A handful of intensity scalars simply do")
+        print("     not carry it. That is exactly the case where richer features")
+        print("     (DINOv2 framing / pooling / foreground) are worth the GPU")
+        print("     time: the experiment is well posed and only the")
+        print("     representation is in question.")
 PY
 echo "════════════════════════════════════════════════════════════════"

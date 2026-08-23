@@ -543,10 +543,17 @@ def main():
             out["null_spearman_mean"] = float(null_rho.mean())
             out["null_spearman_ci"] = [float(np.percentile(null_rho, 2.5)),
                                        float(np.percentile(null_rho, 97.5))]
+            # Save the null itself. Every config in a sweep permutes the SAME
+            # labels with the SAME seed, so these arrays are matched across
+            # configs — which lets the sweep compute a max-statistic
+            # family-wise p that accounts for both the number of configs AND
+            # their correlation. Nothing weaker is honest at n=20.
+            out["null_spearman"] = [float(x) for x in null_rho]
         if len(null_acc):
             out["permutation_p_accuracy"] = float(
                 (np.sum(null_acc >= obs_acc) + 1) / (len(null_acc) + 1))
             out["null_accuracy_mean"] = float(null_acc.mean())
+            out["null_accuracy"] = [float(x) for x in null_acc]
         out["n_permutations"] = int(len(null_acc))
 
     _bp = {}
