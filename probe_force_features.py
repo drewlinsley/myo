@@ -241,8 +241,6 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
                  held-out replicate's own value to build its plate mean would
                  leak the label.
     """
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.decomposition import PCA
     from sklearn.linear_model import Ridge, LogisticRegression
     folds = sorted(set(cv_groups))
     grid = [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]
@@ -271,13 +269,31 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
                 Xf[m_all] -= mu_X
                 yf[m_all] -= mu_y
 
-        # every data-driven quantity is fit on TRAINING rows only
-        sc = StandardScaler().fit(Xf[tr])
-        Xtr, Xte = sc.transform(Xf[tr]), sc.transform(Xf[te])
+        # Sample weights: a 4-FOV tissue must not outvote a 1-FOV one. These
+        # have to apply to the STANDARDIZATION and the PCA too, not just the
+        # regression. PCA to pca_dim is the real regularizer here (768 -> 20),
+        # so if those directions are chosen with a high-FOV tissue counting 4x,
+        # the subspace is tilted toward it and the later down-weighting cannot
+        # recover what fell outside.
+        tr_groups_w = np.asarray(vol_group)[tr]
+        cnt_w = {g: int((tr_groups_w == g).sum()) for g in set(tr_groups_w)}
+        w = np.array([1.0 / cnt_w[g] for g in tr_groups_w])
+        w = w / w.sum() * len(w)          # mean 1, so alpha keeps its scale
+
+        # weighted standardization (fit on TRAINING rows only)
+        mu = np.average(Xf[tr], axis=0, weights=w)
+        var = np.average((Xf[tr] - mu) ** 2, axis=0, weights=w)
+        sd = np.sqrt(var)
+        sd[sd < 1e-12] = 1.0
+        Xtr, Xte = (Xf[tr] - mu) / sd, (Xf[te] - mu) / sd
+
         n_comp = int(min(pca_dim, Xtr.shape[0] - 1, Xtr.shape[1]))
         if n_comp >= 1 and Xtr.shape[1] > n_comp:
-            pca = PCA(n_components=n_comp, random_state=seed).fit(Xtr)
-            Xtr, Xte = pca.transform(Xtr), pca.transform(Xte)
+            # weighted PCA == SVD of the sqrt(w)-scaled, weighted-centered data
+            Z = Xtr * np.sqrt(w)[:, None]
+            _u, _s, vt = np.linalg.svd(Z, full_matrices=False)
+            comp = vt[:n_comp]
+            Xtr, Xte = Xtr @ comp.T, Xte @ comp.T
 
         ytr_force = yf[tr]
         fold_rep_force = {}
@@ -288,10 +304,6 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
         edges = compute_bin_edges(
             [fold_rep_force[g] for g in sorted(set(tr_groups))], n_bins)
         ytr_bin = np.array([assign_bin(v, edges) for v in ytr_force])
-
-        # sample weights: a 4-FOV tissue must not outvote a 1-FOV one
-        cnt = {g: int((tr_groups == g).sum()) for g in set(tr_groups)}
-        w = np.array([1.0 / cnt[g] for g in tr_groups])
 
         if task == "regression":
             # centered force is signed, so log10 only applies to the raw target
