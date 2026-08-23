@@ -124,16 +124,30 @@ def load_stats_features(stats_dir, stems, modality):
 
 
 def load_dino_features(feature_dir, stems, token, agg, fg_min):
-    """Per-view DINOv2 features -> one vector per volume."""
+    """Per-view DINOv2 features -> one vector per volume.
+
+    `token` may be a comma list ("patch_mean,patch_std"), in which case the
+    arrays are concatenated per view. patch_std carries the spatial
+    heterogeneity of the token grid that patch_mean discards, so the pair is
+    usually more informative than either alone.
+
+    `agg` collapses views to a volume. With tiled framing the views tile the
+    whole field, so agg="mean" IS the whole-FOV representation — reached by
+    averaging embeddings of native-resolution crops rather than by resizing the
+    field down into one view.
+    """
+    toks = [t.strip() for t in str(token).split(",") if t.strip()]
     feats, kept = [], []
     for s in stems:
         p = os.path.join(feature_dir, f"{s}.npz")
         if not os.path.exists(p):
             continue
         z = np.load(p)
-        if token not in z:
-            raise SystemExit(f"{p}: no '{token}' array (has {list(z.keys())})")
-        v = np.asarray(z[token], dtype=np.float64)      # (n_views, D)
+        missing = [t for t in toks if t not in z]
+        if missing:
+            raise SystemExit(f"{p}: no {missing} array(s) (has {list(z.keys())})")
+        v = np.concatenate([np.asarray(z[t], dtype=np.float64) for t in toks],
+                           axis=-1)                      # (n_views, sum_D)
         if fg_min > 0 and "view_fg_frac" in z:
             keep = np.asarray(z["view_fg_frac"], float) >= fg_min
             if keep.any():
@@ -148,7 +162,7 @@ def load_dino_features(feature_dir, stems, token, agg, fg_min):
         kept.append(s)
     if not feats:
         raise SystemExit(f"no .npz features found in {feature_dir}")
-    names = [f"{token}[{i}]" for i in range(len(feats[0]))]
+    names = [f"{'+'.join(toks)}[{i}]" for i in range(len(feats[0]))]
     return np.asarray(feats, dtype=np.float64), kept, names
 
 
@@ -358,7 +372,10 @@ def main():
                         "JSONs; 'dino' = cached DINOv2 .npz features.")
     p.add_argument("--data_dir", required=True)
     p.add_argument("--feature_dir", default=None, help="dino mode")
-    p.add_argument("--token", default="patch_mean", help="dino mode")
+    p.add_argument("--token", default="patch_mean,patch_std",
+                   help="dino mode: which per-view array(s) to use. Comma list "
+                        "concatenates. patch_std is the spatial heterogeneity "
+                        "of the token grid, which patch_mean discards.")
     p.add_argument("--agg", default="mean", choices=["mean", "median", "mean+std"])
     p.add_argument("--fg_min", type=float, default=0.0,
                    help="dino mode: drop views whose foreground fraction is "

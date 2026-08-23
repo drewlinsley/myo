@@ -11,20 +11,28 @@ honest multiple-comparison control affordable (see probe_force_features.py).
 Design notes that matter scientifically
 ---------------------------------------
 * 2D only. DINOv2 has no 3D variant, and the 2D arm was already the better one.
-* Two framings. `whole` puts the entire 1600x1100 field in one view, because
-  force is a TISSUE-level property and a 256x256 crop is 3.7% of the FOV.
-  `tiled` keeps native resolution so fine texture survives. Neither dominates
-  a priori, so both are extracted.
-* Views are stored UNPOOLED (one vector per view, not per volume). Pooling is
-  exactly what you want to sweep, and baking it in here would cost another GPU
-  pass per question.
+* `tiled` is the default and the one to trust: 518x518 crops at NATIVE
+  resolution whose union covers the whole 1600x1100 field, so averaging the
+  per-tile embeddings already gives a whole-FOV representation with no resize,
+  no aliasing, and no aspect distortion. Force being a tissue-level property is
+  handled by the aggregation, not by squeezing the field into one view.
+  `whole` (opt-in) downsamples ~3x into a single view. The ONLY thing it adds
+  is attention ACROSS the field in one forward pass; it pays for that by
+  discarding the fine texture, so treat it as a comparison arm, not a default.
+* Views are stored UNPOOLED (one vector per view, not per volume), and each
+  view keeps SPATIAL STATISTICS of its patch tokens, not just their mean.
+  Mean-pooling a token grid discards spatial heterogeneity across the field —
+  the same thing AdaptiveAvgPool was already discarding in the ResNeXt path —
+  and "how uniformly aligned and how densely packed are the fibers across this
+  field" is a plausible force correlate. `patch_std` captures that; `--grid_pool
+  N` keeps a coarse NxN grid for genuinely spatial probes.
 * `view_fg_frac` is always stored even when foreground weighting is off, so a
   probe can drop background tiles later without re-extraction.
 
 Usage
 -----
     python extract_dino_features.py --data_dir data_phalloidin_mhc_051826_staged \
-        --input gfp --framing whole,tiled --norm_scope volume \
+        --input gfp --framing tiled --norm_scope volume \
         --output_dir results/dino_features
     # inspect the plan without loading weights or touching the GPU:
     python extract_dino_features.py ... --limit 2 --dry_run
@@ -67,18 +75,33 @@ def build_dino(model_name, device):
             "n_prefix": int(n_prefix), "dim": int(dim), "name": model_name}
 
 
-def encode_views(ctx, views, view_masks, device, batch_size, amp=True):
-    """(N, 3, S, S) -> {"cls": (N, D), "patch_mean": (N, D), "patch_mean_fg": ...}
+def encode_views(ctx, views, view_masks, device, batch_size, amp=True,
+                 grid_pool=0):
+    """(N, 3, S, S) -> per-view SPATIAL statistics of the patch tokens.
+
+    Returns float16 arrays:
+      cls           (N, D)          the class token
+      patch_mean    (N, D)          mean over spatial tokens
+      patch_std     (N, D)          std over spatial tokens  <- heterogeneity
+      patch_mean_fg (N, D)          foreground-weighted mean (if a mask exists)
+      patch_grid    (N, g, g, D)    coarse pooled token grid (if grid_pool=g)
+
+    patch_std is the point. Collapsing a 37x37 token grid to its mean keeps only
+    the average filter response and discards how much the field VARIES across
+    itself — the same information AdaptiveAvgPool was already discarding in the
+    ResNeXt path. For a tissue-level property like force, "how uniform is this
+    field" is at least as plausible a signal as "what is its average texture".
 
     Patch tokens are taken from index `num_prefix_tokens` onward — hard-coding
-    tok[:, 1:] would silently fold 4 register tokens into the mean on a reg4
-    model.
+    tok[:, 1:] would silently fold 4 register tokens into every statistic on a
+    reg4 model.
     """
     import torch
+    import torch.nn.functional as F
 
     model = ctx["model"]
     n_prefix, patch = ctx["n_prefix"], ctx["patch"]
-    out_cls, out_pm, out_fg = [], [], []
+    out_cls, out_pm, out_ps, out_fg, out_grid = [], [], [], [], []
     use_amp = amp and device.type == "cuda"
 
     for i in range(0, len(views), batch_size):
@@ -101,6 +124,13 @@ def encode_views(ctx, views, view_masks, device, batch_size, amp=True):
                 f"num_prefix_tokens={n_prefix} may be wrong for this model")
         out_cls.append(cls.cpu().numpy())
         out_pm.append(pt.mean(dim=1).cpu().numpy())
+        out_ps.append(pt.std(dim=1).cpu().numpy())
+
+        if grid_pool:
+            g = int(grid_pool)
+            grid = pt.transpose(1, 2).reshape(pt.shape[0], pt.shape[2], gh, gw)
+            grid = F.adaptive_avg_pool2d(grid, (g, g))       # (B, D, g, g)
+            out_grid.append(grid.permute(0, 2, 3, 1).cpu().numpy())
 
         if view_masks is not None:
             mgrid = np.stack([area_resize(m, gh, gw)
@@ -111,9 +141,12 @@ def encode_views(ctx, views, view_masks, device, batch_size, amp=True):
             out_fg.append(((pt * w).sum(dim=1) / denom).cpu().numpy())
 
     res = {"cls": np.concatenate(out_cls).astype(np.float16),
-           "patch_mean": np.concatenate(out_pm).astype(np.float16)}
+           "patch_mean": np.concatenate(out_pm).astype(np.float16),
+           "patch_std": np.concatenate(out_ps).astype(np.float16)}
     if out_fg:
         res["patch_mean_fg"] = np.concatenate(out_fg).astype(np.float16)
+    if out_grid:
+        res["patch_grid"] = np.concatenate(out_grid).astype(np.float16)
     return res
 
 
@@ -143,8 +176,13 @@ def main():
     p.add_argument("--input", choices=["bf", "gfp"], default="gfp")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--framing", default="whole",
-                   help="Comma list of whole|tiled. Both are extracted in one "
+    p.add_argument("--framing", default="tiled",
+                   help="Comma list of tiled|whole. 'tiled' crops at native "
+                        "resolution and covers the full FOV once its views are "
+                        "averaged — no resize, so no aliasing or aspect "
+                        "distortion. 'whole' resizes the field into one view; "
+                        "its only advantage is cross-field attention, at the "
+                        "cost of ~3x downsampling. Both are extracted in one "
                         "pass over the data, since disk reads dominate.")
     p.add_argument("--fov_fit", choices=["pad", "squash"], default="pad",
                    help="whole framing: 'pad' preserves the 1.45 aspect ratio "
@@ -168,6 +206,10 @@ def main():
                    choices=["minimum", "otsu", "li", "triangle"])
     p.add_argument("--mask_dilate", type=int, default=0)
     p.add_argument("--mask_min_frac", type=float, default=0.0)
+    p.add_argument("--grid_pool", type=int, default=0,
+                   help="Also store an NxN average-pooled patch-token grid per "
+                        "view (0 = off), for probes that need spatial layout "
+                        "rather than a single pooled vector.")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--stems", nargs="*", default=None)
     p.add_argument("--limit", type=int, default=None)
@@ -299,7 +341,7 @@ def main():
                     v_int.append(float(np.mean(sub)) if sub.size else 0.0)
 
             feats = encode_views(ctx, views, vmasks or None, device,
-                                 args.batch_size)
+                                 args.batch_size, grid_pool=args.grid_pool)
             os.makedirs(out_dir, exist_ok=True)
             tmp = out_npz + ".tmp.npz"
             np.savez_compressed(

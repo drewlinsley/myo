@@ -39,8 +39,8 @@ FEAT_DIR="${FEAT_DIR:-results/dino_features}"
 OUT_DIR="${OUT_DIR:-results/dino_sweep}"
 MODEL="${MODEL:-vit_base_patch14_reg4_dinov2.lvd142m}"
 MODALITIES="${MODALITIES:-gfp}"
-FRAMINGS="${FRAMINGS:-whole,tiled}"
-TOKENS="${TOKENS:-cls patch_mean}"
+FRAMINGS="${FRAMINGS:-tiled,whole}"
+TOKENS="${TOKENS:-patch_mean patch_mean,patch_std cls}"
 NORM_SCOPE="${NORM_SCOPE:-volume}"
 TASK="${TASK:-regression}"
 N_BINS="${N_BINS:-4}"
@@ -89,7 +89,7 @@ for mod in $MODALITIES; do
       dcs="none"
       [ "$DECONFOUND" != "none" ] && dcs="none $DECONFOUND"
       for dc in $dcs; do
-        tag="${mod}_${framing}_${token}_dc-${dc}"
+        tag="${mod}_${framing}_${token//,/+}_dc-${dc}"
         out="$OUT_DIR/${tag}.json"
         if [ -f "$out" ] && [ "$FORCE" != "1" ]; then
           echo "  [$tag] cached"; n_cfg=$((n_cfg+1)); continue
