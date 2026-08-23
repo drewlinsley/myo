@@ -90,7 +90,14 @@ Z_STRIDE="${Z_STRIDE:-1}"
 # Grid-aware terms appended to the pooled vector, space-separated list of
 # comma-lists. Each extra value is another config and RAISES the family-wise
 # bar, so the default is a single value (no inflation).
-#   STRUCTS="none grad_z,centroid"   compares structured pooling to the mean
+#   STRUCTS="none grad_y,grad_x,std_xy,centroid"
+# Use the FIELD terms, not the depth ones. diagnose_view_structure.py on the
+# 051826 drop (63 volumes, 35 z-levels, ~6 tiles surviving fg 0.75) measured:
+#     across z     12.3% share vs 17.6% null  ->  EXCESS -5.3%
+#     across tile  69.9% share vs  2.4% null  ->  EXCESS +67.5%
+# Depth explains LESS than a random grouping of the same size, so grad_z/std_z
+# have nothing to encode and a 3D-over-z aggregator is unmotivated. All the
+# view-to-view structure is across the field.
 STRUCTS="${STRUCTS:-none}"
 MODEL_CLASS="${MODEL_CLASS:-ridge}"   # ridge|lasso|elasticnet|xgboost
 SEED="${SEED:-42}"
