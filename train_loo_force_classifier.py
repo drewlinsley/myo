@@ -448,8 +448,12 @@ def main():
             crop_size=dcfg.get("crop_size", 256), modality=args.input,
             norm_scope=args.norm_scope, global_pct=global_pct)
 
-    epochs = args.epochs or tcfg.get("epochs", 100)
-    patience = args.patience or tcfg.get("patience", 15)
+    epochs = (args.epochs if args.epochs is not None
+              else tcfg.get("epochs", 100))
+    patience = (args.patience if args.patience is not None
+                else tcfg.get("patience", 15))
+    if epochs < 1:
+        raise SystemExit(f"--epochs must be >= 1, got {epochs}")
     min_delta = tcfg.get("min_delta", 1e-3)
     min_epochs = max(0, int(args.min_epochs))
     if args.fold_cache:
@@ -457,6 +461,25 @@ def main():
     lr = tcfg["lr"]
 
     results = []  # one entry per held-out replicate
+    # Everything that changes what a fold's model IS. A cached fold is reused
+    # only on an exact match, so a resumed run can never silently blend folds
+    # trained under different settings.
+    run_fingerprint = {
+        "config": args.config, "target_col": args.target_col,
+        "metadata": args.metadata, "group_cols": ",".join(group_cols),
+        "input": args.input, "dims": dims, "n_bins": int(n_bins),
+        "bin_scheme": args.bin_scheme, "cv_unit": args.cv_unit,
+        "seed": int(seed), "epochs": int(epochs), "patience": int(patience),
+        "min_epochs": int(min_epochs), "inner_val_frac": float(args.inner_val_frac),
+        "init_from": args.init_from, "freeze_encoder": bool(args.freeze_encoder),
+        "norm_scope": args.norm_scope, "recalibrate_bn": int(args.recalibrate_bn),
+        "weight_decay": (float(args.weight_decay)
+                         if args.weight_decay is not None else None),
+        "n_groups": len(group_keys),
+    }
+
+    folds_without_ckpt = []
+
     for fold_idx, held_g in enumerate(group_keys):
         held_stems = groups[held_g]
         train_groups = [g for g in group_keys if g != held_g]
@@ -513,15 +536,23 @@ def main():
                 and not args.force_folds):
             with open(fold_cache_path) as f:
                 cached = json.load(f)
-            if cached.get("true_bin") == true_bin:
+            cached_fp = cached.get("run_fingerprint")
+            if cached_fp == run_fingerprint:
                 results.append(cached)
+                if args.save_ckpt_dir and not os.path.exists(os.path.join(
+                        args.save_ckpt_dir, fold_key, "best.pth")):
+                    folds_without_ckpt.append(str(held_g))
                 accelerator.print(
                     f"  cached (fold_cache): pred={classes[cached['pred_bin']]} "
                     f"correct={cached['correct']} — skipping")
                 continue
+            diff = ([k for k, v in run_fingerprint.items()
+                     if (cached_fp or {}).get(k) != v] if cached_fp
+                    else ["<no fingerprint: written by an older version>"])
             accelerator.print(
-                "  fold_cache entry disagrees with this fold's bin edges "
-                "(n_bins or metadata changed) — recomputing")
+                f"  fold_cache entry was produced by a DIFFERENT run "
+                f"(differs in: {', '.join(map(str, diff))}) — recomputing. "
+                f"Reusing it would mix models across folds.")
 
         fold_ckpt_path = None
         if args.save_ckpt_dir:
@@ -602,12 +633,21 @@ def main():
         # encoder.eval() pins them there forever. Re-estimate them on this
         # fold's TRAINING batches before any weight moves.
         if args.recalibrate_bn > 0:
-            n_bn = recalibrate_bn(accelerator.unwrap_model(model), train_loader,
-                                  n_batches=args.recalibrate_bn, device=device)
-            if fold_idx == 0:
+            n_seen = recalibrate_bn(accelerator.unwrap_model(model),
+                                    train_loader,
+                                    n_batches=args.recalibrate_bn, device=device)
+            if n_seen == 0:
                 accelerator.print(
-                    f"  recalibrate_bn: re-estimated {n_bn} BatchNorm layer(s) "
-                    f"over {args.recalibrate_bn} batch(es) of {args.input}")
+                    "  recalibrate_bn: loader yielded NO batches (drop_last "
+                    "with a small inner split?) — BN statistics left as-is "
+                    "rather than reset to mean=0/var=1")
+            elif fold_idx == 0:
+                n_samp = n_seen * int(tcfg["batch_size"])
+                accelerator.print(
+                    f"  recalibrate_bn: {n_seen} batch(es) ~ {n_samp} samples "
+                    f"of {args.input}"
+                    + ("   WARNING: thin estimate for BN statistics"
+                       if n_samp < 64 else ""))
 
         def eval_loss_on(loader):
             model.eval()
@@ -689,6 +729,9 @@ def main():
                         "classes": classes, "class_rep_force": class_rep.tolist(),
                         "cv_unit": args.cv_unit, "fold": str(held_g),
                         "input": args.input,
+                        "norm_scope": args.norm_scope,
+                        "global_pct": (list(fold_global_pct)
+                                       if fold_global_pct else None),
                     }, tmp)
                     os.replace(tmp, fold_ckpt_path)
             else:
@@ -746,6 +789,7 @@ def main():
             "rep_probs": [float(x) for x in rep_prob],
             "class_rep_force": class_rep.tolist(),
             "per_volume": vol_records,
+            "run_fingerprint": run_fingerprint,
         })
 
         # Persist this fold immediately: a 20-fold 3D LOO is many hours, and a
@@ -822,8 +866,18 @@ def main():
             f"Permutation test (accuracy): p={perm_info['p_value_accuracy']:.4f} "
             f"(perm mean={perm_acc.mean():.3f})")
 
+    if folds_without_ckpt:
+        accelerator.print(
+            f"\n  NOTE: {len(folds_without_ckpt)} fold(s) were reused from "
+            f"--fold_cache and therefore have NO checkpoint in "
+            f"{args.save_ckpt_dir}: {', '.join(folds_without_ckpt[:5])}"
+            + (" ..." if len(folds_without_ckpt) > 5 else "")
+            + "\n  Saliency/eval on those folds is unavailable. Regenerating "
+              "them needs --force_folds, which recomputes every fold.")
+
     summary = {
         "task": "force_classification",
+        "folds_without_ckpt": folds_without_ckpt,
         "target_col": args.target_col,
         "input": args.input, "dims": dims,
         "init_from": args.init_from, "warm_started": warm_started,

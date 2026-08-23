@@ -146,16 +146,44 @@ def load_dino_features(feature_dir, stems, token, agg, fg_min):
         missing = [t for t in toks if t not in z]
         if missing:
             raise SystemExit(f"{p}: no {missing} array(s) (has {list(z.keys())})")
-        v = np.concatenate([np.asarray(z[t], dtype=np.float64) for t in toks],
-                           axis=-1)                      # (n_views, sum_D)
+        arrs = []
+        for t in toks:
+            a = np.asarray(z[t], dtype=np.float64)
+            if a.ndim > 2:          # e.g. patch_grid (n_views, g, g, D)
+                a = a.reshape(a.shape[0], -1)
+            arrs.append(a)
+        v = np.concatenate(arrs, axis=-1)                # (n_views, sum_D)
+        keep = np.ones(len(v), dtype=bool)
         if fg_min > 0 and "view_fg_frac" in z:
             keep = np.asarray(z["view_fg_frac"], float) >= fg_min
             if keep.any():
                 v = v[keep]
+            else:
+                keep = np.ones(len(v), dtype=bool)
+        fg = (np.asarray(z["view_fg_frac"], float) if "view_fg_frac" in z
+              else np.ones(len(v)))
+        if fg_min > 0 and "view_fg_frac" in z:
+            fg = fg[keep] if keep.any() else fg
         if agg == "median":
             vec = np.median(v, axis=0)
         elif agg == "mean+std":
+            # std ACROSS views = across-field heterogeneity. Distinct from the
+            # patch_std token, which is within-view heterogeneity.
             vec = np.concatenate([v.mean(axis=0), v.std(axis=0)])
+        elif agg == "fgmean":
+            # Weight each view by its foreground fraction. The fields are
+            # sparse tissue on background, so an unweighted mean over 144 tiles
+            # is mostly background texture with a small tissue perturbation —
+            # and the between-volume variance a probe needs lives in that
+            # perturbation.
+            w = np.clip(fg, 0, None)
+            vec = ((v * w[:, None]).sum(axis=0) / w.sum()
+                   if w.sum() > 1e-8 else v.mean(axis=0))
+        elif agg == "fgmean+std":
+            w = np.clip(fg, 0, None)
+            mu = ((v * w[:, None]).sum(axis=0) / w.sum()
+                  if w.sum() > 1e-8 else v.mean(axis=0))
+            vec = np.concatenate([mu, v.std(axis=0)])
         else:
             vec = v.mean(axis=0)
         feats.append(vec)
@@ -376,7 +404,15 @@ def main():
                    help="dino mode: which per-view array(s) to use. Comma list "
                         "concatenates. patch_std is the spatial heterogeneity "
                         "of the token grid, which patch_mean discards.")
-    p.add_argument("--agg", default="mean", choices=["mean", "median", "mean+std"])
+    p.add_argument("--agg", default="mean",
+                   choices=["mean", "median", "mean+std", "fgmean",
+                            "fgmean+std"],
+                   help="How to collapse views to one volume vector. 'fgmean' "
+                        "weights each view by its foreground fraction — the "
+                        "fields are sparse tissue on background, so a plain "
+                        "mean is dominated by background. '*+std' appends the "
+                        "std ACROSS views (across-field heterogeneity), which "
+                        "is different from the patch_std token (within-view).")
     p.add_argument("--fg_min", type=float, default=0.0,
                    help="dino mode: drop views whose foreground fraction is "
                         "below this (removes pure-background tiles).")

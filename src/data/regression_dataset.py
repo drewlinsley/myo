@@ -49,8 +49,15 @@ class VolumeRegressionDataset(Dataset):
                              f"got {norm_scope!r}")
         self.norm_scope = norm_scope
         if norm_scope == "global":
-            self.global_pct = (tuple(global_pct) if global_pct is not None
-                               else global_percentiles(stats_dir, modality))
+            if global_pct is None:
+                raise ValueError(
+                    "norm_scope='global' requires an explicit global_pct. "
+                    "Pooling percentiles over every stats JSON would include "
+                    "held-out volumes, leaking their brightness into the "
+                    "normalization — which is exactly the signal being tested. "
+                    "Pass global_percentiles(stats_dir, modality, "
+                    "stems=<TRAIN stems>).")
+            self.global_pct = tuple(global_pct)
         else:
             self.global_pct = None
 

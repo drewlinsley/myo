@@ -128,6 +128,14 @@ def global_percentiles(stats_dir, modality, stems=None):
 
     if not lows:
         raise ValueError(
-            f"global_percentiles: no stats JSON in {stats_dir} carried a "
-            f"'{modality}' entry (looked at {len(paths)} file(s)).")
+            f"global_percentiles: no stats JSON "
+            + (f"for the {len(paths)} requested stem(s) " if stems is not None
+               else f"in {stats_dir} ")
+            + f"carried a '{modality}' entry.")
+    if stems is not None and len(lows) < len(stems):
+        raise ValueError(
+            f"global_percentiles: only {len(lows)} of {len(stems)} requested "
+            f"stems had a '{modality}' stats entry. A silent subset would "
+            f"narrow the 'global' statistic to whatever happened to exist — "
+            f"check for a stem-naming mismatch.")
     return float(min(lows)), float(max(highs))

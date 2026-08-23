@@ -230,7 +230,9 @@ def recalibrate_bn(model, loader, n_batches=32, device=None, input_fn=None):
             sequence, else the batch itself.
 
     Returns:
-        The number of BN modules that were recalibrated.
+        The number of BATCHES actually used (0 = nothing was done and the
+        existing statistics were left untouched — check this, do not assume
+        success).
     """
     bns = [m for m in model.modules()
            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
@@ -243,6 +245,17 @@ def recalibrate_bn(model, loader, n_batches=32, device=None, input_fn=None):
         def input_fn(b):
             return b[0] if isinstance(b, (list, tuple)) else b
 
+    # Probe the loader BEFORE destroying the existing statistics: resetting and
+    # then finding nothing to estimate from would leave every BN at
+    # mean=0/var=1, which is worse than the stale statistics we are replacing.
+    batches = []
+    for batch in loader:
+        batches.append(batch)
+        if len(batches) >= n_batches:
+            break
+    if not batches:
+        return 0
+
     was_training = model.training
     saved = []
     for m in bns:
@@ -253,17 +266,17 @@ def recalibrate_bn(model, loader, n_batches=32, device=None, input_fn=None):
 
     seen = 0
     with torch.no_grad():
-        for batch in loader:
+        for batch in batches:
             model(input_fn(batch).to(device))
             seen += 1
-            if seen >= n_batches:
-                break
 
     for m, mom in zip(bns, saved):
         m.momentum = mom
-        m.eval()
+    # NOTE: model.train(was_training) below decides the final mode for every
+    # submodule, BN included. Callers that want the freshly estimated running
+    # stats used at inference must call model.eval() themselves.
     model.train(was_training)
-    return len(bns)
+    return seen
 
 
 def resolve_resume(flag, default_path):

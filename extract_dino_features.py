@@ -23,9 +23,13 @@ Design notes that matter scientifically
   view keeps SPATIAL STATISTICS of its patch tokens, not just their mean.
   Mean-pooling a token grid discards spatial heterogeneity across the field —
   the same thing AdaptiveAvgPool was already discarding in the ResNeXt path —
-  and "how uniformly aligned and how densely packed are the fibers across this
-  field" is a plausible force correlate. `patch_std` captures that; `--grid_pool
-  N` keeps a coarse NxN grid for genuinely spatial probes.
+  and "how uniformly aligned and how densely packed are the fibers" is a
+  plausible force correlate. Be precise about the scale, though: under the
+  default `tiled` framing a view is one 518px tile (9% of the field), so
+  `patch_std` is WITHIN-tile heterogeneity. ACROSS-field heterogeneity is a
+  different statistic — the std of patch_mean across views — which the probe
+  computes via `--agg mean+std`. Sweep both; they are not interchangeable.
+  `--grid_pool N` keeps a coarse NxN grid for genuinely spatial probes.
 * `view_fg_frac` is always stored even when foreground weighting is off, so a
   probe can drop background tiles later without re-extraction.
 
@@ -41,13 +45,15 @@ Usage
 import os
 import json
 import glob
+import hashlib
 import argparse
 
 import numpy as np
 
 from src.data.normalization import normalize, global_percentiles
 from src.data.zband import resolve_z_range
-from src.data.dino_views import plan_views, make_view, view_foreground, area_resize
+from src.data.dino_views import (plan_views, make_view, view_foreground,
+                                 area_resize, fit_into_square)
 
 DEFAULT_MODEL = "vit_base_patch14_reg4_dinov2.lvd142m"
 
@@ -55,9 +61,11 @@ DEFAULT_MODEL = "vit_base_patch14_reg4_dinov2.lvd142m"
 def build_dino(model_name, device):
     """Frozen DINOv2 + its own resolved normalization stats.
 
-    Register variants (reg4) are preferred: registers absorb the high-norm
-    artifact tokens that otherwise contaminate mean-patch pooling, which is one
-    of the two headline readouts here.
+    Register variants (reg4) are preferred. The mechanism is not magnitude —
+    after the final LayerNorm all tokens are renormalized to roughly equal norm.
+    It is that artifact tokens carry GLOBAL information in place of local patch
+    content, which distorts the direction of any pooled patch vector. Registers
+    give that global information somewhere else to live.
     """
     import timm
     import torch
@@ -70,8 +78,17 @@ def build_dino(model_name, device):
     img_size = cfg["input_size"][-1]
     n_prefix = getattr(model, "num_prefix_tokens", 1)
     dim = model.num_features
+    has_cls = getattr(model, "cls_token", None) is not None
+    # forward_features returns POST-final-LayerNorm tokens only when
+    # global_pool == 'token' (DINOv2). For a global_pool='avg' checkpoint timm
+    # moves the LN into fc_norm, which forward_features does not apply, and the
+    # tokens come back un-normalized at a wildly different scale.
+    if getattr(model, "global_pool", "token") == "avg":
+        print("WARNING: this checkpoint uses global_pool='avg', so "
+              "forward_features returns PRE-norm tokens. patch_std in "
+              "particular will not be comparable to a DINOv2 run.")
     return {"model": model, "mean": cfg["mean"], "std": cfg["std"],
-            "patch": int(patch), "img_size": int(img_size),
+            "patch": int(patch), "img_size": int(img_size), "has_cls": has_cls,
             "n_prefix": int(n_prefix), "dim": int(dim), "name": model_name}
 
 
@@ -86,11 +103,13 @@ def encode_views(ctx, views, view_masks, device, batch_size, amp=True,
       patch_mean_fg (N, D)          foreground-weighted mean (if a mask exists)
       patch_grid    (N, g, g, D)    coarse pooled token grid (if grid_pool=g)
 
-    patch_std is the point. Collapsing a 37x37 token grid to its mean keeps only
-    the average filter response and discards how much the field VARIES across
-    itself — the same information AdaptiveAvgPool was already discarding in the
-    ResNeXt path. For a tissue-level property like force, "how uniform is this
-    field" is at least as plausible a signal as "what is its average texture".
+    patch_std collapses a 37x37 token grid to per-dimension dispersion rather
+    than just its mean, keeping heterogeneity that AdaptiveAvgPool discarded in
+    the ResNeXt path. Because forward_features returns POST-final-LayerNorm
+    tokens, every token has roughly equal norm, so this is an angular-dispersion
+    measure rather than a norm-dominated one — which is why the known high-norm
+    artifact tokens do not dominate it here. Scale caveat: this is dispersion
+    WITHIN one view; across-view dispersion is `--agg mean+std` in the probe.
 
     Patch tokens are taken from index `num_prefix_tokens` onward — hard-coding
     tok[:, 1:] would silently fold 4 register tokens into every statistic on a
@@ -114,6 +133,14 @@ def encode_views(ctx, views, view_masks, device, batch_size, amp=True,
             else:
                 tok = model.forward_features(x)
         tok = tok.float()
+        if not torch.isfinite(tok).all():
+            raise SystemExit(
+                "non-finite tokens from the backbone (fp16 overflow?) — one bad "
+                "view NaNs the whole volume mean and surfaces much later as a "
+                "confusing sklearn error. Rerun with --no_amp.")
+        if not ctx.get("has_cls", True):
+            raise SystemExit(f"{ctx['name']} has no class token; use "
+                             "--token patch_mean,patch_std instead of cls")
         cls = tok[:, 0]
         pt = tok[:, n_prefix:]                      # (B, gh*gw, D)
         gh = x.shape[-2] // patch
@@ -137,8 +164,15 @@ def encode_views(ctx, views, view_masks, device, batch_size, amp=True,
                               for m in view_masks[i:i + batch_size]])
             w = torch.from_numpy(mgrid.reshape(len(mgrid), -1)).to(pt.device)
             w = w.clamp(min=0).unsqueeze(-1)         # (B, gh*gw, 1)
-            denom = w.sum(dim=1).clamp(min=1e-6)
-            out_fg.append(((pt * w).sum(dim=1) / denom).cpu().numpy())
+            wsum = w.sum(dim=1)                       # (B, 1)
+            fg = (pt * w).sum(dim=1) / wsum.clamp(min=1e-6)
+            # A view with no foreground would otherwise become an all-zero
+            # vector — not neutral, but an out-of-manifold point that pulls the
+            # volume mean toward the origin. Fall back to the plain mean.
+            empty = (wsum.squeeze(-1) < 1e-3)
+            if empty.any():
+                fg[empty] = pt[empty].mean(dim=1)
+            out_fg.append(fg.cpu().numpy())
 
     res = {"cls": np.concatenate(out_cls).astype(np.float16),
            "patch_mean": np.concatenate(out_pm).astype(np.float16),
@@ -182,8 +216,9 @@ def main():
                         "averaged — no resize, so no aliasing or aspect "
                         "distortion. 'whole' resizes the field into one view; "
                         "its only advantage is cross-field attention, at the "
-                        "cost of ~3x downsampling. Both are extracted in one "
-                        "pass over the data, since disk reads dominate.")
+                        "cost of ~3x downsampling. NOTE: each framing "
+                        "re-reads the volume, so listing two doubles the disk "
+                        "and masking cost.")
     p.add_argument("--fov_fit", choices=["pad", "squash"], default="pad",
                    help="whole framing: 'pad' preserves the 1.45 aspect ratio "
                         "(myotube alignment is plausibly the signal); 'squash' "
@@ -262,7 +297,24 @@ def main():
         print(f"model={ctx['name']} dim={ctx['dim']} patch={ctx['patch']} "
               f"img_size={ctx['img_size']} n_prefix={ctx['n_prefix']}")
 
-    manifest = {"model": args.model, "input": args.input,
+    # Every setting that changes the FEATURES goes into the directory key.
+    cfg_key = {
+        "model": args.model, "input": args.input,
+        "norm_scope": args.norm_scope, "global_pct": gpct,
+        "z_range": args.z_range, "z_stride": args.z_stride,
+        "fov_fit": args.fov_fit, "tile_grid": [gx, gy],
+        "grid_pool": args.grid_pool, "mask_source": args.mask_source,
+        "mask_method": args.mask_method, "mask_dilate": args.mask_dilate,
+        "mask_min_frac": args.mask_min_frac,
+    }
+    cfg_hash = hashlib.sha1(
+        json.dumps(cfg_key, sort_keys=True).encode()).hexdigest()[:8]
+    print(f"config hash: {cfg_hash}  (feature dirs are keyed by it, so a "
+          f"different backbone or geometry cannot silently reuse cached "
+          f"features)")
+
+    manifest = {"config_hash": cfg_hash, "config": cfg_key,
+                "model": args.model, "input": args.input,
                 "norm_scope": args.norm_scope, "global_pct": gpct,
                 "z_range": args.z_range, "z_stride": args.z_stride,
                 "fov_fit": args.fov_fit, "tile_grid": [gx, gy],
@@ -291,9 +343,12 @@ def main():
 
         for framing in framings:
             out_dir = os.path.join(args.output_dir,
-                                   f"{args.input}_{framing}_{args.norm_scope}")
+                                   f"{args.input}_{framing}_{args.norm_scope}"
+                                   f"_{cfg_hash}")
             out_npz = os.path.join(out_dir, f"{stem}.npz")
             if os.path.exists(out_npz) and not args.force:
+                manifest["volumes"].setdefault(stem, {})[framing] = {
+                    "cached": True}
                 print(f"  [{si+1}/{len(stems)}] {stem} {framing}: cached")
                 continue
 
@@ -313,6 +368,13 @@ def main():
                 mpath = os.path.join(mask_dir, f"{stem}.npy")
                 if os.path.exists(mpath):
                     mv = np.load(mpath, mmap_mode="r")
+                    if mv.shape != vol.shape:
+                        raise SystemExit(
+                            f"{stem}: mask source '{args.mask_source}' has "
+                            f"shape {mv.shape} but '{args.input}' has "
+                            f"{vol.shape}. The z-band and view geometry come "
+                            f"from the input volume, so a mismatch silently "
+                            f"misaligns every mask.")
                     mraw = np.asarray(mv[z_lo:z_hi][::max(1, args.z_stride)])
                     mask_band, warn = foreground_mask(
                         mraw, args.mask_method, args.mask_dilate,
@@ -328,9 +390,23 @@ def main():
                     views.append(make_view(sl, sp, p_low, p_high,
                                            ctx["mean"], ctx["std"], normalize))
                     if msl is not None:
-                        mm = (msl[sp["y"]:sp["y"] + sp["th"],
-                                  sp["x"]:sp["x"] + sp["tw"]].astype(np.float32)
-                              if sp["mode"] == "crop" else msl.astype(np.float32))
+                        # The mask MUST go through the same geometry as the
+                        # image. Previously the resize path stored the raw mask
+                        # while the image was aspect-preserved and padded, so
+                        # the two were stretched apart by 518/356 = 1.455 —
+                        # a ~250px misalignment at the extremes, silently
+                        # corrupting every foreground-weighted feature.
+                        if sp["mode"] == "crop":
+                            mm = msl[sp["y"]:sp["y"] + sp["th"],
+                                     sp["x"]:sp["x"] + sp["tw"]].astype(np.float32)
+                            if mm.shape != (sp["th"], sp["tw"]):
+                                pad = np.zeros((sp["th"], sp["tw"]), np.float32)
+                                pad[:mm.shape[0], :mm.shape[1]] = mm
+                                mm = pad
+                        else:
+                            mm = fit_into_square(msl.astype(np.float32),
+                                                 sp["out"], sp.get("fit", "pad"),
+                                                 pad_value=0.0)
                         vmasks.append(mm)
                     v_z.append(z)
                     v_yx.append([sp["y"], sp["x"]])
@@ -343,15 +419,19 @@ def main():
             feats = encode_views(ctx, views, vmasks or None, device,
                                  args.batch_size, grid_pool=args.grid_pool)
             os.makedirs(out_dir, exist_ok=True)
-            tmp = out_npz + ".tmp.npz"
+            tmp = os.path.join(out_dir, f".{stem}.partial")
+            # Dot-prefix the temp file. np.savez_compressed always appends
+            # ".npz", so any suffix scheme still matches the probe's
+            # glob("*.npz") — but glob skips dotfiles, so an orphan left by a
+            # killed run cannot surface as a phantom stem.
             np.savez_compressed(
-                tmp, view_z=np.asarray(v_z, np.int32),
+                tmp + ".npz", view_z=np.asarray(v_z, np.int32),
                 view_yx=np.asarray(v_yx, np.int32),
                 view_fg_frac=np.asarray(v_fg, np.float32),
                 view_mean_int=np.asarray(v_int, np.float32),
                 z_lo=z_lo, z_hi=z_hi, n_z_total=n_z,
                 p_low_used=p_low, p_high_used=p_high, **feats)
-            os.replace(tmp, out_npz)
+            os.replace(tmp + ".npz", out_npz)
             manifest["volumes"].setdefault(stem, {})[framing] = {
                 "n_views": int(n_views), "z": [int(z_lo), int(z_hi)],
                 "shape": [int(n_z), int(H), int(W)]}
@@ -359,8 +439,30 @@ def main():
                   f"{n_views} views -> {out_npz}")
 
     if not args.dry_run:
-        os.makedirs(args.output_dir, exist_ok=True)
+        # One manifest per hashed feature dir. A single shared manifest was
+        # clobbered by the next modality/model and could describe a config its
+        # neighbouring .npz files were not produced with.
+        for framing in framings:
+            fdir = os.path.join(args.output_dir,
+                                f"{args.input}_{framing}_{args.norm_scope}"
+                                f"_{cfg_hash}")
+            if not os.path.isdir(fdir):
+                continue
+            mp = os.path.join(fdir, "manifest.json")
+            merged = dict(manifest)
+            if os.path.exists(mp):          # keep earlier volumes + warnings
+                try:
+                    prev = json.load(open(mp))
+                    merged["volumes"] = {**prev.get("volumes", {}),
+                                         **manifest["volumes"]}
+                    merged["warnings"] = (prev.get("warnings", [])
+                                          + manifest["warnings"])
+                except Exception:
+                    pass
+            with open(mp, "w") as f:
+                json.dump(merged, f, indent=2)
         mp = os.path.join(args.output_dir, "manifest.json")
+        os.makedirs(args.output_dir, exist_ok=True)
         with open(mp, "w") as f:
             json.dump(manifest, f, indent=2)
         print(f"\nmanifest -> {mp}")

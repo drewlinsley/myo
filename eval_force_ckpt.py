@@ -103,6 +103,16 @@ def main():
     pd_, cs_ = dcfg.get("patch_depth", 32), dcfg.get("crop_size", 256)
     bs = args.batch_size or tcfg["batch_size"]
 
+    # Honour the normalization the checkpoint was TRAINED with. Defaulting to
+    # "volume" for a globally-normalized model would score it on inputs it
+    # never saw, with nothing detecting the mismatch.
+    _peek = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    ck_norm = _peek.get("norm_scope", "volume")
+    ck_gpct = _peek.get("global_pct")
+    if ck_norm != "volume":
+        print(f"  checkpoint trained with norm_scope={ck_norm} "
+              f"(global_pct={ck_gpct}) — matching it for evaluation")
+
     model = build_gfp_classifier(cfg, n_bins, 2).to(device)
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     sd = ck.get("model_state_dict", ck)
@@ -133,7 +143,8 @@ def main():
             transform=build_transforms(cfg, False), z_range=z_range,
             apply_timm=apply_timm, mode=dims, patch_depth=pd_,
             patches_per_volume=args.patches_per_volume, crop_size=cs_,
-            modality=args.input)
+            modality=args.input, norm_scope=ck_norm,
+            global_pct=tuple(ck_gpct) if ck_gpct else None)
         loader = torch.utils.data.DataLoader(
             ds, batch_size=bs, shuffle=False, num_workers=0)
         probs, counts, ce = _eval_det(

@@ -327,6 +327,19 @@ class VolumeDataset(BaseDataset):
         # and left index_map unassigned (so __len__ raised AttributeError).
         self.index_map = []
         for i in range(len(bf_files)):
+            # Skip volumes with no usable z-plane after the z_range crop.
+            # _extract_patch_fast would slice to (0, cs, cs) and np.pad(...,
+            # mode="reflect") raises on a size-0 axis. regression_dataset.py
+            # guards the same case; this path did not.
+            try:
+                n_z = np.load(bf_files[i], mmap_mode="r").shape[0]
+                if self.z_range is not None:
+                    z_lo, z_hi = resolve_z_range(self.z_range, self.stats[i], n_z)
+                    n_z = z_hi - z_lo
+                if n_z < 1:
+                    continue
+            except Exception:
+                pass          # unreadable header: let __getitem__ report it
             for p in range(patches_per_volume):
                 self.index_map.append((i, p))
 

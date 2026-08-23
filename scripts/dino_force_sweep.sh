@@ -36,14 +36,16 @@ METADATA="${METADATA:-phalloidin_mhc_mapping_051426_SS edit.xlsx}"
 TARGET_COL="${TARGET_COL:-peak_amplitude_week1}"
 GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
 FEAT_DIR="${FEAT_DIR:-results/dino_features}"
-OUT_DIR="${OUT_DIR:-results/dino_sweep}"
+OUT_DIR="${OUT_DIR:-results/dino_sweep}"   # per-target subdir added below
 MODEL="${MODEL:-vit_base_patch14_reg4_dinov2.lvd142m}"
 MODALITIES="${MODALITIES:-gfp}"
-FRAMINGS="${FRAMINGS:-tiled,whole}"
-TOKENS="${TOKENS:-patch_mean patch_mean,patch_std cls}"
+FRAMINGS="${FRAMINGS:-tiled}"
+TOKENS="${TOKENS:-cls,patch_mean patch_mean,patch_std patch_std}"
 NORM_SCOPE="${NORM_SCOPE:-volume}"
 TASK="${TASK:-regression}"
 N_BINS="${N_BINS:-4}"
+AGGS="${AGGS:-mean fgmean mean+std}"
+FG_MIN="${FG_MIN:-0.0}"
 DECONFOUND="${DECONFOUND:-plate}"
 N_PERM="${N_PERM:-1000}"
 Z_STRIDE="${Z_STRIDE:-3}"
@@ -54,12 +56,21 @@ FORCE="${FORCE:-0}"
 [ -d "$DATA_DIR" ] || { echo "ERROR: DATA_DIR $DATA_DIR not found" >&2; exit 1; }
 [ -f "$METADATA" ] || { echo "ERROR: METADATA '$METADATA' not found" >&2; exit 1; }
 
+# Scope the results directory by everything that changes what is being
+# predicted. Two targets must never share a directory: Stage C's max-statistic
+# assumes every JSON in it permuted the SAME labels with the SAME seed.
+RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s' "$TARGET_COL" "$TASK" "$N_BINS" \
+           "$MODEL" "$NORM_SCOPE" "$SEED" | cksum | cut -d' ' -f1)"
+OUT_DIR="$OUT_DIR/${TARGET_COL}_${TASK}_b${N_BINS}_s${SEED}_${RUN_KEY}"
 mkdir -p "$OUT_DIR"
 echo "════════════════════════════════════════════════════════════════"
 echo " Frozen DINOv2 -> force"
 echo "   target=$TARGET_COL   deconfound=$DECONFOUND   task=$TASK"
+echo "   results -> $OUT_DIR"
 echo "   model=$MODEL"
-echo "   modalities=[$MODALITIES] framings=$FRAMINGS tokens=[$TOKENS]"
+echo "   modalities=[$MODALITIES] framings=$FRAMINGS"
+echo "   tokens=[$TOKENS]"
+echo "   aggs=[$AGGS]  fg_min=$FG_MIN"
 echo "════════════════════════════════════════════════════════════════"
 
 # ── Stage A: extract once ──
@@ -81,15 +92,27 @@ echo ""; echo "▶ B. probing"
 n_cfg=0
 for mod in $MODALITIES; do
   for framing in ${FRAMINGS//,/ }; do
-    fdir="$FEAT_DIR/${mod}_${framing}_${NORM_SCOPE}"
-    if [ ! -d "$fdir" ]; then
-      echo "  (no $fdir — skipping)"; continue
+    matches="$(ls -d "$FEAT_DIR/${mod}_${framing}_${NORM_SCOPE}"_* 2>/dev/null || true)"
+    n_match="$(printf '%s' "$matches" | grep -c . || true)"
+    if [ "$n_match" -eq 0 ]; then
+      echo "  ERROR: no feature dir $FEAT_DIR/${mod}_${framing}_${NORM_SCOPE}_*" >&2
+      echo "         (extraction did not run, or ran with other settings)" >&2
+      exit 1
     fi
+    if [ "$n_match" -gt 1 ]; then
+      echo "  ERROR: $n_match feature dirs match ${mod}_${framing}_${NORM_SCOPE}_*:" >&2
+      echo "$matches" >&2
+      echo "         Config-hash suffixes differ; pass FEAT_DIR explicitly or" >&2
+      echo "         delete the stale one. Refusing to guess." >&2
+      exit 1
+    fi
+    fdir="$matches"
     for token in $TOKENS; do
+     for agg in $AGGS; do
       dcs="none"
       [ "$DECONFOUND" != "none" ] && dcs="none $DECONFOUND"
       for dc in $dcs; do
-        tag="${mod}_${framing}_${token//,/+}_dc-${dc}"
+        tag="${mod}_${framing}_${token//,/+}_${agg//+/-}_dc-${dc}"
         out="$OUT_DIR/${tag}.json"
         if [ -f "$out" ] && [ "$FORCE" != "1" ]; then
           echo "  [$tag] cached"; n_cfg=$((n_cfg+1)); continue
@@ -99,23 +122,26 @@ for mod in $MODALITIES; do
           --token "$token" --data_dir "$DATA_DIR" --metadata "$METADATA" \
           --target_col "$TARGET_COL" --group_cols "$GROUP_COLS" \
           --modality "$mod" --task "$TASK" --n_bins "$N_BINS" \
+          --agg "$agg" --fg_min "$FG_MIN" \
           --deconfound "$dc" --n_perm "$N_PERM" --seed "$SEED" --quiet \
           --output "$out" || echo "    (failed — continuing)"
         n_cfg=$((n_cfg+1))
       done
+     done
     done
   done
 done
 
 # a shuffled-label control on one config: must land at chance
-ctrl_dir="$FEAT_DIR/$(echo $MODALITIES | cut -d' ' -f1)_$(echo ${FRAMINGS%%,*})_${NORM_SCOPE}"
-if [ -d "$ctrl_dir" ]; then
+ctrl_dir="$(ls -d "$FEAT_DIR/$(echo $MODALITIES | cut -d' ' -f1)_${FRAMINGS%%,*}_${NORM_SCOPE}"_* 2>/dev/null | head -1 || true)"
+if [ -n "$ctrl_dir" ] && [ -d "$ctrl_dir" ]; then
   echo "  [control: shuffled labels]"
   python probe_force_features.py --features dino --feature_dir "$ctrl_dir" \
     --token patch_mean --data_dir "$DATA_DIR" --metadata "$METADATA" \
     --target_col "$TARGET_COL" --group_cols "$GROUP_COLS" \
     --modality "$(echo $MODALITIES | cut -d' ' -f1)" \
     --task "$TASK" --n_bins "$N_BINS" --deconfound "$DECONFOUND" \
+    --agg "$(echo $AGGS | cut -d' ' -f1)" --fg_min "$FG_MIN" \
     --shuffle --n_perm "$N_PERM" --seed "$SEED" --quiet \
     --output "$OUT_DIR/_control_shuffled.json" || true
 fi
@@ -155,9 +181,10 @@ for name, r in rows:
 ctrl = os.path.join(d, "_control_shuffled.json")
 if os.path.exists(ctrl):
     c = json.load(open(ctrl))
-    print(f"\n  control (shuffled labels): spearman="
-          f"{c.get('spearman_pred_vs_force'):.3f} "
-          f"perm_p={c.get('permutation_p_spearman')}")
+    cs = c.get("spearman_pred_vs_force")
+    print("\n  control (shuffled labels): spearman="
+          + ("n/a" if cs is None else f"{cs:.3f}")
+          + f" perm_p={c.get('permutation_p_spearman')}")
     if (c.get("permutation_p_spearman") or 1) < 0.05:
         print("  *** the shuffled control is SIGNIFICANT — the folds leak.")
         print("      Every number above is void until that is fixed.")
@@ -182,6 +209,9 @@ if nulls and len(nulls) == len(rows):
         print("    -> does NOT survive. The best row is what a sweep of this")
         print("       size produces by chance; do not report it as a finding.")
 else:
-    print("\n  (family-wise p unavailable — rerun with --n_perm > 0)")
+    print(f"\n  FAMILY-WISE p UNAVAILABLE: {len(nulls)} of {len(rows)} configs "
+          f"carry a null distribution.")
+    print("  Without it the best row is uncorrected and must NOT be reported as")
+    print("  a finding. Rerun the missing configs with --n_perm > 0.")
 PY
 echo "════════════════════════════════════════════════════════════════"
