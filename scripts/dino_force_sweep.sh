@@ -220,15 +220,28 @@ done
 ctrl_dir="$(ls -d "$FEAT_DIR/$(echo $MODALITIES | cut -d' ' -f1)_${FRAMINGS%%,*}_${NORM_SCOPE}"_* 2>/dev/null | head -1 || true)"
 if [ -n "$ctrl_dir" ] && [ -d "$ctrl_dir" ]; then
   echo "  [control: shuffled labels]"
+  # Use the SAME token set the sweep is testing. This was hardcoded to
+  # patch_mean while the configs used patch_mean_fg, so the leak canary
+  # validated a representation nobody was reporting on.
   python probe_force_features.py --features dino --feature_dir "$ctrl_dir" \
-    --token patch_mean --data_dir "$DATA_DIR" --metadata "$METADATA" \
+    --token "$(echo $TOKENS | cut -d' ' -f1)" \
+    --data_dir "$DATA_DIR" --metadata "$METADATA" \
     --target_col "$TARGET_COL" --group_cols "$GROUP_COLS" \
     --modality "$(echo $MODALITIES | cut -d' ' -f1)" \
     --task "$TASK" --n_bins "$N_BINS" --deconfound "$DECONFOUND" \
     --agg "$(echo $AGGS | cut -d' ' -f1)" --fg_min "$FG_MIN" \
     --aggregate "$AGGREGATE" --target_type "$TARGET_TYPE" \
     --shuffle --n_perm "$N_PERM" --seed "$SEED" --quiet \
-    --output "$OUT_DIR/_control_shuffled.json" || true
+    --output "$OUT_DIR/_control_shuffled.json" || ctrl_failed=1
+  if [ "${ctrl_failed:-0}" = "1" ]; then
+    echo "  *** THE SHUFFLED CONTROL FAILED TO RUN."
+    echo "      It was previously swallowed by '|| true', so a run could"
+    echo "      finish with no leak check and still print a ranked table."
+    echo "      Nothing below is validated until this runs clean."
+  fi
+else
+  echo "  *** NO SHUFFLED CONTROL: no feature dir matched"
+  echo "      $FEAT_DIR/<mod>_${FRAMINGS%%,*}_${NORM_SCOPE}_*"
 fi
 
 # ── Stage C: ranked table + family-wise max-statistic p ──
@@ -241,6 +254,11 @@ files = sorted(f for f in glob.glob(os.path.join(d, "*.json"))
                if not os.path.basename(f).startswith("_"))
 if not files:
     print("  (no results)"); raise SystemExit
+if not os.path.exists(os.path.join(d, "_control_shuffled.json")):
+    print("  *** NO SHUFFLED-LABEL CONTROL IN THIS RUN.")
+    print("      The control is what rules out fold leakage. Without it a")
+    print("      significant row cannot be distinguished from a broken split,")
+    print("      so treat everything below as unvalidated.")
 rows, nulls = [], []
 # A nominal label has no ordering, so rank correlation is not a result for it.
 # Rank and family-wise-correct on ACCURACY instead, against the accuracy null.
