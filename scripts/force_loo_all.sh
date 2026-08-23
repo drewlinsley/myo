@@ -52,11 +52,15 @@
 #                       run for a file that simply is not on disk. Set 0 to
 #                       fail instead — worth doing on a NEW drop, where many
 #                       unmatched rows would mean broken filename matching.
-#   NORM_SCOPE    (global)  volume|global. Per-volume percentile scaling
+#   NORM_SCOPE    (volume)  volume|global. Per-volume percentile scaling
 #                       rescales every tissue to [0,1] and ERASES absolute
 #                       brightness — a likely proxy for myotube density and
 #                       hence force. global keeps it. Refit per fold on
 #                       training replicates only, so it stays leak-free.
+#                       DEFAULT IS volume: scripts/probe_intensity.sh
+#                       showed intensity alone does NOT predict force
+#                       (perm p=0.15), so global has no demonstrated
+#                       benefit and carries a plate-confound risk.
 #   RECAL_BN      (32)  re-estimate BatchNorm stats over N training batches.
 #                       The warm-started encoder carries BRIGHTFIELD BN
 #                       stats; with input=gfp + frozen encoder they never
@@ -85,7 +89,7 @@ PATIENCE_FT="${PATIENCE_FT:-25}"
 MIN_EPOCHS="${MIN_EPOCHS:-20}"
 INNER_VAL="${INNER_VAL:-0.2}"
 ALLOW_PARTIAL="${ALLOW_PARTIAL:-1}"
-NORM_SCOPE="${NORM_SCOPE:-global}"
+NORM_SCOPE="${NORM_SCOPE:-volume}"
 RECAL_BN="${RECAL_BN:-32}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
 SEED="${SEED:-42}"

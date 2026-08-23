@@ -14,7 +14,7 @@
 #
 # Runs in seconds. Run this BEFORE spending GPU time on feature extraction.
 #
-# It runs four arms, and the last three exist to stop you believing the first:
+# It runs five arms, and the last four exist to stop you believing the first:
 #   1. real        GFP intensity -> force, leave-one-replicate-out
 #   2. shuffled    same, with permuted labels. MUST be at chance, or the
 #                  fold logic leaks and arm 1 means nothing.
@@ -25,6 +25,12 @@
 #                  confounded feature could earn for free.
 #   4. plate-CV    leave-one-PLATE-out, which does control for it. If arm 1 is
 #                  strong and arm 4 collapses, arm 1 was a batch effect.
+#   5. within-plate features AND force centered within each plate (train rows
+#                  only), so only within-plate variation is modelled. With just
+#                  4 plates, leave-one-plate-out has 4 folds and almost no
+#                  power; this keeps all 20 replicates while remaining immune to
+#                  batch by construction. THIS IS THE ARM THAT MATTERS: it is
+#                  the strongest confound-free question the dataset can answer.
 #
 # Usage:  bash scripts/probe_intensity.sh
 #         TASK=classification N_BINS=4 bash scripts/probe_intensity.sh
@@ -59,21 +65,25 @@ common=(--features stats --data_dir "$DATA_DIR" --metadata "$METADATA"
         --modality "$MODALITY" --task "$TASK" --n_bins "$N_BINS"
         --n_perm "$N_PERM" --seed "$SEED")
 
-echo ""; echo "▶ 1/4  real labels, leave-one-replicate-out"
+echo ""; echo "▶ 1/5  real labels, leave-one-replicate-out"
 python probe_force_features.py "${common[@]}" \
   --output "$OUT_DIR/intensity_real.json"
 
-echo ""; echo "▶ 2/4  SHUFFLED labels — leak check, must be at chance"
+echo ""; echo "▶ 2/5  SHUFFLED labels — leak check, must be at chance"
 python probe_force_features.py "${common[@]}" --shuffle --quiet \
   --output "$OUT_DIR/intensity_shuffled.json"
 
-echo ""; echo "▶ 3/4  plate canary — what plate identity alone earns"
+echo ""; echo "▶ 3/5  plate canary — what plate identity alone earns"
 python probe_force_features.py "${common[@]}" --canary plate --quiet \
   --output "$OUT_DIR/intensity_canary_plate.json"
 
-echo ""; echo "▶ 4/4  leave-one-PLATE-out — controls for acquisition batch"
+echo ""; echo "▶ 4/5  leave-one-PLATE-out — controls for acquisition batch"
 python probe_force_features.py "${common[@]}" --cv_group plate --quiet \
   --output "$OUT_DIR/intensity_plateCV.json"
+
+echo ""; echo "▶ 5/5  WITHIN-PLATE — batch removed, all 20 replicates kept"
+python probe_force_features.py "${common[@]}" --deconfound plate --quiet \
+  --output "$OUT_DIR/intensity_withinplate.json"
 
 echo ""; echo "▶ verdict"
 python - "$OUT_DIR" <<'PY'
@@ -83,7 +93,8 @@ def load(n):
     p = os.path.join(d, f"intensity_{n}.json")
     return json.load(open(p)) if os.path.exists(p) else None
 rows = [("real", load("real")), ("shuffled", load("shuffled")),
-        ("canary plate", load("canary_plate")), ("plate-CV", load("plateCV"))]
+        ("canary plate", load("canary_plate")), ("plate-CV", load("plateCV")),
+        ("within-plate", load("withinplate"))]
 print(f"  {'arm':14s} {'n':>3} {'acc':>6} {'chance':>7} {'binom_p':>8} "
       f"{'spearman':>9} {'perm_p':>7}")
 for name, r in rows:
@@ -96,7 +107,7 @@ for name, r in rows:
           f"{f(r.get('permutation_p_spearman'),4):>7}")
 
 real, sh = rows[0][1], rows[1][1]
-can, pcv = rows[2][1], rows[3][1]
+can, pcv, wip = rows[2][1], rows[3][1], rows[4][1]
 print("")
 if sh and sh.get("permutation_p_spearman", 1) < 0.05:
     print("  *** SHUFFLED labels beat chance — the folds LEAK. Every other")
@@ -121,5 +132,31 @@ elif real:
         print("  --norm_scope global is unlikely to rescue the models on its")
         print("  own. Weight the DINO work toward richer features (framing,")
         print("  pooling, foreground) rather than toward intensity recovery.")
+
+if can and can.get("permutation_p_spearman") is not None \
+        and can["permutation_p_spearman"] < 0.05:
+    print("")
+    print(f"  PLATE CONFOUND: plate identity alone predicts force "
+          f"(acc {can['replicate_accuracy']:.3f} vs chance "
+          f"{can['chance']:.3f}, perm p={can['permutation_p_spearman']:.4f}).")
+    print("  Leave-one-REPLICATE-out therefore cannot validate anything here:")
+    print("  any feature encoding acquisition batch scores above chance with no")
+    print("  biology in it. Read the within-plate arm instead.")
+
+if wip:
+    wp = wip.get("permutation_p_spearman")
+    print("")
+    wr = wip.get("spearman_pred_vs_force")
+    print("  WITHIN-PLATE (the confound-free question): spearman="
+          + ("n/a" if wr is None else f"{wr:.3f}")
+          + (f"  perm p={wp:.4f}" if wp is not None else ""))
+    if wp is not None and wp < 0.05:
+        print("  -> Inside a single batch, this feature ranks which tissues pull")
+        print("     harder. That is a real result and cannot be a plate effect.")
+    else:
+        print("  -> No within-plate signal. Combined with the arms above, force")
+        print("     is a plate-level property in this drop, so a model trained")
+        print("     here would be learning batch, not biology. More plates is")
+        print("     the fix, not a bigger encoder.")
 PY
 echo "════════════════════════════════════════════════════════════════"
