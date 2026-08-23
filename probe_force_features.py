@@ -549,6 +549,17 @@ def main():
             out["null_accuracy_mean"] = float(null_acc.mean())
         out["n_permutations"] = int(len(null_acc))
 
+    _bp = {}
+    for g, f in zip(vol_group, vol_force):
+        _bp.setdefault(plate_of(g), {})[g] = float(f)
+    _allf = np.array([v for d in _bp.values() for v in d.values()])
+    _gm = _allf.mean()
+    _sst = ((_allf - _gm) ** 2).sum()
+    _ssb = sum(len(d) * (np.mean(list(d.values())) - _gm) ** 2
+               for d in _bp.values())
+    out = dict(out)
+    out["eta2_plate"] = float(_ssb / _sst) if _sst > 0 else None
+    out["n_plates"] = len(_bp)
     out.update({"deconfound": args.deconfound,
                 "features": args.features, "modality": args.modality,
                 "target_col": args.target_col, "cv_group": args.cv_group,
@@ -565,7 +576,8 @@ def main():
     print(f"\n  LOO n={out['n_replicates']}  "
           f"acc={out['replicate_accuracy']:.3f} (chance {out['chance']:.3f}, "
           f"{out['n_correct']}/{out['n_replicates']})  "
-          f"binom_p={out['binomial_p']:.4f}")
+          f"binom_p={out['binomial_p']:.4f} [anti-conservative: assumes 20 "
+          f"independent trials; trust perm_p]")
     print(f"  spearman(pred, true force) = {out['spearman_pred_vs_force']:.3f}"
           + (f"   perm_p={out['permutation_p_spearman']:.4f}"
              if "permutation_p_spearman" in out else ""))

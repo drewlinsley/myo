@@ -133,15 +133,22 @@ elif real:
         print("  own. Weight the DINO work toward richer features (framing,")
         print("  pooling, foreground) rather than toward intensity recovery.")
 
-if can and can.get("permutation_p_spearman") is not None \
-        and can["permutation_p_spearman"] < 0.05:
+e2 = (real or {}).get("eta2_plate")
+npl = (real or {}).get("n_plates")
+if e2 is not None:
     print("")
-    print(f"  PLATE CONFOUND: plate identity alone predicts force "
-          f"(acc {can['replicate_accuracy']:.3f} vs chance "
-          f"{can['chance']:.3f}, perm p={can['permutation_p_spearman']:.4f}).")
-    print("  Leave-one-REPLICATE-out therefore cannot validate anything here:")
-    print("  any feature encoding acquisition batch scores above chance with no")
-    print("  biology in it. Read the within-plate arm instead.")
+    print(f"  between-plate share of force variance: eta^2 = {e2:.3f} "
+          f"over {npl} plates")
+    if e2 > 0.5:
+        print("  PLATE CONFOUND (by EFFECT SIZE, not p-value — with so few")
+        print("  plates no p-value can settle it): most of this target's")
+        print("  variance is between plates, so leave-one-REPLICATE-out cannot")
+        print("  validate anything. Any feature encoding acquisition batch")
+        print("  scores above chance with no biology in it. Read the")
+        print("  within-plate arm, and check inventory_metadata.py for a")
+        print("  target column with lower eta^2.")
+    else:
+        print("  Most variance is WITHIN plates — this target is well posed.")
 
 if wip:
     wp = wip.get("permutation_p_spearman")
