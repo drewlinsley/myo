@@ -52,6 +52,16 @@
 #                       run for a file that simply is not on disk. Set 0 to
 #                       fail instead — worth doing on a NEW drop, where many
 #                       unmatched rows would mean broken filename matching.
+#   NORM_SCOPE    (global)  volume|global. Per-volume percentile scaling
+#                       rescales every tissue to [0,1] and ERASES absolute
+#                       brightness — a likely proxy for myotube density and
+#                       hence force. global keeps it. Refit per fold on
+#                       training replicates only, so it stays leak-free.
+#   RECAL_BN      (32)  re-estimate BatchNorm stats over N training batches.
+#                       The warm-started encoder carries BRIGHTFIELD BN
+#                       stats; with input=gfp + frozen encoder they never
+#                       adapt. 0 disables.
+#   WEIGHT_DECAY  (0.05)  L2 on the linear head (2048-d features, ~20 tissues)
 #   SEED          (42)
 #   FORCE         (0)    1 = ignore cached folds and recompute
 #   PLAN_ONLY     (0)
@@ -75,6 +85,9 @@ PATIENCE_FT="${PATIENCE_FT:-25}"
 MIN_EPOCHS="${MIN_EPOCHS:-20}"
 INNER_VAL="${INNER_VAL:-0.2}"
 ALLOW_PARTIAL="${ALLOW_PARTIAL:-1}"
+NORM_SCOPE="${NORM_SCOPE:-global}"
+RECAL_BN="${RECAL_BN:-32}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
 SEED="${SEED:-42}"
 FORCE="${FORCE:-0}"
 PLAN_ONLY="${PLAN_ONLY:-0}"
@@ -108,6 +121,11 @@ echo "════════════════════════�
 echo " Force, leave-one-replicate-out"
 echo "   data=$DATA_DIR  metadata=$METADATA"
 echo "   target=$TARGET_COL  groups=$GROUP_COLS"
+echo "   norm_scope=$NORM_SCOPE  recal_bn=$RECAL_BN  wd=$WEIGHT_DECAY"
+[ "$NORM_SCOPE" = "global" ] && echo "   NOTE: global normalization is a HYPOTHESIS under test — run
+         bash scripts/probe_intensity.sh (seconds, no GPU) first; it
+         says whether intensity predicts force and whether any gain is
+         really an acquisition-batch (plate) effect."
 echo "   n_bins=$N_BINS (chance $(python -c "print(f'{1/$N_BINS:.3f}')"))"
 echo "   arms=[$ARMS]  modes=[$MODES]  seed=$SEED  allow_partial=$ALLOW_PARTIAL"
 [ "$ALLOW_PARTIAL" = "1" ] && echo "   (check the match report below: expect ~53 matched / 20 replicates)"
@@ -163,6 +181,8 @@ run_arm() {
   python train_loo_force_classifier.py -c "$cfg" \
     --metadata "$METADATA" --target_col "$TARGET_COL" \
     --group_cols "$GROUP_COLS" \
+    --norm_scope "$NORM_SCOPE" --recalibrate_bn "$RECAL_BN" \
+    --weight_decay "$WEIGHT_DECAY" \
     --data_dir "$DATA_DIR" --input "$input" \
     --cv_unit replicate --n_bins "$N_BINS" \
     --epochs "$epochs" --patience "$patience" --min_epochs "$MIN_EPOCHS" \

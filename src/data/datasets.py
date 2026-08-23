@@ -322,16 +322,18 @@ class VolumeDataset(BaseDataset):
         # no-op on the already-exact-size patch).
         self.patch_sampling = patch_sampling
 
-    def _fast_ok(self):
-        # per_z normalizes each FULL slice before cropping — percentiles over a
-        # crop differ, so that mode must keep the slow full-volume path.
-        return super()._fast_ok() and self.gfp_norm_mode != "per_z"
-
-        # Build index: (file_idx, patch_idx)
+        # Build index: (file_idx, patch_idx). This MUST stay in __init__ —
+        # it previously sat below _fast_ok's return, where it was unreachable
+        # and left index_map unassigned (so __len__ raised AttributeError).
         self.index_map = []
         for i in range(len(bf_files)):
             for p in range(patches_per_volume):
                 self.index_map.append((i, p))
+
+    def _fast_ok(self):
+        # per_z normalizes each FULL slice before cropping — percentiles over a
+        # crop differ, so that mode must keep the slow full-volume path.
+        return super()._fast_ok() and self.gfp_norm_mode != "per_z"
 
     def __len__(self):
         return len(self.index_map)

@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.normalization import normalize
+from src.data.normalization import global_percentiles
 from src.data.zband import resolve_z_range
 
 
@@ -19,7 +20,18 @@ class VolumeRegressionDataset(Dataset):
                  transform=None, z_range=None, apply_timm=True,
                  percentile_clip=(0.5, 99.5),
                  mode="2d", patch_depth=32, patches_per_volume=32,
-                 crop_size=256, modality="bf"):
+                 crop_size=256, modality="bf", norm_scope="volume",
+                 global_pct=None):
+        """
+        norm_scope: "volume" (default, historical) normalizes each volume by its
+            OWN percentiles, which rescales every tissue to [0,1] and therefore
+            ERASES absolute brightness — the most plausible proxy for myotube
+            density and hence force. "global" uses one dataset-wide pair so
+            relative brightness between tissues survives.
+        global_pct: optional (p_low, p_high) to use when norm_scope="global".
+            Pass TRAINING-fold percentiles to keep the statistic leak-free;
+            when None it is pooled from every stats JSON in stats_dir.
+        """
         self.files = files
         self.stats_dir = stats_dir
         self.transform = transform
@@ -31,6 +43,16 @@ class VolumeRegressionDataset(Dataset):
         self.patches_per_volume = patches_per_volume
         self.crop_size = crop_size
         self.modality = modality
+
+        if norm_scope not in ("volume", "global"):
+            raise ValueError(f"norm_scope must be 'volume' or 'global', "
+                             f"got {norm_scope!r}")
+        self.norm_scope = norm_scope
+        if norm_scope == "global":
+            self.global_pct = (tuple(global_pct) if global_pct is not None
+                               else global_percentiles(stats_dir, modality))
+        else:
+            self.global_pct = None
 
         self.stats = []
         self.target_vals = []
@@ -89,10 +111,12 @@ class VolumeRegressionDataset(Dataset):
         return raw
 
     def _normalize(self, patch, file_idx):
-        st = self.stats[file_idx]
-        return normalize(patch, st[self.modality]["p_low"],
-                         st[self.modality]["p_high"],
-                         apply_timm=self.apply_timm)
+        if self.global_pct is not None:
+            p_low, p_high = self.global_pct
+        else:
+            st = self.stats[file_idx][self.modality]
+            p_low, p_high = st["p_low"], st["p_high"]
+        return normalize(patch, p_low, p_high, apply_timm=self.apply_timm)
 
     def __getitem__(self, idx):
         file_idx, slot = self.index_map[idx]

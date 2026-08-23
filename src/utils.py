@@ -204,6 +204,68 @@ def load_train_state(path, model, optimizer=None, scheduler=None,
     return st
 
 
+def recalibrate_bn(model, loader, n_batches=32, device=None, input_fn=None):
+    """Re-estimate BatchNorm running statistics on a new input distribution.
+
+    Why this exists
+    ---------------
+    load_encoder_from_unet copies BN running_mean/running_var along with the
+    weights, and those are BRIGHTFIELD statistics — the BF->GFP U-Net encoder
+    only ever saw BF. A force probe run with --input gfp feeds that encoder a
+    different modality, and --freeze_encoder holds encoder.eval() every epoch,
+    so the stale BF statistics can never adapt. This runs forward passes in
+    train() mode under no_grad so ONLY the running estimates move; no weight is
+    touched and no gradient is taken.
+
+    momentum=None makes each BN use a cumulative moving average, so the result
+    is the true mean/var over the batches seen rather than an EMA that depends
+    on batch order.
+
+    Args:
+        model: the model (or submodule) whose BN layers should be recalibrated.
+        loader: yields batches; input_fn extracts the tensor to feed.
+        n_batches: how many batches to average over.
+        device: device to move inputs to (default: the model's first param).
+        input_fn: batch -> input tensor. Default takes batch[0] for a
+            sequence, else the batch itself.
+
+    Returns:
+        The number of BN modules that were recalibrated.
+    """
+    bns = [m for m in model.modules()
+           if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    if not bns or n_batches <= 0:
+        return 0
+
+    if device is None:
+        device = next(model.parameters()).device
+    if input_fn is None:
+        def input_fn(b):
+            return b[0] if isinstance(b, (list, tuple)) else b
+
+    was_training = model.training
+    saved = []
+    for m in bns:
+        saved.append(m.momentum)
+        m.momentum = None          # cumulative average
+        m.reset_running_stats()
+        m.train()
+
+    seen = 0
+    with torch.no_grad():
+        for batch in loader:
+            model(input_fn(batch).to(device))
+            seen += 1
+            if seen >= n_batches:
+                break
+
+    for m, mom in zip(bns, saved):
+        m.momentum = mom
+        m.eval()
+    model.train(was_training)
+    return len(bns)
+
+
 def resolve_resume(flag, default_path):
     """Map a --resume value to a path to load, or None.
 

@@ -67,7 +67,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.config import load_config, validate_config
-from src.utils import set_seed, prepare_env
+from src.utils import set_seed, prepare_env, recalibrate_bn
+from src.data.normalization import global_percentiles
 from src.data.regression_dataset import VolumeRegressionDataset
 from src.data.grouping import stem_to_group
 from src.models.gfp_classifier import build_gfp_classifier
@@ -248,6 +249,24 @@ def main():
                    help="Modality fed to the encoder (force-from-GFP => gfp)")
     p.add_argument("--data_dir", default=None,
                    help="Override cfg.data.data_dir (root with <input>/ + stats/)")
+    p.add_argument("--norm_scope", choices=["volume", "global"], default="volume",
+                   help="'volume' (default) normalizes each volume by its OWN "
+                        "percentiles, which rescales every tissue to [0,1] and "
+                        "erases absolute brightness — a likely proxy for "
+                        "myotube density and hence force. 'global' uses one "
+                        "dataset-wide pair so relative brightness survives. "
+                        "Under LOO the pair is refit per fold on TRAINING "
+                        "replicates only, so it stays leak-free.")
+    p.add_argument("--recalibrate_bn", type=int, default=0, metavar="N",
+                   help="Before training, re-estimate BatchNorm running stats "
+                        "over N training batches. The warm-started encoder "
+                        "carries BRIGHTFIELD BN statistics; with --input gfp "
+                        "and --freeze_encoder those never adapt. 0 disables. "
+                        "Try 32.")
+    p.add_argument("--weight_decay", type=float, default=None,
+                   help="Override training.weight_decay. With --freeze_encoder "
+                        "this is the L2 on the linear head, which fits 2048-d "
+                        "features from ~20 tissues — try 0.05.")
     p.add_argument("--freeze_encoder", action="store_true",
                    help="Linear-probe mode: freeze the encoder (incl. BN running "
                         "stats) and train only the classification head. With "
@@ -416,7 +435,7 @@ def main():
     warm_started = bool(args.init_from)
     eval_seed = seed + 9973  # fixed → deterministic eval patches
 
-    def make_ds(stem_list, train, targets):
+    def make_ds(stem_list, train, targets, global_pct=None):
         return VolumeRegressionDataset(
             [os.path.join(mod_dir, f"{s}.npy") for s in stem_list],
             stats_dir=stats_dir, targets=targets,
@@ -426,7 +445,8 @@ def main():
             patch_depth=dcfg.get("patch_depth", 32),
             patches_per_volume=(dcfg.get("patches_per_volume", 32)
                                 if train else 8),
-            crop_size=dcfg.get("crop_size", 256), modality=args.input)
+            crop_size=dcfg.get("crop_size", 256), modality=args.input,
+            norm_scope=args.norm_scope, global_pct=global_pct)
 
     epochs = args.epochs or tcfg.get("epochs", 100)
     patience = args.patience or tcfg.get("patience", 15)
@@ -441,6 +461,13 @@ def main():
         held_stems = groups[held_g]
         train_groups = [g for g in group_keys if g != held_g]
         train_stems = [s for g in train_groups for s in groups[g]]
+
+        # Global normalization must be refit per fold on TRAINING replicates
+        # only — pooling percentiles over the held-out tissue would leak its
+        # brightness, which is precisely the signal we are testing for.
+        fold_global_pct = (global_percentiles(stats_dir, args.input,
+                                              stems=train_stems)
+                           if args.norm_scope == "global" else None)
 
         # ── Per-fold, TRAIN-ONLY discretization (no held-out leak) ──
         fold_edges = compute_bin_edges(
@@ -546,28 +573,41 @@ def main():
 
         optimizer = torch.optim.AdamW(
             trainable, lr=lr,
-            weight_decay=tcfg.get("weight_decay", 0.01))
+            weight_decay=(args.weight_decay if args.weight_decay is not None
+                          else tcfg.get("weight_decay", 0.01)))
         criterion = nn.CrossEntropyLoss()
 
         gen = torch.Generator()
         gen.manual_seed(seed * 1000 + fold_idx)
         train_loader = torch.utils.data.DataLoader(
-            make_ds(inner_train, True, fold_targets),
+            make_ds(inner_train, True, fold_targets, fold_global_pct),
             batch_size=tcfg["batch_size"], shuffle=True, drop_last=True,
             pin_memory=True, num_workers=tcfg.get("num_workers", 4),
             worker_init_fn=_seed_worker, generator=gen)
         # Eval loaders: plain DataLoaders, num_workers=0, NOT routed through
         # Accelerate (keeps per-volume aggregation exact + RNG controllable).
         predict_loader = torch.utils.data.DataLoader(
-            make_ds(held_stems, False, fold_targets),
+            make_ds(held_stems, False, fold_targets, fold_global_pct),
             batch_size=tcfg["batch_size"], shuffle=False, num_workers=0)
         inner_val_loader = (torch.utils.data.DataLoader(
-            make_ds(inner_val, False, fold_targets),
+            make_ds(inner_val, False, fold_targets, fold_global_pct),
             batch_size=tcfg["batch_size"], shuffle=False, num_workers=0)
             if inner_val else None)
 
         model, optimizer, train_loader = accelerator.prepare(
             model, optimizer, train_loader)
+
+        # The warm-started encoder carries BF BatchNorm statistics (the U-Net
+        # only ever saw brightfield). With --input gfp and --freeze_encoder,
+        # encoder.eval() pins them there forever. Re-estimate them on this
+        # fold's TRAINING batches before any weight moves.
+        if args.recalibrate_bn > 0:
+            n_bn = recalibrate_bn(accelerator.unwrap_model(model), train_loader,
+                                  n_batches=args.recalibrate_bn, device=device)
+            if fold_idx == 0:
+                accelerator.print(
+                    f"  recalibrate_bn: re-estimated {n_bn} BatchNorm layer(s) "
+                    f"over {args.recalibrate_bn} batch(es) of {args.input}")
 
         def eval_loss_on(loader):
             model.eval()
@@ -788,6 +828,10 @@ def main():
         "input": args.input, "dims": dims,
         "init_from": args.init_from, "warm_started": warm_started,
         "freeze_encoder": bool(args.freeze_encoder),
+        "norm_scope": args.norm_scope,
+        "recalibrate_bn": int(args.recalibrate_bn),
+        "weight_decay": (float(args.weight_decay)
+                         if args.weight_decay is not None else None),
         "seed": int(seed), "cv_unit": args.cv_unit,
         "n_bins": n_bins, "bin_scheme": args.bin_scheme,
         "edges_are_per_fold": True,

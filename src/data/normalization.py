@@ -78,3 +78,56 @@ def denormalize(data, p_low, p_high, applied_timm=False):
 
     data = data * (p_high - p_low) + p_low
     return data
+
+
+def global_percentiles(stats_dir, modality, stems=None):
+    """Dataset-wide (p_low, p_high) pooled across every per-volume stats JSON.
+
+    Why this exists
+    ---------------
+    The default per-volume normalization clips each volume to ITS OWN
+    percentiles and rescales to [0, 1], so a dim sparse tissue and a bright
+    dense one both end up spanning the same range. That erases absolute
+    intensity — which, for GFP/phalloidin, is the most plausible proxy for
+    myotube density and therefore for contraction force. Normalizing every
+    volume by one shared pair keeps relative brightness between tissues.
+
+    p_low is the min over volumes and p_high the max, so no volume is clipped
+    harder than it was before; the trade is a narrower effective dynamic range
+    for dim volumes, which is exactly the signal we want to preserve.
+
+    Args:
+        stats_dir: directory of <stem>.json files written by compute_stats.py
+        modality: "bf" or "gfp"
+        stems: optional list of stems to restrict to (default: every JSON).
+            Pass the TRAINING stems only if you need the statistic to be
+            leak-free with respect to a held-out split.
+
+    Returns:
+        (p_low, p_high) floats.
+    """
+    import glob as _glob
+    import json as _json
+    import os as _os
+
+    if stems is None:
+        paths = sorted(_glob.glob(_os.path.join(stats_dir, "*.json")))
+    else:
+        paths = [_os.path.join(stats_dir, f"{s}.json") for s in stems]
+
+    lows, highs = [], []
+    for p in paths:
+        if not _os.path.exists(p):
+            continue
+        with open(p) as f:
+            st = _json.load(f)
+        if modality not in st:
+            continue
+        lows.append(float(st[modality]["p_low"]))
+        highs.append(float(st[modality]["p_high"]))
+
+    if not lows:
+        raise ValueError(
+            f"global_percentiles: no stats JSON in {stats_dir} carried a "
+            f"'{modality}' entry (looked at {len(paths)} file(s)).")
+    return float(min(lows)), float(max(highs))

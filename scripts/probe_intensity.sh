@@ -1,0 +1,125 @@
+#!/bin/bash
+# Stage 0 — the zero-GPU test of the intensity hypothesis.
+#
+# The claim under test: per-volume percentile normalization
+# (src/data/normalization.py) rescales every tissue to [0,1] and therefore
+# erases absolute GFP brightness — a plausible proxy for myotube density and
+# hence contraction force.
+#
+# That claim is testable with NO GPU and NO features, because compute_stats.py
+# already wrote each volume's p_low/p_high to disk. If absolute brightness
+# predicts force, then those scalars alone should show leave-one-replicate-out
+# signal. If they don't, per-volume normalization probably wasn't what was
+# holding the models back, and the DINOv2 work should be aimed elsewhere.
+#
+# Runs in seconds. Run this BEFORE spending GPU time on feature extraction.
+#
+# It runs four arms, and the last three exist to stop you believing the first:
+#   1. real        GFP intensity -> force, leave-one-replicate-out
+#   2. shuffled    same, with permuted labels. MUST be at chance, or the
+#                  fold logic leaks and arm 1 means nothing.
+#   3. canary      one-hot PLATE identity as the only feature. Absolute
+#                  intensity carries exposure/gain/staining batch effects, and
+#                  replicates share plates, so leave-one-replicate-out does NOT
+#                  control for plate. This measures what a purely batch-
+#                  confounded feature could earn for free.
+#   4. plate-CV    leave-one-PLATE-out, which does control for it. If arm 1 is
+#                  strong and arm 4 collapses, arm 1 was a batch effect.
+#
+# Usage:  bash scripts/probe_intensity.sh
+#         TASK=classification N_BINS=4 bash scripts/probe_intensity.sh
+
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+DATA_DIR="${DATA_DIR:-data_phalloidin_mhc_051826_staged}"
+METADATA="${METADATA:-phalloidin_mhc_mapping_051426_SS edit.xlsx}"
+TARGET_COL="${TARGET_COL:-peak_amplitude_week3}"
+GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
+MODALITY="${MODALITY:-gfp}"
+TASK="${TASK:-regression}"
+N_BINS="${N_BINS:-4}"
+N_PERM="${N_PERM:-1000}"
+SEED="${SEED:-42}"
+OUT_DIR="${OUT_DIR:-results/probe_intensity}"
+
+[ -d "$DATA_DIR" ] || { echo "ERROR: DATA_DIR $DATA_DIR not found" >&2; exit 1; }
+[ -f "$METADATA" ] || { echo "ERROR: METADATA '$METADATA' not found" >&2; exit 1; }
+
+mkdir -p "$OUT_DIR"
+echo "════════════════════════════════════════════════════════════════"
+echo " Stage 0: does absolute intensity predict force?  (no GPU)"
+echo "   data=$DATA_DIR  modality=$MODALITY  target=$TARGET_COL"
+echo "   task=$TASK  n_bins=$N_BINS  perms=$N_PERM"
+echo "════════════════════════════════════════════════════════════════"
+
+common=(--features stats --data_dir "$DATA_DIR" --metadata "$METADATA"
+        --target_col "$TARGET_COL" --group_cols "$GROUP_COLS"
+        --modality "$MODALITY" --task "$TASK" --n_bins "$N_BINS"
+        --n_perm "$N_PERM" --seed "$SEED")
+
+echo ""; echo "▶ 1/4  real labels, leave-one-replicate-out"
+python probe_force_features.py "${common[@]}" \
+  --output "$OUT_DIR/intensity_real.json"
+
+echo ""; echo "▶ 2/4  SHUFFLED labels — leak check, must be at chance"
+python probe_force_features.py "${common[@]}" --shuffle --quiet \
+  --output "$OUT_DIR/intensity_shuffled.json"
+
+echo ""; echo "▶ 3/4  plate canary — what plate identity alone earns"
+python probe_force_features.py "${common[@]}" --canary plate --quiet \
+  --output "$OUT_DIR/intensity_canary_plate.json"
+
+echo ""; echo "▶ 4/4  leave-one-PLATE-out — controls for acquisition batch"
+python probe_force_features.py "${common[@]}" --cv_group plate --quiet \
+  --output "$OUT_DIR/intensity_plateCV.json"
+
+echo ""; echo "▶ verdict"
+python - "$OUT_DIR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+def load(n):
+    p = os.path.join(d, f"intensity_{n}.json")
+    return json.load(open(p)) if os.path.exists(p) else None
+rows = [("real", load("real")), ("shuffled", load("shuffled")),
+        ("canary plate", load("canary_plate")), ("plate-CV", load("plateCV"))]
+print(f"  {'arm':14s} {'n':>3} {'acc':>6} {'chance':>7} {'binom_p':>8} "
+      f"{'spearman':>9} {'perm_p':>7}")
+for name, r in rows:
+    if not r:
+        print(f"  {name:14s}  (missing)"); continue
+    f = lambda x, k=3: "    n/a" if x is None else f"{x:.{k}f}"
+    print(f"  {name:14s} {r['n_replicates']:>3} {f(r['replicate_accuracy']):>6} "
+          f"{f(r['chance']):>7} {f(r.get('binomial_p'),4):>8} "
+          f"{f(r.get('spearman_pred_vs_force')):>9} "
+          f"{f(r.get('permutation_p_spearman'),4):>7}")
+
+real, sh = rows[0][1], rows[1][1]
+can, pcv = rows[2][1], rows[3][1]
+print("")
+if sh and sh.get("permutation_p_spearman", 1) < 0.05:
+    print("  *** SHUFFLED labels beat chance — the folds LEAK. Every other")
+    print("      number here is void. Fix that before reading anything else.")
+elif real:
+    p = real.get("permutation_p_spearman", 1.0)
+    if p < 0.05:
+        print(f"  Intensity alone predicts force (perm p={p:.4f}).")
+        print("  Per-volume normalization WAS discarding real signal —")
+        print("  --norm_scope global is justified. Before believing it, check:")
+        if can:
+            print(f"    - plate canary spearman = "
+                  f"{can.get('spearman_pred_vs_force')}: if that is comparable,")
+            print("      this is an acquisition batch effect, not biology.")
+        if pcv:
+            print(f"    - leave-one-plate-out spearman = "
+                  f"{pcv.get('spearman_pred_vs_force')}: if this collapses,")
+            print("      the replicate-level result was carried by plate.")
+    else:
+        print(f"  Intensity alone does NOT predict force (perm p={p:.4f}).")
+        print("  Per-volume normalization is probably not the bottleneck, so")
+        print("  --norm_scope global is unlikely to rescue the models on its")
+        print("  own. Weight the DINO work toward richer features (framing,")
+        print("  pooling, foreground) rather than toward intensity recovery.")
+PY
+echo "════════════════════════════════════════════════════════════════"
