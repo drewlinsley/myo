@@ -239,6 +239,26 @@ def recalibrate_bn(model, loader, n_batches=32, device=None, input_fn=None):
     if not bns or n_batches <= 0:
         return 0
 
+    # Multi-GPU is NOT supported and fails silently rather than loudly, so
+    # refuse it. Each rank would see only its own shard of the prepared loader
+    # and estimate BN statistics from 1/N of the data with no all-reduce; DDP's
+    # broadcast_buffers=True would then overwrite every rank with rank 0's
+    # buffers at the first training forward. The result is "rank 0's few
+    # batches" masquerading as a global estimate — wrong, and invisible.
+    if (torch.distributed.is_available() and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1):
+        raise RuntimeError(
+            f"recalibrate_bn does not support distributed training "
+            f"(world_size={torch.distributed.get_world_size()}). Each rank "
+            f"would estimate BatchNorm statistics from its own shard with no "
+            f"all-reduce, and broadcast_buffers would then replace them all "
+            f"with rank 0's — a silently wrong estimate.\n"
+            f"  Either run single-GPU (CUDA_VISIBLE_DEVICES=0), or pass "
+            f"--recalibrate_bn 0 to disable it.\n"
+            f"  To add support: wrap the update in "
+            f"torch.distributed.all_reduce over each BN's running_mean/"
+            f"running_var, weighted by each rank's sample count.")
+
     if device is None:
         device = next(model.parameters()).device
     if input_fn is None:

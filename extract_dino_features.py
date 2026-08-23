@@ -120,7 +120,7 @@ def encode_views(ctx, views, view_masks, device, batch_size, amp=True,
 
     model = ctx["model"]
     n_prefix, patch = ctx["n_prefix"], ctx["patch"]
-    out_cls, out_pm, out_ps, out_fg, out_grid = [], [], [], [], []
+    out_cls, out_pm, out_ps, out_fg, out_fgs, out_grid = [], [], [], [], [], []
     use_amp = amp and device.type == "cuda"
 
     for i in range(0, len(views), batch_size):
@@ -173,25 +173,74 @@ def encode_views(ctx, views, view_masks, device, batch_size, amp=True,
             if empty.any():
                 fg[empty] = pt[empty].mean(dim=1)
             out_fg.append(fg.cpu().numpy())
+            # foreground-weighted dispersion (the fg analogue of patch_std)
+            var = ((pt - fg.unsqueeze(1)) ** 2 * w).sum(dim=1) / wsum.clamp(min=1e-6)
+            fgs = var.clamp(min=0).sqrt()
+            if empty.any():
+                fgs[empty] = pt[empty].std(dim=1)
+            out_fgs.append(fgs.cpu().numpy())
 
     res = {"cls": np.concatenate(out_cls).astype(np.float16),
            "patch_mean": np.concatenate(out_pm).astype(np.float16),
            "patch_std": np.concatenate(out_ps).astype(np.float16)}
     if out_fg:
         res["patch_mean_fg"] = np.concatenate(out_fg).astype(np.float16)
+        res["patch_std_fg"] = np.concatenate(out_fgs).astype(np.float16)
     if out_grid:
         res["patch_grid"] = np.concatenate(out_grid).astype(np.float16)
     return res
 
 
-def foreground_mask(raw, method, dilate, min_frac):
+def global_mask_threshold(stems, mask_dir, stats_dir, z_range, z_stride,
+                          method, sample=12):
+    """One foreground threshold for the whole dataset.
+
+    compute_bf_foreground_mask thresholds PER VOLUME, which makes
+    `view_fg_frac` incomparable across volumes: a fixed --fg_min would then
+    drop systematically more tiles from volumes that happened to threshold
+    high, and that bias could easily correlate with tissue density — i.e. with
+    the label. Taking the median per-volume threshold over a sample gives one
+    physical intensity cutoff that means the same thing everywhere.
+    """
+    from src.data.foreground_mask import _threshold
+
+    picks = stems[::max(1, len(stems) // max(1, sample))][:sample]
+    vals = []
+    for stem in picks:
+        mpath = os.path.join(mask_dir, f"{stem}.npy")
+        spath = os.path.join(stats_dir, f"{stem}.json")
+        if not (os.path.exists(mpath) and os.path.exists(spath)):
+            continue
+        with open(spath) as f:
+            st = json.load(f)
+        mv = np.load(mpath, mmap_mode="r")
+        n_z = mv.shape[0]
+        z_lo, z_hi = ((0, n_z) if z_range is None
+                      else resolve_z_range(z_range, st, n_z))
+        band = np.asarray(mv[z_lo:z_hi][::max(1, z_stride)])
+        try:
+            vals.append(_threshold(band, method))
+        except Exception:
+            continue
+    if not vals:
+        return None
+    return float(np.median(vals))
+
+
+def foreground_mask(raw, method, dilate, min_frac, threshold=None):
     """BF/GFP foreground mask, tolerant of threshold failures.
 
     threshold_minimum raises RuntimeError when it cannot find two histogram
     maxima, which happens on near-black GFP backgrounds. Fall back rather than
     killing a multi-hour extraction, and record that it happened.
     """
-    from src.data.foreground_mask import compute_bf_foreground_mask
+    from src.data.foreground_mask import (compute_bf_foreground_mask,
+                                          _cleanup_per_slice)
+    if threshold is not None:
+        mask = raw > threshold
+        if dilate or min_frac > 0:
+            mask = _cleanup_per_slice(mask, dilate, min_frac)
+        return mask, None
     try:
         return compute_bf_foreground_mask(raw, method=method, dilate=dilate,
                                           min_component_frac=min_frac), None
@@ -239,6 +288,13 @@ def main():
                         "intensity being measured.")
     p.add_argument("--mask_method", default="li",
                    choices=["minimum", "otsu", "li", "triangle"])
+    p.add_argument("--mask_scope", choices=["global", "volume"], default="global",
+                   help="'global' (default) uses ONE dataset-wide intensity "
+                        "threshold, so view_fg_frac means the same thing in "
+                        "every volume and --fg_min is a comparable cutoff. "
+                        "'volume' thresholds each volume separately, which "
+                        "makes a fixed --fg_min drop unequal fractions across "
+                        "volumes.")
     p.add_argument("--mask_dilate", type=int, default=0)
     p.add_argument("--mask_min_frac", type=float, default=0.0)
     p.add_argument("--grid_pool", type=int, default=0,
@@ -285,6 +341,15 @@ def main():
     print(f"{len(stems)} volume(s)  framings={framings}  z_stride={args.z_stride}"
           f"  mask={args.mask_source}/{args.mask_method}")
 
+    g_thresh = None
+    if mask_dir and args.mask_scope == "global" and not args.dry_run:
+        g_thresh = global_mask_threshold(
+            stems, mask_dir, stats_dir, z_range, args.z_stride,
+            args.mask_method)
+        print(f"global foreground threshold ({args.mask_source}/"
+              f"{args.mask_method}): {g_thresh}"
+              + ("  — falling back to per-volume" if g_thresh is None else ""))
+
     ctx = None
     device = None
     if not args.dry_run:
@@ -305,7 +370,7 @@ def main():
         "fov_fit": args.fov_fit, "tile_grid": [gx, gy],
         "grid_pool": args.grid_pool, "mask_source": args.mask_source,
         "mask_method": args.mask_method, "mask_dilate": args.mask_dilate,
-        "mask_min_frac": args.mask_min_frac,
+        "mask_min_frac": args.mask_min_frac, "mask_scope": args.mask_scope,
     }
     cfg_hash = hashlib.sha1(
         json.dumps(cfg_key, sort_keys=True).encode()).hexdigest()[:8]
@@ -378,7 +443,7 @@ def main():
                     mraw = np.asarray(mv[z_lo:z_hi][::max(1, args.z_stride)])
                     mask_band, warn = foreground_mask(
                         mraw, args.mask_method, args.mask_dilate,
-                        args.mask_min_frac)
+                        args.mask_min_frac, threshold=g_thresh)
                     if warn:
                         manifest["warnings"].append(f"{stem}: {warn}")
 

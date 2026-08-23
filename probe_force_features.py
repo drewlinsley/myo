@@ -77,13 +77,36 @@ def assign_bin(value, edges):
                                float(value), side="right"))
 
 
+def _rankdata(x):
+    """Average ranks, so tied values share a rank.
+
+    Ordinal ranks (argsort of argsort) break ties by input order, which makes
+    the correlation depend on row ordering whenever values repeat — and force
+    measurements have limited precision, so ties are expected.
+    """
+    x = np.asarray(x, float)
+    order = np.argsort(x, kind="mergesort")
+    ranks = np.empty(len(x), float)
+    ranks[order] = np.arange(len(x), dtype=float)
+    # average the ranks within each run of equal values
+    sx = x[order]
+    i = 0
+    while i < len(sx):
+        j = i
+        while j + 1 < len(sx) and sx[j + 1] == sx[i]:
+            j += 1
+        if j > i:
+            ranks[order[i:j + 1]] = (i + j) / 2.0
+        i = j + 1
+    return ranks
+
+
 def spearman(a, b):
     a, b = np.asarray(a, float), np.asarray(b, float)
     if len(a) < 3 or np.all(a == a[0]) or np.all(b == b[0]):
         return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(float)
-    rb = np.argsort(np.argsort(b)).astype(float)
-    ra -= ra.mean(); rb -= rb.mean()
+    ra, rb = _rankdata(a), _rankdata(b)
+    ra = ra - ra.mean(); rb = rb - rb.mean()
     d = np.sqrt((ra**2).sum() * (rb**2).sum())
     return float((ra * rb).sum() / d) if d > 0 else float("nan")
 
@@ -221,10 +244,6 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
     from sklearn.preprocessing import StandardScaler
     from sklearn.decomposition import PCA
     from sklearn.linear_model import Ridge, LogisticRegression
-    from sklearn.model_selection import GroupKFold
-
-    reps = sorted(set(vol_group))
-    rep_force = {g: float(vol_force[list(vol_group).index(g)]) for g in reps}
     folds = sorted(set(cv_groups))
     grid = [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]
 
@@ -276,8 +295,16 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
 
         if task == "regression":
             # centered force is signed, so log10 only applies to the raw target
-            ytr = (ytr_force if deconfound is not None
-                   else np.log10(np.clip(ytr_force, 1e-9, None)))
+            if deconfound is not None:
+                ytr = ytr_force          # centered force is signed
+            else:
+                if np.any(ytr_force <= 0):
+                    raise SystemExit(
+                        f"non-positive force value(s) "
+                        f"{ytr_force[ytr_force <= 0][:3]} cannot be log-scaled. "
+                        f"Clipping would map them to -9, a catastrophic outlier "
+                        f"for Ridge. Fix the metadata or use --deconfound.")
+                ytr = np.log10(ytr_force)
             alpha = fixed_alpha
             if alpha is None:
                 alpha = _inner_select(
@@ -292,12 +319,20 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
             if C is None:
                 C = _inner_select(
                     Xtr, ytr_bin, tr_groups, w, grid,
-                    lambda c: LogisticRegression(C=c, max_iter=2000,
-                                                 class_weight="balanced"),
+                    lambda c: LogisticRegression(C=c, max_iter=2000),
                     "acc", seed)
-            m = LogisticRegression(C=C, max_iter=2000,
-                                   class_weight="balanced").fit(
-                Xtr, ytr_bin, sample_weight=w)
+            # Class balancing must be computed on the WEIGHTED class totals,
+            # not on raw volume counts; class_weight="balanced" would ignore w
+            # and then multiply on top of it.
+            wb = w.copy()
+            tot = w.sum()
+            for c in np.unique(ytr_bin):
+                m_c = ytr_bin == c
+                wc = w[m_c].sum()
+                if wc > 0:
+                    wb[m_c] *= tot / (len(np.unique(ytr_bin)) * wc)
+            m = LogisticRegression(C=C, max_iter=2000).fit(
+                Xtr, ytr_bin, sample_weight=wb)
             p = m.predict_proba(Xte)
 
         # collapse held-out VOLUMES to one prediction per replicate
@@ -368,15 +403,35 @@ def _inner_select(X, y, groups, w, grid, make, metric, seed):
     return best
 
 
-def _permute_replicate_force(vol_group, vol_force, rng):
+def _permute_replicate_force(vol_group, vol_force, rng, strata=None):
     """Permute force across REPLICATES (every volume of a tissue keeps one
     shared value). Permuting per-volume would break the group structure and
-    make the null easier than the real problem."""
+    make the null easier than the real problem.
+
+    strata: optional per-volume confound level (e.g. plate). When given, force
+        is shuffled only WITHIN a stratum. This matters for a nested design:
+        free permutation destroys the plate-force association, so the null
+        becomes "no feature-force association at all" and any feature encoding
+        acquisition batch beats it. The restricted null asks the question we
+        actually care about — is there association BEYOND plate.
+    """
     reps = sorted(set(vol_group))
-    rf = {}
-    for g, f in zip(vol_group, vol_force):
+    rf, rs = {}, {}
+    for i, (g, f) in enumerate(zip(vol_group, vol_force)):
         rf.setdefault(g, float(f))
-    shuffled = dict(zip(reps, rng.permutation([rf[g] for g in reps])))
+        if strata is not None:
+            rs.setdefault(g, strata[i])
+
+    shuffled = {}
+    if strata is None:
+        shuffled = dict(zip(reps, rng.permutation([rf[g] for g in reps])))
+    else:
+        by_stratum = {}
+        for g in reps:
+            by_stratum.setdefault(rs[g], []).append(g)
+        for _lvl, gs in sorted(by_stratum.items(), key=lambda kv: str(kv[0])):
+            gs = sorted(gs)
+            shuffled.update(zip(gs, rng.permutation([rf[g] for g in gs])))
     return [shuffled[g] for g in vol_group]
 
 
@@ -421,11 +476,31 @@ def main():
     p.add_argument("--file_col", default="file")
     p.add_argument("--group_cols", default="plate,Tissue")
     p.add_argument("--modality", choices=["bf", "gfp"], default="gfp")
-    p.add_argument("--allow_partial_match", action="store_true", default=True)
+    p.add_argument("--strict_match", action="store_true",
+                   help="Fail if any force-labeled metadata row matched no "
+                        "staged volume. Off by default: this drop has one "
+                        "known-unstaged file.")
     p.add_argument("--task", choices=["regression", "classification"],
                    default="regression")
     p.add_argument("--n_bins", type=int, default=4)
     p.add_argument("--pca_dim", type=int, default=20)
+    p.add_argument("--perm_scope", choices=["within_plate", "free"],
+                   default="within_plate",
+                   help="'within_plate' (default) shuffles force only among "
+                        "replicates sharing a plate. Free permutation destroys "
+                        "the plate-force link, so any batch-encoding feature "
+                        "beats the null — the very confound this file guards "
+                        "against.")
+    p.add_argument("--alpha", type=float, default=1.0,
+                   help="Fixed Ridge alpha / LogisticRegression C, used for the "
+                        "observed run AND every permutation so the two are "
+                        "produced by an identical procedure.")
+    p.add_argument("--tune_alpha", action="store_true",
+                   help="Nested-CV select the hyperparameter on the observed "
+                        "run. NOT recommended: the permutations stay fixed, so "
+                        "the observed statistic would be tuned against untuned "
+                        "nulls, and on null data the inner R^2 criterion "
+                        "systematically picks maximum shrinkage.")
     p.add_argument("--cv_group", choices=["replicate", "plate"],
                    default="replicate",
                    help="'plate' = leave-one-plate-out, which DOES control for "
@@ -475,9 +550,11 @@ def main():
         print("\n".join(data["report"]))
     if data["n_matched"] == 0:
         raise SystemExit("no metadata force rows matched any volume")
-    if data["unmatched_meta"] and not args.allow_partial_match:
+    if data["unmatched_meta"] and args.strict_match:
         raise SystemExit(f"{len(data['unmatched_meta'])} force row(s) matched "
-                         "no volume; pass --allow_partial_match")
+                         "no volume (this is expected for the one known "
+                         "unstaged file); rerun without --strict_match to "
+                         "proceed")
 
     forces = data["forces"]
     groups = data["groups"]
@@ -501,6 +578,19 @@ def main():
             if part.lower().startswith("plate="):
                 return part.split("=", 1)[1]
         return "NA"
+
+    _plates = sorted({plate_of(g) for g in vol_group})
+    if (args.deconfound == "plate" or args.canary == "plate"
+            or args.cv_group == "plate" or args.perm_scope == "within_plate"):
+        if len(_plates) < 2 or _plates == ["NA"]:
+            raise SystemExit(
+                f"plate identity could not be parsed from the group ids "
+                f"(got {_plates[:5]}). Every confound control here depends on "
+                f"it: --deconfound would become a global no-op, --canary a "
+                f"constant column, and the restricted permutation would "
+                f"degenerate to a free one — all silently. Make sure "
+                f"--group_cols includes 'plate' (currently "
+                f"'{args.group_cols}').")
 
     if args.canary == "plate":
         plates = sorted({plate_of(g) for g in vol_group})
@@ -550,14 +640,28 @@ def main():
               + ("  [SHUFFLED LABELS]" if args.shuffle else "")
               + (f"  [CANARY {args.canary}]" if args.canary != "none" else ""))
 
+    if args.deconfound == "plate" and args.cv_group == "plate":
+        raise SystemExit(
+            "--deconfound plate with --cv_group plate is degenerate: the "
+            "held-out plate has no training rows, so its centering falls back "
+            "to the global mean while every training plate had its own offset "
+            "removed — a systematic test-time shift. Use --cv_group replicate "
+            "with --deconfound plate (within-plate question, all replicates), "
+            "or --cv_group plate with --deconfound none (across-plate "
+            "generalization).")
+
     deconf = ([plate_of(g) for g in vol_group]
               if args.deconfound == "plate" else None)
     if deconf is not None and not args.quiet:
         print("  deconfound=plate: modelling WITHIN-plate variation only; a "
               "positive result here\n    cannot be an acquisition batch effect.")
 
+    # The observed statistic MUST be produced by the same procedure as the
+    # null, hyperparameter included. Nested selection on the observed run only
+    # would compare a tuned model against untuned nulls.
     res = run_loo(X, vol_group, vol_force, cv_groups, args.task,
-                  args.n_bins, args.pca_dim, args.seed, deconfound=deconf)
+                  args.n_bins, args.pca_dim, args.seed, deconfound=deconf,
+                  fixed_alpha=(None if args.tune_alpha else args.alpha))
     out = score(res, args.n_bins, args.task)
 
     # ---- permutation null: RE-RUN the whole LOO under permuted labels ----
@@ -577,10 +681,18 @@ def main():
     if args.n_perm > 0 and out["n_replicates"] >= 3:
         rng = np.random.default_rng(args.seed)
         obs_rho, obs_acc = out["spearman_pred_vs_force"], out["replicate_accuracy"]
-        fixed = 1.0          # fixed alpha (Ridge) / C (LogisticRegression)
+        fixed = args.alpha          # same value for observed AND permuted
+        # Restricted permutation for the nested design unless explicitly freed.
+        perm_strata = (None if args.perm_scope == "free"
+                       else [plate_of(g) for g in vol_group])
+        if perm_strata is not None and not args.quiet:
+            n_lv = len(set(perm_strata))
+            print(f"  permutation null: RESTRICTED within {n_lv} plate(s) — "
+                  f"tests association BEYOND plate, not merely any association")
         null_rho, null_acc = [], []
         for _ in range(args.n_perm):
-            vf = _permute_replicate_force(vol_group, vol_force, rng)
+            vf = _permute_replicate_force(vol_group, vol_force, rng,
+                                          strata=perm_strata)
             r = run_loo(X, vol_group, vf, cv_groups, args.task, args.n_bins,
                         args.pca_dim, args.seed, fixed_alpha=fixed,
                         deconfound=deconf)
@@ -590,9 +702,20 @@ def main():
             null_acc.append(float(np.mean(r["true_bin"] == r["pred_bin"])))
         null_rho = np.asarray([x for x in null_rho if not np.isnan(x)])
         null_acc = np.asarray(null_acc)
-        if len(null_rho):
+        if len(null_rho) and np.isfinite(obs_rho):
+            # ONE-SIDED on signed rho. Using |rho| would let an anti-correlated
+            # model win: the leave-one-out null is centered well below zero, so
+            # "far from 0" is achieved by over-shrinkage as easily as by signal.
             out["permutation_p_spearman"] = float(
-                (np.sum(np.abs(null_rho) >= abs(obs_rho)) + 1) / (len(null_rho) + 1))
+                (np.sum(null_rho >= obs_rho) + 1) / (len(null_rho) + 1))
+            out["p_is_one_sided"] = True
+        elif len(null_rho):
+            # S3: abs(nan) comparisons are all-False, which would have produced
+            # the SMALLEST attainable p (1/(B+1)) for a degenerate model whose
+            # predictions collapsed to a constant.
+            out["permutation_p_spearman"] = 1.0
+            out["degenerate"] = ("observed spearman is not finite (constant "
+                                 "predictions?) — p forced to 1.0")
             out["null_spearman_mean"] = float(null_rho.mean())
             out["null_spearman_ci"] = [float(np.percentile(null_rho, 2.5)),
                                        float(np.percentile(null_rho, 97.5))]
@@ -602,9 +725,11 @@ def main():
             # family-wise p that accounts for both the number of configs AND
             # their correlation. Nothing weaker is honest at n=20.
             out["null_spearman"] = [float(x) for x in null_rho]
-        if len(null_acc):
+        if len(null_acc) and np.isfinite(obs_acc):
             out["permutation_p_accuracy"] = float(
                 (np.sum(null_acc >= obs_acc) + 1) / (len(null_acc) + 1))
+        elif len(null_acc):
+            out["permutation_p_accuracy"] = 1.0
             out["null_accuracy_mean"] = float(null_acc.mean())
             out["null_accuracy"] = [float(x) for x in null_acc]
         out["n_permutations"] = int(len(null_acc))

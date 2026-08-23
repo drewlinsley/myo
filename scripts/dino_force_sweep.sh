@@ -40,12 +40,29 @@ OUT_DIR="${OUT_DIR:-results/dino_sweep}"   # per-target subdir added below
 MODEL="${MODEL:-vit_base_patch14_reg4_dinov2.lvd142m}"
 MODALITIES="${MODALITIES:-gfp}"
 FRAMINGS="${FRAMINGS:-tiled}"
-TOKENS="${TOKENS:-cls,patch_mean patch_mean,patch_std patch_std}"
+# Foreground-only by default: the fields are sparse tissue on
+# background, so background tokens are not evidence about force.
+# patch_mean_fg / patch_std_fg are mask-weighted WITHIN each view.
+TOKENS="${TOKENS:-patch_mean_fg patch_mean_fg,patch_std_fg}"
 NORM_SCOPE="${NORM_SCOPE:-volume}"
 TASK="${TASK:-regression}"
 N_BINS="${N_BINS:-4}"
-AGGS="${AGGS:-mean fgmean mean+std}"
-FG_MIN="${FG_MIN:-0.0}"
+# fgmean weights whole views by their foreground fraction, on top of the
+# token-level weighting above.
+AGGS="${AGGS:-fgmean fgmean+std}"
+FG_MIN="${FG_MIN:-0.02}"  # drop views with <2% tissue outright
+# Foreground acts in three independent places. Know which one you are testing:
+#   1. view SELECTION  (--fg_min)      drop tiles below a foreground fraction
+#   2. view WEIGHTING  (--agg fgmean)  weight whole tiles by their fg fraction
+#   3. token WEIGHTING (patch_mean_fg) weight individual patch tokens by the
+#                                      mask, inside each view
+# All three are ON by default. Hard selection (1) is only safe because
+# extraction now uses --mask_scope global: ONE dataset-wide intensity threshold,
+# so view_fg_frac means the same thing in every volume. Under the old
+# per-volume thresholding a fixed cutoff would have dropped unequal fractions
+# across volumes, a bias that could correlate with tissue density and hence
+# with the label.
+# Set FG_MIN=0 AGGS=mean TOKENS=patch_mean for a no-foreground comparison.
 DECONFOUND="${DECONFOUND:-plate}"
 N_PERM="${N_PERM:-1000}"
 Z_STRIDE="${Z_STRIDE:-3}"
@@ -70,7 +87,9 @@ echo "   results -> $OUT_DIR"
 echo "   model=$MODEL"
 echo "   modalities=[$MODALITIES] framings=$FRAMINGS"
 echo "   tokens=[$TOKENS]"
-echo "   aggs=[$AGGS]  fg_min=$FG_MIN"
+echo "   aggs=[$AGGS]  fg_min=$FG_MIN "
+echo "   (fg acts at 3 levels: --fg_min selects views, --agg fgmean weights views,"
+echo "    patch_mean_fg weights tokens within a view)"
 echo "════════════════════════════════════════════════════════════════"
 
 # ── Stage A: extract once ──
@@ -107,7 +126,20 @@ for mod in $MODALITIES; do
       exit 1
     fi
     fdir="$matches"
+    have_tokens="$(python -c "
+import numpy as np, glob, sys
+f = sorted(glob.glob(sys.argv[1] + '/*.npz'))
+print(' '.join(np.load(f[0]).files) if f else '')
+" "$fdir" 2>/dev/null || true)"
     for token in $TOKENS; do
+     missing=0
+     for t in ${token//,/ }; do
+       case " $have_tokens " in *" $t "*) ;; *) missing=1 ;; esac
+     done
+     if [ "$missing" = "1" ]; then
+       echo "  [skip $token] not in the cached features (have: $have_tokens)"
+       continue
+     fi
      for agg in $AGGS; do
       dcs="none"
       [ "$DECONFOUND" != "none" ] && dcs="none $DECONFOUND"
@@ -165,9 +197,41 @@ for f in files:
     rows.append((os.path.basename(f)[:-5], r))
     ns = r.get("null_spearman")
     if ns:
-        nulls.append(np.abs(np.asarray(ns)))
+        # SIGNED, not |.|: the leave-one-out null sits well below zero, so an
+        # anti-correlated model would otherwise be selected as the family best.
+        nulls.append(np.asarray(ns))
 
-rows.sort(key=lambda t: -abs(t[1].get("spearman_pred_vs_force") or 0))
+# S4/S11: matched nulls are the premise of the max-statistic. Verify it.
+def _key(r):
+    return (r.get("target_col"), r.get("task"), r.get("cv_group"),
+            r.get("deconfound"), r.get("n_replicates"),
+            r.get("n_permutations"), r.get("perm_scope"))
+keys = {}
+for name, r in rows:
+    keys.setdefault(tuple(_key(r)[:3] + _key(r)[4:]), []).append(name)
+if len(keys) > 1:
+    print("  *** REFUSING to combine these results: they did not come from one")
+    print("      experiment, so their permutations are NOT matched and a")
+    print("      max-statistic over them is invalid. Groups found:")
+    for k, names in keys.items():
+        print(f"        target/task/cv/n_reps/n_perm/scope = {k}")
+        for n in names[:4]:
+            print(f"          - {n}")
+    print("      Delete the stale jsons in this directory and re-run.")
+    raise SystemExit(1)
+
+# non-finite rho cannot be ranked; drop with a notice rather than letting
+# max() return NaN depending on list order
+bad = [n for n, r in rows
+       if not isinstance(r.get("spearman_pred_vs_force"), (int, float))
+       or r.get("spearman_pred_vs_force") != r.get("spearman_pred_vs_force")]
+if bad:
+    print(f"  NOTE: {len(bad)} config(s) produced a non-finite spearman "
+          f"(degenerate features?) and are excluded: {bad[:3]}")
+    rows = [(n, r) for n, r in rows if n not in bad]
+    nulls = nulls[:len(rows)]
+
+rows.sort(key=lambda t: -(t[1].get("spearman_pred_vs_force") or -9))
 print(f"  {'config':38s} {'n':>3} {'acc':>6} {'spearman':>9} {'perm_p':>8} "
       f"{'null_mean':>10}")
 for name, r in rows:
@@ -193,13 +257,16 @@ if nulls and len(nulls) == len(rows):
     m = min(len(n) for n in nulls)
     stack = np.stack([n[:m] for n in nulls])       # (n_cfg, n_perm)
     maxnull = stack.max(axis=0)                    # best config per permutation
-    obs = max(abs(r.get("spearman_pred_vs_force") or 0) for _, r in rows)
+    obs = max((r.get("spearman_pred_vs_force") or -9) for _, r in rows)
     fw = float((np.sum(maxnull >= obs) + 1) / (len(maxnull) + 1))
     print(f"\n  FAMILY-WISE (max-statistic over {len(rows)} configs, "
           f"{m} matched permutations)")
-    print(f"    best observed |spearman| = {obs:.3f}")
-    print(f"    null max |spearman|: mean {maxnull.mean():.3f}, "
-          f"95th pct {np.percentile(maxnull,95):.3f}")
+    print(f"    best observed spearman = {obs:+.3f}  (one-sided; signed)")
+    print(f"    null max spearman: mean {maxnull.mean():+.3f}, "
+          f"95th pct {np.percentile(maxnull,95):+.3f}")
+    print(f"    NOTE the null is centered near {np.mean(np.concatenate(list(stack))):+.3f} "
+          f"— leave-one-out is structurally anti-correlated, so a NEGATIVE")
+    print(f"    observed value is the null, never a finding.")
     print(f"    family-wise p = {fw:.4f}")
     if fw < 0.05:
         print("    -> survives correction for the whole sweep. Validate next by:")
