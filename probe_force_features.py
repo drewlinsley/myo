@@ -146,7 +146,81 @@ def load_stats_features(stats_dir, stems, modality):
     return np.asarray(feats, dtype=np.float64), kept, names
 
 
-def load_dino_features(feature_dir, stems, token, agg, fg_min):
+def _wcov_axis(v, coord, w):
+    """Weighted covariance of each embedding dim with a standardized axis.
+
+    This is the ordered-structure term a plain mean throws away: "does the
+    embedding drift as you go deeper / across the field", as opposed to "how
+    much does it vary", which is what a std captures.
+    """
+    c = np.asarray(coord, dtype=np.float64)
+    mu_c = np.average(c, weights=w)
+    sd_c = np.sqrt(np.average((c - mu_c) ** 2, weights=w))
+    if sd_c < 1e-12:
+        return np.zeros(v.shape[1])
+    cz = (c - mu_c) / sd_c
+    return (v * (w * cz)[:, None]).sum(0) / w.sum()
+
+
+def _within_group_std(v, keys, w):
+    """Mean weighted std WITHIN groups (e.g. across z at a fixed tile).
+
+    Separates the two dispersions the single `+std` term conflates: variation
+    through depth at one place, versus variation between places at one depth.
+    """
+    out = np.zeros(v.shape[1])
+    tw = 0.0
+    keys = [tuple(np.atleast_1d(k).tolist()) for k in keys]
+    for k in set(keys):
+        m = np.array([q == k for q in keys])
+        if m.sum() < 2:
+            continue
+        wk = w[m]
+        s = wk.sum()
+        if s <= 0:
+            continue
+        wn = wk / s
+        mu = (v[m] * wn[:, None]).sum(0)
+        var = (wn[:, None] * (v[m] - mu) ** 2).sum(0)
+        out += s * np.sqrt(np.clip(var, 0, None))
+        tw += s
+    return out / tw if tw > 0 else out
+
+
+def structured_terms(v, vz, vy, vx, w, terms):
+    """Grid-aware summaries appended to the pooled volume vector.
+
+    NOTE a raw position embedding concatenated before a MEAN is a no-op: every
+    volume has the same grid, so the position half averages to the same
+    constant and the standardizer drops it. Only `centroid` survives pooling,
+    and only because fg_min keeps a different subset of views per volume --
+    what it encodes is where the tissue is, not positional structure. Genuine
+    positional conditioning needs a learned aggregator.
+    """
+    outs = []
+    for t in terms:
+        if t == "grad_z":
+            outs.append(_wcov_axis(v, vz, w))
+        elif t == "grad_y":
+            outs.append(_wcov_axis(v, vy, w))
+        elif t == "grad_x":
+            outs.append(_wcov_axis(v, vx, w))
+        elif t == "std_z":
+            outs.append(_within_group_std(v, list(zip(vy, vx)), w))
+        elif t == "std_xy":
+            outs.append(_within_group_std(v, list(vz), w))
+        elif t == "centroid":
+            def _c(a):
+                a = np.asarray(a, float)
+                rng_ = a.max() - a.min()
+                return (np.average(a, weights=w) - a.min()) / (rng_ + 1e-12)
+            outs.append(np.array([_c(vz), _c(vy), _c(vx)]))
+        else:
+            raise SystemExit(f"unknown --struct term {t!r}")
+    return np.concatenate(outs) if outs else np.zeros(0)
+
+
+def load_dino_features(feature_dir, stems, token, agg, fg_min, struct=()):
     """Per-view DINOv2 features -> one vector per volume.
 
     `token` may be a comma list ("patch_mean,patch_std"), in which case the
@@ -225,6 +299,17 @@ def load_dino_features(feature_dir, stems, token, agg, fg_min):
             vec = np.concatenate([mu, sd])
         else:
             vec = v.mean(axis=0)
+        if struct:
+            if "view_z" not in z or "view_yx" not in z:
+                raise SystemExit(
+                    f"{p}: --struct needs view_z/view_yx, which these features "
+                    f"predate. Re-extract.")
+            vzk = np.asarray(z["view_z"]).astype(float)[keep]
+            vyk = np.asarray(z["view_yx"]).astype(float)[keep, 0]
+            vxk = np.asarray(z["view_yx"]).astype(float)[keep, 1]
+            ws = np.clip(fg, 1e-12, None)
+            vec = np.concatenate(
+                [vec, structured_terms(v, vzk, vyk, vxk, ws, struct)])
         feats.append(vec)
         kept.append(s)
     if fg_seen:
@@ -261,7 +346,8 @@ def load_dino_features(feature_dir, stems, token, agg, fg_min):
 # the LOO probe
 # --------------------------------------------------------------------------
 def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
-            seed=0, fixed_alpha=None, deconfound=None, categorical=False):
+            seed=0, fixed_alpha=None, deconfound=None, categorical=False,
+            model_class="ridge"):
     """Leave-one-group-out; returns per-replicate predictions.
 
     X            (n_vol, D)   volume-level features
@@ -332,7 +418,12 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
         sd[sd < 1e-12] = 1.0
         Xtr, Xte = (Xf[tr] - mu) / sd, (Xf[te] - mu) / sd
 
+        # PCA is the regularizer for ridge. Sparse and tree readouts do their
+        # own selection, and putting them behind a 20-component bottleneck
+        # would test the bottleneck rather than the model class.
         n_comp = int(min(pca_dim, Xtr.shape[0] - 1, Xtr.shape[1]))
+        if model_class != "ridge":
+            n_comp = 0
         if n_comp >= 1 and Xtr.shape[1] > n_comp:
             # weighted PCA == SVD of the sqrt(w)-scaled, weighted-centered data
             Z = Xtr * np.sqrt(w)[:, None]
@@ -371,12 +462,12 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
                         f"Clipping would map them to -9, a catastrophic outlier "
                         f"for Ridge. Fix the metadata or use --deconfound.")
                 ytr = np.log10(ytr_force)
+            make = _make_regressor(model_class, seed)
             alpha = fixed_alpha
             if alpha is None:
-                alpha = _inner_select(
-                    Xtr, ytr, tr_groups, w, grid,
-                    lambda a: Ridge(alpha=a), "r2", seed)
-            m = Ridge(alpha=alpha).fit(Xtr, ytr, sample_weight=w)
+                alpha = _inner_select(Xtr, ytr, tr_groups, w,
+                                      _hp_grid(model_class), make, "r2", seed)
+            m = make(alpha).fit(Xtr, ytr, sample_weight=w)
             p = m.predict(Xte)
         else:
             if len(set(ytr_bin)) < 2:
@@ -438,6 +529,43 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
             "pred_score": np.asarray(pred_force),
             "true_bin": np.asarray(true_bin),
             "pred_bin": np.asarray(pred_bin)}
+
+
+def _hp_grid(model_class):
+    if model_class == "ridge":
+        return [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]
+    if model_class in ("lasso", "elasticnet"):
+        return [1e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0]
+    return [2, 3, 4, 6]          # xgboost: n_estimators tier
+
+
+def _make_regressor(model_class, seed):
+    """Return f(hp) -> unfitted estimator.
+
+    Depth-1 stumps and a handful of trees is not timidity: with ~21 training
+    rows and 768+ columns, a deeper tree picks the best of 768 splits on 21
+    points, which is selecting noise. This is the most generous tree model the
+    sample size supports.
+    """
+    from sklearn.linear_model import Ridge, Lasso, ElasticNet
+    if model_class == "ridge":
+        return lambda a: Ridge(alpha=a)
+    if model_class == "lasso":
+        return lambda a: Lasso(alpha=a, max_iter=20000)
+    if model_class == "elasticnet":
+        return lambda a: ElasticNet(alpha=a, l1_ratio=0.5, max_iter=20000)
+    if model_class == "xgboost":
+        try:
+            from xgboost import XGBRegressor
+        except ImportError:
+            raise SystemExit(
+                "--model_class xgboost needs the xgboost package "
+                "(pip install xgboost)")
+        return lambda n: XGBRegressor(
+            n_estimators=int(n), max_depth=1, learning_rate=0.3,
+            reg_lambda=10.0, subsample=1.0, colsample_bytree=0.3,
+            random_state=seed, verbosity=0)
+    raise SystemExit(f"unknown model_class {model_class!r}")
 
 
 def _bin_reps(edges, n_bins, train_forces):
@@ -552,6 +680,21 @@ def main():
                         "encodings of every FOV sharing a force value into one "
                         "row BEFORE fitting -- less predictor noise, so less "
                         "errors-in-variables attenuation of the ridge fit.")
+    p.add_argument("--struct", default="none",
+                   help="Comma list of grid-aware terms appended to the pooled "
+                        "vector: grad_z,grad_y,grad_x,std_z,std_xy,centroid. "
+                        "These are what a mean over views discards. A position "
+                        "embedding concatenated before a mean is a NO-OP "
+                        "(same grid every volume -> constant), which is why "
+                        "these are covariances and within-group spreads "
+                        "instead.")
+    p.add_argument("--model_class",
+                   choices=["ridge", "lasso", "elasticnet", "xgboost"],
+                   default="ridge",
+                   help="Readout. 'ridge' runs on PCA(pca_dim); the sparse and "
+                        "tree options skip PCA and see all features, which is "
+                        "the point of trying them. NOTE each class is a "
+                        "separate config and so raises the family-wise bar.")
     p.add_argument("--fg_min", type=float, default=0.0,
                    help="dino mode: drop views whose foreground fraction is "
                         "below this (removes pure-background tiles).")
@@ -669,7 +812,9 @@ def main():
 
     if args.features == "dino":
         X, stems, names = load_dino_features(
-            args.feature_dir, stems, args.token, args.agg, args.fg_min)
+            args.feature_dir, stems, args.token, args.agg, args.fg_min,
+            struct=[t.strip() for t in args.struct.split(",")
+                    if t.strip() and t.strip() != "none"])
     else:
         X, stems, names = load_stats_features(stats_dir, stems, args.modality)
 
@@ -797,7 +942,7 @@ def main():
     # would compare a tuned model against untuned nulls.
     res = run_loo(X, vol_group, vol_force, cv_groups, args.task,
                   args.n_bins, args.pca_dim, args.seed, deconfound=deconf,
-                  categorical=_cat,
+                  categorical=_cat, model_class=args.model_class,
                   fixed_alpha=(None if args.tune_alpha else args.alpha))
     out = score(res, args.n_bins, args.task)
 
@@ -860,7 +1005,8 @@ def main():
                                           strata=perm_strata)
             r = run_loo(X, vol_group, vf, cv_groups, args.task, args.n_bins,
                         args.pca_dim, args.seed, fixed_alpha=fixed,
-                        deconfound=deconf, categorical=_cat)
+                        deconfound=deconf, categorical=_cat,
+                        model_class=args.model_class)
             if not len(r["true_bin"]):
                 continue
             null_rho.append(spearman(r["true_force"], r["pred_score"]))
@@ -927,6 +1073,7 @@ def main():
                 "features": args.features, "modality": args.modality,
                 "target_col": args.target_col, "cv_group": args.cv_group,
                 "target_type": args.target_type,
+                "struct": args.struct, "model_class": args.model_class,
                 "aggregate": args.aggregate, "fg_min": args.fg_min,
                 "canary": args.canary, "shuffled": bool(args.shuffle),
                 "n_volumes": len(stems), "feature_dim": int(X.shape[1]),

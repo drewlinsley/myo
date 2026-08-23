@@ -239,6 +239,38 @@ def main():
             flag = "  <-- plate adds little: testable"
         print(f"    {str(h):30s} {len(vals):>4} {n_cls:>7} {bal:>8.2f} "
               f"{pacc:>11.2f}{flag}")
+        # For a plate-determined label, leave-one-PLATE-out is the only valid
+        # test: batch artifacts do not transfer to an unseen plate, so a model
+        # that generalises across plates learned something else. Whether it is
+        # RUNNABLE depends on how classes spread over plates -- a class living
+        # on one plate leaves zero training examples when that plate is held
+        # out, and the fold is degenerate.
+        per_plate = {}
+        for v, q in zip(vals, pls):
+            per_plate.setdefault(q, {}).setdefault(v, 0)
+            per_plate[q][v] += 1
+        if pacc > 0.95 and plate_h:
+            plates_of_class = {}
+            for q, d in per_plate.items():
+                for c in d:
+                    plates_of_class.setdefault(c, set()).add(q)
+            layout = "; ".join(
+                f"{q[-8:]}={'/'.join(f'{c}:{n}' for c, n in sorted(d.items()))}"
+                for q, d in sorted(per_plate.items()))
+            print(f"      per plate: {layout}")
+            thin = sorted(c for c, s in plates_of_class.items() if len(s) < 2)
+            n_folds = len(per_plate)
+            if thin:
+                print(f"      LOPO NOT RUNNABLE: class(es) {', '.join(thin)} "
+                      f"occupy a single plate, so holding")
+                print(f"      that plate out leaves no training example of it.")
+            else:
+                print(f"      LOPO runnable: {n_folds} folds "
+                      f"({min(len(s) for s in plates_of_class.values())}+ "
+                      f"plates/class). Even a PERFECT model")
+                print(f"      gives p>={0.5 ** n_folds:.4f} — effect-size "
+                      f"estimation, not a test.")
+        out.setdefault("per_plate", {})[str(h)] = per_plate
         out["categorical"][str(h)] = {
             "n": len(vals), "n_classes": n_cls, "classes": sorted(set(vals)),
             "majority_frac": bal, "plate_predicts_label": pacc}

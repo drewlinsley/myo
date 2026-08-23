@@ -81,7 +81,18 @@ AGGREGATE="${AGGREGATE:-label}"
 # Set FG_MIN=0 AGGS=mean TOKENS=patch_mean for a no-foreground comparison.
 DECONFOUND="${DECONFOUND:-plate}"
 N_PERM="${N_PERM:-1000}"
-Z_STRIDE="${Z_STRIDE:-3}"
+# z_auto is a 35-slice band, so stride 3 sampled only 12 of them. Stride 1
+# takes all 35. This does NOT add label information -- force is still one
+# number per tissue -- it reduces noise in the volume mean by averaging ~3x
+# more views. Extraction cost scales with it; the feature-dir hash includes it,
+# so stride-3 features stay cached and untouched.
+Z_STRIDE="${Z_STRIDE:-1}"
+# Grid-aware terms appended to the pooled vector, space-separated list of
+# comma-lists. Each extra value is another config and RAISES the family-wise
+# bar, so the default is a single value (no inflation).
+#   STRUCTS="none grad_z,centroid"   compares structured pooling to the mean
+STRUCTS="${STRUCTS:-none}"
+MODEL_CLASS="${MODEL_CLASS:-ridge}"   # ridge|lasso|elasticnet|xgboost
 SEED="${SEED:-42}"
 SKIP_EXTRACT="${SKIP_EXTRACT:-0}"
 FORCE="${FORCE:-0}"
@@ -98,10 +109,11 @@ FORCE="${FORCE:-0}"
 # directory, so a stale JSON from the old settings was silently pooled into the
 # ranking AND into the max-statistic null. DECONFOUND is deliberately absent:
 # it is swept within a run (dc-none and dc-plate are both configs).
-RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
            "$TARGET_COL" "$TASK" "$N_BINS" "$MODEL" "$NORM_SCOPE" "$SEED" \
            "$TARGET_TYPE" "$FG_MIN" "$AGGREGATE" "$TOKENS" "$AGGS" \
-           "$FRAMINGS" | cksum | cut -d' ' -f1)"
+           "$FRAMINGS" "$STRUCTS" "$MODEL_CLASS" "$Z_STRIDE" \
+           | cksum | cut -d' ' -f1)"
 OUT_DIR="$OUT_DIR/${TARGET_COL}_${TASK}_b${N_BINS}_s${SEED}_${RUN_KEY}"
 mkdir -p "$OUT_DIR"
 # Belt and braces: even inside a correctly-keyed directory, refuse to pool
@@ -139,6 +151,7 @@ echo "   model=$MODEL"
 echo "   modalities=[$MODALITIES] framings=$FRAMINGS"
 echo "   tokens=[$TOKENS]"
 echo "   aggs=[$AGGS]  fg_min=$FG_MIN  aggregate=$AGGREGATE"
+echo "   z_stride=$Z_STRIDE  structs=[$STRUCTS]  model=$MODEL_CLASS"
 echo "   (fg acts at 3 levels: --fg_min selects views, --agg fgmean weights views,"
 echo "    patch_mean_fg weights tokens within a view)"
 echo "════════════════════════════════════════════════════════════════"
@@ -192,10 +205,13 @@ print(' '.join(np.load(f[0]).files) if f else '')
        continue
      fi
      for agg in $AGGS; do
+      for st in $STRUCTS; do
       dcs="none"
       [ "$DECONFOUND" != "none" ] && dcs="none $DECONFOUND"
       for dc in $dcs; do
         tag="${mod}_${framing}_${token//,/+}_${agg//+/-}_dc-${dc}"
+        [ "$st" != "none" ] && tag="${tag}_st-${st//,/+}"
+        [ "$MODEL_CLASS" != "ridge" ] && tag="${tag}_${MODEL_CLASS}"
         out="$OUT_DIR/${tag}.json"
         if [ -f "$out" ] && [ "$FORCE" != "1" ]; then
           echo "  [$tag] cached"; n_cfg=$((n_cfg+1)); continue
@@ -206,10 +222,12 @@ print(' '.join(np.load(f[0]).files) if f else '')
           --target_col "$TARGET_COL" --group_cols "$GROUP_COLS" \
           --modality "$mod" --task "$TASK" --n_bins "$N_BINS" \
           --agg "$agg" --fg_min "$FG_MIN" --aggregate "$AGGREGATE" \
-          --target_type "$TARGET_TYPE" \
+          --target_type "$TARGET_TYPE" --struct "$st" \
+          --model_class "$MODEL_CLASS" \
           --deconfound "$dc" --n_perm "$N_PERM" --seed "$SEED" --quiet \
           --output "$out" || echo "    (failed — continuing)"
         n_cfg=$((n_cfg+1))
+       done
       done
      done
     done
@@ -231,6 +249,7 @@ if [ -n "$ctrl_dir" ] && [ -d "$ctrl_dir" ]; then
     --task "$TASK" --n_bins "$N_BINS" --deconfound "$DECONFOUND" \
     --agg "$(echo $AGGS | cut -d' ' -f1)" --fg_min "$FG_MIN" \
     --aggregate "$AGGREGATE" --target_type "$TARGET_TYPE" \
+    --struct "$(echo $STRUCTS | cut -d' ' -f1)" --model_class "$MODEL_CLASS" \
     --shuffle --n_perm "$N_PERM" --seed "$SEED" --quiet \
     --output "$OUT_DIR/_control_shuffled.json" || ctrl_failed=1
   if [ "${ctrl_failed:-0}" = "1" ]; then
