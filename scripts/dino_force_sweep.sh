@@ -92,10 +92,45 @@ FORCE="${FORCE:-0}"
 # Scope the results directory by everything that changes what is being
 # predicted. Two targets must never share a directory: Stage C's max-statistic
 # assumes every JSON in it permuted the SAME labels with the SAME seed.
-RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s' "$TARGET_COL" "$TASK" "$N_BINS" \
-           "$MODEL" "$NORM_SCOPE" "$SEED" | cksum | cut -d' ' -f1)"
+# Everything that changes the FEATURES or the FIT belongs in this key. It
+# used to cover only target/task/bins/model/norm/seed, so changing FG_MIN or
+# AGGREGATE reused the previous run's directory -- and Stage C globs the whole
+# directory, so a stale JSON from the old settings was silently pooled into the
+# ranking AND into the max-statistic null. DECONFOUND is deliberately absent:
+# it is swept within a run (dc-none and dc-plate are both configs).
+RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+           "$TARGET_COL" "$TASK" "$N_BINS" "$MODEL" "$NORM_SCOPE" "$SEED" \
+           "$TARGET_TYPE" "$FG_MIN" "$AGGREGATE" "$TOKENS" "$AGGS" \
+           "$FRAMINGS" | cksum | cut -d' ' -f1)"
 OUT_DIR="$OUT_DIR/${TARGET_COL}_${TASK}_b${N_BINS}_s${SEED}_${RUN_KEY}"
 mkdir -p "$OUT_DIR"
+# Belt and braces: even inside a correctly-keyed directory, refuse to pool
+# JSONs written by settings that differ from this run.
+python - "$OUT_DIR" "$FG_MIN" "$AGGREGATE" "$TARGET_TYPE" <<'PYCHK'
+import json, glob, os, sys
+d, fg, ag, tt = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+stale = []
+for f in glob.glob(os.path.join(d, "*.json")):
+    try:
+        r = json.load(open(f))
+    except Exception:
+        stale.append((os.path.basename(f), "unreadable")); continue
+    if r.get("fg_min") is None and r.get("aggregate") is None:
+        stale.append((os.path.basename(f), "written before these were recorded"))
+    elif (abs(float(r.get("fg_min", -1)) - fg) > 1e-9
+          or r.get("aggregate") != ag or r.get("target_type", "numeric") != tt):
+        stale.append((os.path.basename(f),
+                      f"fg_min={r.get('fg_min')} aggregate={r.get('aggregate')} "
+                      f"target_type={r.get('target_type')}"))
+if stale:
+    print(f"  {len(stale)} stale result(s) in {d}:")
+    for n, why in stale[:8]:
+        print(f"    {n}  [{why}]")
+    print("  These came from different settings. Stage C would rank them")
+    print("  alongside this run's and fold them into the max-statistic null.")
+    print(f"  Delete them first:  rm -rf '{d}'")
+    raise SystemExit(1)
+PYCHK
 echo "════════════════════════════════════════════════════════════════"
 echo " Frozen DINOv2 -> force"
 echo "   target=$TARGET_COL ($TARGET_TYPE)   deconfound=$DECONFOUND   task=$TASK"
