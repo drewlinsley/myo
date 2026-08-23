@@ -50,7 +50,18 @@ N_BINS="${N_BINS:-4}"
 # fgmean weights whole views by their foreground fraction, on top of the
 # token-level weighting above.
 AGGS="${AGGS:-fgmean fgmean+std}"
-FG_MIN="${FG_MIN:-0.02}"  # drop views with <2% tissue outright
+# Tiles must be mostly TISSUE. 0.75 = at most 25% background. The old 0.02
+# let a 98%-background tile into the average; fgmean discounted it, but it was
+# still there, and the fgmean+std arm folded it into the dispersion term at
+# full weight.
+FG_MIN="${FG_MIN:-0.75}"
+# 'label' averages the encodings of every FOV sharing a force value into one
+# row BEFORE fitting. Those FOVs are one tissue (build_force_groups hard-fails
+# on a group with two force values), so this is one row per level of the
+# dependent variable. Fitting per-FOV instead treats imaging noise as
+# between-tissue variation, and that noise is in the PREDICTORS -- it attenuates
+# ridge coefficients in a way averaging predictions afterwards cannot undo.
+AGGREGATE="${AGGREGATE:-label}"
 # Foreground acts in three independent places. Know which one you are testing:
 #   1. view SELECTION  (--fg_min)      drop tiles below a foreground fraction
 #   2. view WEIGHTING  (--agg fgmean)  weight whole tiles by their fg fraction
@@ -87,7 +98,7 @@ echo "   results -> $OUT_DIR"
 echo "   model=$MODEL"
 echo "   modalities=[$MODALITIES] framings=$FRAMINGS"
 echo "   tokens=[$TOKENS]"
-echo "   aggs=[$AGGS]  fg_min=$FG_MIN "
+echo "   aggs=[$AGGS]  fg_min=$FG_MIN  aggregate=$AGGREGATE"
 echo "   (fg acts at 3 levels: --fg_min selects views, --agg fgmean weights views,"
 echo "    patch_mean_fg weights tokens within a view)"
 echo "════════════════════════════════════════════════════════════════"
@@ -154,7 +165,7 @@ print(' '.join(np.load(f[0]).files) if f else '')
           --token "$token" --data_dir "$DATA_DIR" --metadata "$METADATA" \
           --target_col "$TARGET_COL" --group_cols "$GROUP_COLS" \
           --modality "$mod" --task "$TASK" --n_bins "$N_BINS" \
-          --agg "$agg" --fg_min "$FG_MIN" \
+          --agg "$agg" --fg_min "$FG_MIN" --aggregate "$AGGREGATE" \
           --deconfound "$dc" --n_perm "$N_PERM" --seed "$SEED" --quiet \
           --output "$out" || echo "    (failed — continuing)"
         n_cfg=$((n_cfg+1))
@@ -174,6 +185,7 @@ if [ -n "$ctrl_dir" ] && [ -d "$ctrl_dir" ]; then
     --modality "$(echo $MODALITIES | cut -d' ' -f1)" \
     --task "$TASK" --n_bins "$N_BINS" --deconfound "$DECONFOUND" \
     --agg "$(echo $AGGS | cut -d' ' -f1)" --fg_min "$FG_MIN" \
+    --aggregate "$AGGREGATE" \
     --shuffle --n_perm "$N_PERM" --seed "$SEED" --quiet \
     --output "$OUT_DIR/_control_shuffled.json" || true
 fi

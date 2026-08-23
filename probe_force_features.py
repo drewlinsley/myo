@@ -161,6 +161,7 @@ def load_dino_features(feature_dir, stems, token, agg, fg_min):
     """
     toks = [t.strip() for t in str(token).split(",") if t.strip()]
     feats, kept = [], []
+    fg_seen, dropped, n_kept, n_total = [], [], [], []
     for s in stems:
         p = os.path.join(feature_dir, f"{s}.npz")
         if not os.path.exists(p):
@@ -176,17 +177,25 @@ def load_dino_features(feature_dir, stems, token, agg, fg_min):
                 a = a.reshape(a.shape[0], -1)
             arrs.append(a)
         v = np.concatenate(arrs, axis=-1)                # (n_views, sum_D)
+        fg_all = (np.asarray(z["view_fg_frac"], float) if "view_fg_frac" in z
+                  else np.ones(len(v)))
+        fg_seen.append(fg_all)
         keep = np.ones(len(v), dtype=bool)
         if fg_min > 0 and "view_fg_frac" in z:
-            keep = np.asarray(z["view_fg_frac"], float) >= fg_min
-            if keep.any():
-                v = v[keep]
-            else:
-                keep = np.ones(len(v), dtype=bool)
-        fg = (np.asarray(z["view_fg_frac"], float) if "view_fg_frac" in z
-              else np.ones(len(v)))
-        if fg_min > 0 and "view_fg_frac" in z:
-            fg = fg[keep] if keep.any() else fg
+            keep = fg_all >= fg_min
+            if not keep.any():
+                # NEVER fall back to "keep everything" here. That was the old
+                # behaviour and it silently inverted the request: a volume with
+                # no tissue-rich tile contributed a pure-background vector,
+                # while tissue-rich volumes contributed tissue -- so the
+                # feature that best separated volumes was how much background
+                # they had. Drop the volume and say so.
+                dropped.append((s, float(fg_all.max())))
+                continue
+        v = v[keep]
+        fg = fg_all[keep]
+        n_kept.append(int(keep.sum()))
+        n_total.append(int(len(keep)))
         if agg == "median":
             vec = np.median(v, axis=0)
         elif agg == "mean+std":
@@ -203,14 +212,45 @@ def load_dino_features(feature_dir, stems, token, agg, fg_min):
             vec = ((v * w[:, None]).sum(axis=0) / w.sum()
                    if w.sum() > 1e-8 else v.mean(axis=0))
         elif agg == "fgmean+std":
+            # BOTH terms foreground-weighted. Pairing a tissue-weighted mean
+            # with an unweighted std let background-heavy tiles back in through
+            # the dispersion half of the vector.
             w = np.clip(fg, 0, None)
-            mu = ((v * w[:, None]).sum(axis=0) / w.sum()
-                  if w.sum() > 1e-8 else v.mean(axis=0))
-            vec = np.concatenate([mu, v.std(axis=0)])
+            if w.sum() > 1e-8:
+                mu = (v * w[:, None]).sum(axis=0) / w.sum()
+                sd = np.sqrt(np.clip(
+                    ((v - mu) ** 2 * w[:, None]).sum(axis=0) / w.sum(), 0, None))
+            else:
+                mu, sd = v.mean(axis=0), v.std(axis=0)
+            vec = np.concatenate([mu, sd])
         else:
             vec = v.mean(axis=0)
         feats.append(vec)
         kept.append(s)
+    if fg_seen:
+        allfg = np.concatenate(fg_seen)
+        qs = np.percentile(allfg, [50, 75, 90, 95, 100])
+        print(f"  views: foreground fraction median {qs[0]:.3f}, "
+              f"p75 {qs[1]:.3f}, p90 {qs[2]:.3f}, p95 {qs[3]:.3f}, "
+              f"max {qs[4]:.3f}")
+        if n_total:
+            print(f"  fg_min={fg_min}: kept {sum(n_kept)}/{sum(n_total)} views "
+                  f"({sum(n_kept)/max(1,sum(n_total)):.1%}), "
+                  f"{len(kept)} volume(s) usable")
+        if fg_min > 0 and float(allfg.max()) < fg_min:
+            raise SystemExit(
+                f"--fg_min {fg_min} exceeds the best tile in the WHOLE dataset "
+                f"({allfg.max():.3f}). No volume can pass. Either lower it, or "
+                f"re-extract with foreground-guided tile placement "
+                f"(--framing tiled_fg) so tiles are positioned on tissue "
+                f"instead of on a fixed grid.")
+    if dropped:
+        print(f"  DROPPED {len(dropped)} volume(s) with no tile at "
+              f"fg>={fg_min} (best tile shown): "
+              + ", ".join(f"{s}({m:.2f})" for s, m in dropped[:6])
+              + (" ..." if len(dropped) > 6 else ""))
+        print(f"  NOTE dropping volumes is not neutral: if tissue coverage "
+              f"correlates with force, this drops a biased subset.")
     if not feats:
         raise SystemExit(f"no .npz features found in {feature_dir}")
     names = [f"{'+'.join(toks)}[{i}]" for i in range(len(feats[0]))]
@@ -480,6 +520,13 @@ def main():
                         "mean is dominated by background. '*+std' appends the "
                         "std ACROSS views (across-field heterogeneity), which "
                         "is different from the patch_std token (within-view).")
+    p.add_argument("--aggregate", choices=["volume", "label"], default="volume",
+                   help="'volume': one row per FOV, weighted 1/n_FOV, and "
+                        "predictions averaged per tissue afterwards (default, "
+                        "the historical behaviour). 'label': average the "
+                        "encodings of every FOV sharing a force value into one "
+                        "row BEFORE fitting -- less predictor noise, so less "
+                        "errors-in-variables attenuation of the ridge fit.")
     p.add_argument("--fg_min", type=float, default=0.0,
                    help="dino mode: drop views whose foreground fraction is "
                         "below this (removes pure-background tiles).")
@@ -584,6 +631,35 @@ def main():
     stems = [stems[i] for i in keep]
     vol_group = [stem_group[s] for s in stems]
     vol_force = [float(forces[s]) for s in stems]
+
+    if args.aggregate == "label":
+        # Collapse every volume that shares a force value into ONE row before
+        # fitting. Those are exactly the FOVs of one tissue: build_force_groups
+        # hard-fails on a group carrying two force values, so a group IS a
+        # level of the dependent variable.
+        #
+        # This is not cosmetic. Fitting on individual FOVs treats per-field
+        # imaging noise as if it were between-tissue variation, and that noise
+        # sits in the PREDICTORS -- classic errors-in-variables, which biases
+        # ridge coefficients toward zero. Averaging first cuts that noise by
+        # ~sqrt(n_FOV) before the fit ever sees it. Averaging predictions
+        # afterwards (what the default does) cannot recover it: the attenuation
+        # already happened during fitting.
+        _order = sorted(set(vol_group))
+        _vf = np.asarray(vol_force, dtype=np.float64)
+        _vg = np.asarray(vol_group, dtype=object)
+        _Xa, _ga, _fa, _nn = [], [], [], []
+        for g in _order:
+            m = _vg == g
+            _Xa.append(X[m].mean(axis=0))
+            _ga.append(g)
+            _fa.append(float(_vf[m][0]))
+            _nn.append(int(m.sum()))
+        X = np.asarray(_Xa, dtype=np.float64)
+        vol_group, vol_force = _ga, _fa
+        stems = [f"{g}(mean of {n})" for g, n in zip(_ga, _nn)]
+        print(f"  aggregate=label: {len(_vg)} volumes -> {len(_ga)} rows, "
+              f"one per force value ({min(_nn)}-{max(_nn)} FOVs each)")
 
     def plate_of(g):
         for part in str(g).split("_"):

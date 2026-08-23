@@ -52,7 +52,8 @@ import numpy as np
 
 from src.data.normalization import normalize, global_percentiles
 from src.data.zband import resolve_z_range
-from src.data.dino_views import (plan_views, make_view, view_foreground,
+from src.data.dino_views import (plan_views, plan_views_fg,
+                                 fg_window_scores, make_view, view_foreground,
                                  area_resize, fit_into_square)
 
 DEFAULT_MODEL = "vit_base_patch14_reg4_dinov2.lvd142m"
@@ -273,6 +274,17 @@ def main():
                         "(myotube alignment is plausibly the signal); 'squash' "
                         "fills the square and wastes no tokens on padding.")
     p.add_argument("--tile_grid", default="4,3", help="tiled framing: gx,gy")
+    p.add_argument("--fg_tiles", type=int, default=12,
+                   help="tiled_fg: max tiles per volume (fewer are returned "
+                        "when fewer qualify -- that is the point)")
+    p.add_argument("--fg_tile_min", type=float, default=0.5,
+                   help="tiled_fg: minimum tissue coverage for a tile to be "
+                        "used at all. 0.75 = 'at most 25%% background'.")
+    p.add_argument("--fg_stride", type=int, default=64,
+                   help="tiled_fg: search stride when scoring windows")
+    p.add_argument("--fg_min_sep", type=int, default=None,
+                   help="tiled_fg: min separation between kept tiles "
+                        "(default tile_size//2 = 259, i.e. <=50%% overlap)")
     p.add_argument("--norm_scope", choices=["volume", "global"], default="volume",
                    help="'global' pools percentiles across the dataset so "
                         "absolute brightness survives. NOTE: probe_intensity.sh "
@@ -311,8 +323,9 @@ def main():
 
     framings = [f.strip() for f in args.framing.split(",") if f.strip()]
     for f in framings:
-        if f not in ("whole", "tiled"):
-            raise SystemExit(f"--framing must be whole|tiled, got {f!r}")
+        if f not in ("whole", "tiled", "tiled_fg"):
+            raise SystemExit(
+                f"--framing must be whole|tiled|tiled_fg, got {f!r}")
     gx, gy = (int(v) for v in args.tile_grid.split(","))
 
     data_dir = args.data_dir
@@ -372,6 +385,13 @@ def main():
         "mask_method": args.mask_method, "mask_dilate": args.mask_dilate,
         "mask_min_frac": args.mask_min_frac, "mask_scope": args.mask_scope,
     }
+    if any(f == "tiled_fg" for f in framings):
+        # These change WHERE tiles land, so they change the features. Omitting
+        # them would let two different placements share one cache directory.
+        cfg_key.update({"fg_tiles": args.fg_tiles,
+                        "fg_tile_min": args.fg_tile_min,
+                        "fg_stride": args.fg_stride,
+                        "fg_min_sep": args.fg_min_sep})
     cfg_hash = hashlib.sha1(
         json.dumps(cfg_key, sort_keys=True).encode()).hexdigest()[:8]
     print(f"config hash: {cfg_hash}  (feature dirs are keyed by it, so a "
@@ -417,17 +437,8 @@ def main():
                 print(f"  [{si+1}/{len(stems)}] {stem} {framing}: cached")
                 continue
 
-            specs = plan_views(H, W, framing, fov_size=518, tile_size=518,
-                               tile_grid=(gx, gy), fov_fit=args.fov_fit)
-            n_views = len(zs) * len(specs)
-            if args.dry_run:
-                print(f"  [{si+1}/{len(stems)}] {stem} ({n_z},{H},{W}) "
-                      f"z_auto={st.get('z_auto')} -> z[{z_lo}:{z_hi}] "
-                      f"{len(zs)} slices x {len(specs)} views = {n_views}"
-                      f"  [{framing}]")
-                continue
-
-            raw_band = np.asarray(vol[z_lo:z_hi][::max(1, args.z_stride)])
+            # The mask has to be resolved BEFORE the views are planned: the
+            # tiled_fg framing places tiles from it, rather than on a grid.
             mask_band, warn = None, None
             if mask_dir:
                 mpath = os.path.join(mask_dir, f"{stem}.npy")
@@ -446,6 +457,45 @@ def main():
                         args.mask_min_frac, threshold=g_thresh)
                     if warn:
                         manifest["warnings"].append(f"{stem}: {warn}")
+
+            if framing == "tiled_fg":
+                if mask_band is None:
+                    raise SystemExit(
+                        f"{stem}: --framing tiled_fg places tiles from the "
+                        f"foreground mask, but no mask is available "
+                        f"(mask_source={args.mask_source}). Use --framing "
+                        f"tiled, or make the mask volume available.")
+                # Place tiles once per volume, from the mean projection of the
+                # mask over the z-band, so view_yx means the same thing on
+                # every slice. Per-slice placement would track tissue through
+                # depth but makes a view index incomparable across z.
+                proj = mask_band.astype(np.float32).mean(axis=0)
+                specs = plan_views_fg(
+                    proj, n_tiles=args.fg_tiles, tile_size=518,
+                    stride=args.fg_stride, min_sep=args.fg_min_sep,
+                    min_fg=args.fg_tile_min)
+                if not specs:
+                    best = float(fg_window_scores(proj, 518, args.fg_stride)[2].max()
+                                 if min(proj.shape) >= 518 else 0.0)
+                    manifest["warnings"].append(
+                        f"{stem}: no tile reaches fg>={args.fg_tile_min} "
+                        f"(best {best:.3f}) — volume SKIPPED")
+                    print(f"  [{si+1}/{len(stems)}] {stem} {framing}: "
+                          f"SKIPPED (best tile fg={best:.3f} < "
+                          f"{args.fg_tile_min})")
+                    continue
+            else:
+                specs = plan_views(H, W, framing, fov_size=518, tile_size=518,
+                                   tile_grid=(gx, gy), fov_fit=args.fov_fit)
+            n_views = len(zs) * len(specs)
+            if args.dry_run:
+                print(f"  [{si+1}/{len(stems)}] {stem} ({n_z},{H},{W}) "
+                      f"z_auto={st.get('z_auto')} -> z[{z_lo}:{z_hi}] "
+                      f"{len(zs)} slices x {len(specs)} views = {n_views}"
+                      f"  [{framing}]")
+                continue
+
+            raw_band = np.asarray(vol[z_lo:z_hi][::max(1, args.z_stride)])
 
             views, vmasks, v_z, v_yx, v_fg, v_int = [], [], [], [], [], []
             for zi, z in enumerate(zs):
