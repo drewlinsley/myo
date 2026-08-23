@@ -728,9 +728,20 @@ def main():
             out["permutation_p_spearman"] = 1.0
             out["degenerate"] = ("observed spearman is not finite (constant "
                                  "predictions?) — p forced to 1.0")
+        # UNCONDITIONAL on purpose. These lines used to live inside the `elif`
+        # above, so the null was serialized ONLY when the observed rho was NaN
+        # — i.e. never, on any healthy run. The sweep's max-statistic stage
+        # then reported "0 of N configs carry a null distribution" and silently
+        # fell back to uncorrected p-values, which is exactly the failure mode
+        # the max-statistic exists to prevent.
+        if len(null_rho):
             out["null_spearman_mean"] = float(null_rho.mean())
             out["null_spearman_ci"] = [float(np.percentile(null_rho, 2.5)),
                                        float(np.percentile(null_rho, 97.5))]
+            # The smallest observed rho this design could have called
+            # significant at alpha=0.05. Report it with every null result: it
+            # separates "no signal" from "no power to see one".
+            out["mde_spearman_95"] = float(np.percentile(null_rho, 95))
             # Save the null itself. Every config in a sweep permutes the SAME
             # labels with the SAME seed, so these arrays are matched across
             # configs — which lets the sweep compute a max-statistic
@@ -742,7 +753,9 @@ def main():
                 (np.sum(null_acc >= obs_acc) + 1) / (len(null_acc) + 1))
         elif len(null_acc):
             out["permutation_p_accuracy"] = 1.0
+        if len(null_acc):
             out["null_accuracy_mean"] = float(null_acc.mean())
+            out["mde_accuracy_95"] = float(np.percentile(null_acc, 95))
             out["null_accuracy"] = [float(x) for x in null_acc]
         out["n_permutations"] = int(len(null_acc))
 
@@ -778,6 +791,16 @@ def main():
     print(f"  spearman(pred, true force) = {out['spearman_pred_vs_force']:.3f}"
           + (f"   perm_p={out['permutation_p_spearman']:.4f}"
              if "permutation_p_spearman" in out else ""))
+    if "mde_spearman_95" in out:
+        # A null result means nothing without this number. It is the smallest
+        # rho this design could have distinguished from chance — read it as
+        # "anything weaker than X was invisible here regardless of the model".
+        print(f"  null: mean {out['null_spearman_mean']:+.3f}, "
+              f"95% CI [{out['null_spearman_ci'][0]:+.3f}, "
+              f"{out['null_spearman_ci'][1]:+.3f}]  "
+              f"({out['n_permutations']} permutations)")
+        print(f"  detectable only if spearman > {out['mde_spearman_95']:+.3f} "
+              f"(alpha=0.05, this config alone)")
     if args.shuffle:
         print("  ^ labels were SHUFFLED: this must be at chance. If it is not,"
               "\n    the fold logic leaks and every other number is void.")

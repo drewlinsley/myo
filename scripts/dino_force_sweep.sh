@@ -264,9 +264,21 @@ if nulls and len(nulls) == len(rows):
     print(f"    best observed spearman = {obs:+.3f}  (one-sided; signed)")
     print(f"    null max spearman: mean {maxnull.mean():+.3f}, "
           f"95th pct {np.percentile(maxnull,95):+.3f}")
-    print(f"    NOTE the null is centered near {np.mean(np.concatenate(list(stack))):+.3f} "
-          f"— leave-one-out is structurally anti-correlated, so a NEGATIVE")
-    print(f"    observed value is the null, never a finding.")
+    # Do NOT hardcode the direction of this claim. Plain leave-one-out IS
+    # structurally anti-correlated (holding a point out pulls the training
+    # mean away from it), but ridge shrinkage and --deconfound plate can pull
+    # the null back to ~0. Read it off the permutations instead of asserting
+    # it, or the caveat contradicts the numbers printed beside it.
+    _nm = float(np.mean(np.concatenate(list(stack))))
+    print(f"    NOTE the null is centered near {_nm:+.3f}", end="")
+    if _nm < -0.1:
+        print(" — leave-one-out is structurally")
+        print("    anti-correlated here, so a NEGATIVE observed value is the")
+        print("    null, never a finding.")
+    else:
+        print(" — near zero, so this config's")
+        print("    null does NOT carry the usual leave-one-out anti-correlation")
+        print("    and rho may be read in the ordinary direction.")
     print(f"    family-wise p = {fw:.4f}")
     if fw < 0.05:
         print("    -> survives correction for the whole sweep. Validate next by:")
@@ -275,10 +287,26 @@ if nulls and len(nulls) == len(rows):
     else:
         print("    -> does NOT survive. The best row is what a sweep of this")
         print("       size produces by chance; do not report it as a finding.")
+        # A negative result is only interpretable next to what the design
+        # COULD have seen. Without this, "no signal" and "no power" read the
+        # same, and at n=22 replicates they are very different conclusions.
+        thr = float(np.percentile(maxnull, 95))
+        print(f"\n    POWER: to clear alpha=0.05 after correcting for these")
+        print(f"    {len(rows)} configs, a config needed spearman > {thr:+.3f}.")
+        print(f"    The best here reached {obs:+.3f}. So this run rules out an")
+        print(f"    effect large enough to survive that bar — it does NOT rule")
+        print(f"    out a real but weaker association. Distinguishing those")
+        print(f"    needs more replicates, not more configs: the threshold is")
+        print(f"    set by n={rows[0][1].get('n_replicates')}, not by the model.")
 else:
     print(f"\n  FAMILY-WISE p UNAVAILABLE: {len(nulls)} of {len(rows)} configs "
           f"carry a null distribution.")
     print("  Without it the best row is uncorrected and must NOT be reported as")
     print("  a finding. Rerun the missing configs with --n_perm > 0.")
+    if nulls == [] and any(r.get("permutation_p_spearman") is not None
+                           for _, r in rows):
+        print("  (Configs DO report perm_p but carry no 'null_spearman' array.")
+        print("   That combination means stale JSONs written before the")
+        print("   null-serialization fix — delete this results dir and rerun.)")
 PY
 echo "════════════════════════════════════════════════════════════════"
