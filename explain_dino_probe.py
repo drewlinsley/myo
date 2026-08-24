@@ -78,6 +78,7 @@ _dv = _by_path("dino_views.py", "dino_views")
 _zb = _by_path("zband.py", "zband")
 _nm = _by_path("normalization.py", "normalization")
 plan_views, make_view = _dv.plan_views, _dv.make_view
+area_resize = _dv.area_resize
 resolve_z_range = _zb.resolve_z_range
 normalize, global_percentiles = _nm.normalize, _nm.global_percentiles
 
@@ -173,26 +174,184 @@ def paint_view_map(vc, H, W):
 # --------------------------------------------------------------------------
 # patch-level attribution: re-run the backbone
 # --------------------------------------------------------------------------
-def patch_score_field(ctx, sl, specs, p_low, p_high, u_block, device,
-                      batch_size=8):
-    """s(p) = u . t_p for every patch of every tile of one z-slice.
+def encode_slice_tokens(ctx, sl, specs, p_low, p_high, device, batch_size=8):
+    """Patch tokens for every tile of one z-slice: (n_tiles, gh, gw, D).
 
-    Returns (grids, gh, gw) where grids is (n_tiles, gh, gw).
+    Everything downstream -- the readout response, the DINO foreground mask,
+    the patch montage -- is a projection of these, so they are computed once
+    per slice rather than once per quantity. One slice of a 4x3 tiling is
+    12 x 37 x 37 x 768 float32 = 50 MB, which is why slices are streamed
+    instead of held.
     """
     import torch
     views = [make_view(sl, sp, p_low, p_high, ctx["mean"], ctx["std"],
                        normalize) for sp in specs]
     n_prefix, patch = ctx["n_prefix"], ctx["patch"]
-    out = []
+    out, gh, gw = [], None, None
     for i in range(0, len(views), batch_size):
         x = torch.from_numpy(np.stack(views[i:i + batch_size])).to(device)
         with torch.no_grad():
             tok = ctx["model"].forward_features(x).float()
         pt = tok[:, n_prefix:]                              # (B, gh*gw, D)
         gh, gw = x.shape[-2] // patch, x.shape[-1] // patch
-        s = pt @ torch.from_numpy(u_block).to(pt.device, pt.dtype)
-        out.append(s.reshape(-1, gh, gw).cpu().numpy())
+        out.append(pt.reshape(pt.shape[0], gh, gw, pt.shape[-1])
+                     .cpu().numpy().astype(np.float32))
     return np.concatenate(out), gh, gw
+
+
+def fit_dino_foreground(ctx, band, zs, specs, p_low, p_high, device,
+                        batch_size=8, n_slices=6):
+    """A foreground mask read out of the DINOv2 tokens themselves.
+
+    The first principal component of DINOv2 patch tokens separates object from
+    background -- that is the standard published behaviour of these features,
+    and it is attractive here because it lives in the SAME representation the
+    probe reads. A brightfield-derived mask has to be geometrically aligned to
+    the tiles and can disagree with what the tokens encode; PC1 cannot.
+
+    PC1's sign is arbitrary, so it is fixed by data rather than assumed: the
+    side whose patches are brighter on average is called foreground. The split
+    point is Otsu on the PC1 scores rather than zero, because the two
+    populations are not balanced and the centered zero-crossing sits wherever
+    the foreground fraction puts it.
+
+    Scope: fitted PER VOLUME, on a subsample of slices. That makes it adaptive,
+    which is right for looking at one volume and WRONG for rebuilding features
+    across the dataset -- a per-volume cutoff makes foreground fractions
+    incomparable between volumes, and if tissue coverage tracks force, that
+    bias tracks the label. Use it to inspect and to attribute; do not
+    regenerate `patch_mean_fg` with it without moving the fit to a
+    dataset-wide sample.
+
+    Returns (pc1, threshold, sign) with mask = sign * (tokens @ pc1) > threshold.
+    """
+    picks = list(range(0, len(zs), max(1, len(zs) // max(1, n_slices))))[:n_slices]
+    toks, ints = [], []
+    for zi in picks:
+        t, gh, gw = encode_slice_tokens(ctx, band[zi], specs, p_low, p_high,
+                                        device, batch_size)
+        toks.append(t.reshape(-1, t.shape[-1]))
+        for sp in specs:
+            tile = band[zi][sp["y"]:sp["y"] + TILE, sp["x"]:sp["x"] + TILE]
+            ints.append(patch_descriptors(tile, ctx["patch"])["intensity"]
+                        .ravel())
+    T = np.concatenate(toks).astype(np.float64)
+    I = np.concatenate(ints).astype(np.float64)
+    T = T - T.mean(axis=0)
+    # PC1 by power iteration on the Gram side: 768 dims, ~50k rows.
+    _u, _s, vt = np.linalg.svd(T[np.random.default_rng(0).choice(
+        len(T), size=min(len(T), 20000), replace=False)], full_matrices=False)
+    pc1 = vt[0]
+    proj = T @ pc1
+    sign = 1.0 if np.corrcoef(proj, I)[0, 1] > 0 else -1.0
+    thr = _otsu(sign * proj)
+    return pc1, float(thr), float(sign)
+
+
+def _otsu(v, bins=256):
+    """Otsu split point on a 1-D score."""
+    v = np.asarray(v, dtype=np.float64)
+    lo, hi = float(v.min()), float(v.max())
+    if not np.isfinite(lo) or hi <= lo:
+        return lo
+    hist, edges = np.histogram(v, bins=bins, range=(lo, hi))
+    w = hist.cumsum().astype(np.float64)
+    mids = 0.5 * (edges[1:] + edges[:-1])
+    m = (hist * mids).cumsum()
+    tot_w, tot_m = w[-1], m[-1]
+    w0 = w[:-1]
+    w1 = tot_w - w0
+    ok = (w0 > 0) & (w1 > 0)
+    if not ok.any():
+        return float(np.median(v))
+    mu0 = np.where(ok, m[:-1] / np.maximum(w0, 1), 0.0)
+    mu1 = np.where(ok, (tot_m - m[:-1]) / np.maximum(w1, 1), 0.0)
+    var = w0 * w1 * (mu0 - mu1) ** 2
+    var[~ok] = -1.0
+    return float(mids[int(np.argmax(var))])
+
+
+def resolve_mask_threshold(man, data_dir, stems, feature_dir):
+    """The ONE intensity cutoff the cached features were masked with.
+
+    The probe weights patch tokens by the brightfield foreground mask, so any
+    faithful per-patch attribution needs the same mask. The extractor computes
+    a single dataset-wide threshold (so `view_fg_frac` means the same thing on
+    every volume) but older runs did not record it, so recompute and cache it
+    next to the features rather than silently using a per-volume threshold,
+    which would shift the mask relative to the one the features were built
+    with.
+    """
+    cfg = man.get("config", {})
+    if man.get("mask_threshold") is not None:
+        return float(man["mask_threshold"]), cfg
+    cache = os.path.join(feature_dir, "mask_threshold.json")
+    if os.path.exists(cache):
+        return float(json.load(open(cache))["threshold"]), cfg
+    if cfg.get("mask_scope") != "global":
+        return None, cfg          # per-volume thresholds: recomputed below
+    from extract_dino_features import global_mask_threshold
+    src = cfg.get("mask_source", man.get("mask_source", "bf"))
+    zr = man.get("z_range", "auto")
+    zr = None if zr in (None, "none", "") else zr
+    if zr not in (None, "auto"):
+        zr = [int(v) for v in str(zr).split(",")]
+    thr = global_mask_threshold(
+        sorted(stems), os.path.join(data_dir, src),
+        os.path.join(data_dir, "stats"), zr,
+        int(man.get("z_stride", 1)),
+        cfg.get("mask_method", man.get("mask_method", "li")))
+    if thr is not None:
+        try:
+            json.dump({"threshold": float(thr), "note":
+                       "recomputed by explain_dino_probe.py; matches the "
+                       "extractor's global_mask_threshold"}, open(cache, "w"))
+        except OSError:
+            pass
+    return (None if thr is None else float(thr)), cfg
+
+
+def load_mask_band(data_dir, cfg, man, stem, z_lo, z_hi, z_stride, threshold,
+                   expect_shape):
+    """The foreground mask over the same z-band the features used."""
+    from extract_dino_features import foreground_mask
+    src = cfg.get("mask_source", man.get("mask_source", "bf"))
+    if src in (None, "none"):
+        return None
+    mpath = os.path.join(data_dir, src, f"{stem}.npy")
+    if not os.path.exists(mpath):
+        return None
+    mv = np.load(mpath, mmap_mode="r")
+    if tuple(mv.shape) != tuple(expect_shape):
+        raise SystemExit(
+            f"{stem}: mask source '{src}' has shape {mv.shape} but the input "
+            f"volume has {tuple(expect_shape)}. The tile geometry comes from "
+            f"the input, so a mismatch silently misaligns every mask.")
+    raw = np.asarray(mv[z_lo:z_hi][::max(1, z_stride)])
+    band, _warn = foreground_mask(
+        raw, cfg.get("mask_method", man.get("mask_method", "li")),
+        int(cfg.get("mask_dilate", 0) or 0),
+        float(cfg.get("mask_min_frac", 0.0) or 0.0), threshold=threshold)
+    return band
+
+
+def token_weights(mask_tile, g):
+    """Mask -> per-token weights, exactly as encode_views built them.
+
+    area_resize is a box filter, so a token's weight is the FRACTION of its
+    14x14 pixel footprint that is foreground. A token entirely on background
+    gets weight 0 and therefore contributes nothing -- which is the whole
+    point: without this the attribution map paints a response onto pixels the
+    model provably never pooled.
+    """
+    if mask_tile is None:
+        return None
+    w = np.clip(area_resize(mask_tile.astype(np.float32), g, g), 0, None)
+    tot = float(w.sum())
+    if tot <= 1e-6:
+        # encode_views falls back to the unweighted mean for an empty view.
+        return np.full((g, g), 1.0 / (g * g), dtype=np.float64)
+    return (w / tot).astype(np.float64)
 
 
 def patch_descriptors(tile, patch):
@@ -380,6 +539,15 @@ def main():
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--modality", default="gfp")
     ap.add_argument("--level", choices=["view", "patch"], default="view")
+    ap.add_argument("--mask_mode", choices=["bf", "dino", "none"],
+                    default="bf",
+                    help="which foreground mask weights the patch "
+                         "tokens in --level patch. 'bf' rebuilds the "
+                         "brightfield mask the features were extracted "
+                         "with (faithful to the fitted model). 'dino' "
+                         "derives it from PC1 of the patch tokens. "
+                         "'none' shows the unweighted response and "
+                         "WILL paint background the model never pooled.")
     ap.add_argument("--n_volumes", type=int, default=6,
                     help="how many volumes to render (half highest-predicted, "
                          "half lowest)")
@@ -453,6 +621,17 @@ def main():
     gpct = (global_percentiles(stats_dir, args.modality)
             if man.get("norm_scope") == "global" else None)
 
+    mask_thr, mcfg, mask_projs = None, {}, {}
+    if args.level == "patch" and args.mask_mode == "bf":
+        mask_thr, mcfg = resolve_mask_threshold(man, args.data_dir, stems,
+                                                args.feature_dir)
+        print(f"  mask: {mcfg.get('mask_source','bf')}/"
+              f"{mcfg.get('mask_method','li')} "
+              f"scope={mcfg.get('mask_scope','global')} "
+              f"threshold={'per-volume' if mask_thr is None else f'{mask_thr:.1f}'}")
+    elif args.level == "patch":
+        print(f"  mask: {args.mask_mode}")
+
     ctx = device = None
     if args.level == "patch":
         import torch
@@ -492,81 +671,124 @@ def main():
         gx, gy = man.get("tile_grid", [4, 3])
         specs = plan_views(H, W, "tiled", tile_size=TILE, tile_grid=(gx, gy))
         amap = np.zeros((H, W), np.float64)
+        mproj = np.zeros((H, W), np.float32)
         # How much each view was actually pooled, straight from the cached
         # features. A view below --fg_min contributed NOTHING to the
         # prediction, so painting its response would show the model reading a
         # region it never saw. Those get weight 0 and stay blank.
         vw = {(int(z), int(y), int(x)): float(w) for z, (y, x), w
               in zip(vc["z"], vc["yx"], vc["weight"])}
+
+        # The mask that decides which tokens the prediction is built from.
+        bf_band = None
+        pc1 = pc_thr = pc_sign = None
+        if args.mask_mode == "bf":
+            bf_band = load_mask_band(args.data_dir, mcfg, man, stem, z_lo,
+                                     z_hi, z_stride, mask_thr, vol.shape)
+            if bf_band is None:
+                print(f"    {stem}: no brightfield mask available; "
+                      f"falling back to --mask_mode none")
+        elif args.mask_mode == "dino":
+            pc1, pc_thr, pc_sign = fit_dino_foreground(
+                ctx, band, zs, specs, p_low, p_high, device, args.batch_size)
+
         for zi, _z in enumerate(zs):
             sl = band[zi]
-            grids, gh, gw = patch_score_field(ctx, sl, specs, p_low, p_high,
-                                              ub, device, args.batch_size)
-            gctrl = (patch_score_field(ctx, sl, specs, p_low, p_high, ub_ctrl,
-                                       device, args.batch_size)[0]
-                     if ub_ctrl is not None else None)
+            toks, gh, gw = encode_slice_tokens(ctx, sl, specs, p_low, p_high,
+                                               device, args.batch_size)
+            grids = toks @ ub                                # (n_tiles, gh, gw)
+            gctrl = toks @ ub_ctrl if ub_ctrl is not None else None
             for ti, sp in enumerate(specs):
                 y, x = sp["y"], sp["x"]
                 tile = sl[y:y + TILE, x:x + TILE]
                 if tile.shape != (TILE, TILE):
                     continue
+
+                # b_p: the within-view token weights. THIS is what was missing
+                # before -- without it the map paints a response onto
+                # background tokens whose pooling weight is exactly zero, which
+                # reads as "the model is driven by background" when the model
+                # never saw those tokens at all.
+                if bf_band is not None:
+                    mtile = bf_band[zi][y:y + TILE, x:x + TILE]
+                elif pc1 is not None:
+                    mtile = np.kron(
+                        (pc_sign * (toks[ti] @ pc1) > pc_thr).astype(np.float32),
+                        np.ones((ctx["patch"], ctx["patch"]), np.float32))
+                else:
+                    mtile = None
+                b = token_weights(mtile, gh)
+                if mtile is not None:
+                    np.maximum(mproj[y:y + TILE, x:x + TILE],
+                               np.asarray(mtile, np.float32),
+                               out=mproj[y:y + TILE, x:x + TILE])
+
                 a_v = vw.get((int(_z), int(y), int(x)), 0.0)
                 if a_v > 0:
-                    up = np.kron(grids[ti] * a_v,
-                                 np.ones((ctx["patch"], ctx["patch"])))
+                    # Exact per-patch contribution: a_v * b_p * (u . t_p).
+                    # Summed over patches this is a_v * (u . patch_mean_fg),
+                    # i.e. the view's contribution, so the whole map integrates
+                    # to the prediction the same way the view-level one does.
+                    contrib = grids[ti] * (b if b is not None
+                                           else 1.0 / (gh * gw)) * a_v
+                    up = np.kron(contrib, np.ones((ctx["patch"], ctx["patch"])))
                     hh = min(up.shape[0], H - y); ww = min(up.shape[1], W - x)
                     amap[y:y + hh, x:x + ww] += up[:hh, :ww]
+
                 # descriptors + extreme-patch reservoir, middle slice only:
                 # every slice would multiply the work for a montage that only
                 # needs a few dozen tiles.
                 if zi == len(zs) // 2:
                     d = patch_descriptors(tile, ctx["patch"])
                     D_acc.append(d)
-                    S_acc.append(grids[ti][:d["intensity"].shape[0],
-                                           :d["intensity"].shape[1]])
-                    # Weighting for the descriptor regression. The probe
-                    # weights tokens by the BF-derived foreground mask, which
-                    # is not carried in the feature cache at patch
-                    # resolution; this is an intensity-based stand-in for it
-                    # within the tile. It only decides which patches get a
-                    # vote in the summary regression -- it does not touch the
-                    # attribution maps, which use the real pooling weights.
-                    F_acc.append((d["intensity"] > np.percentile(
-                        d["intensity"], 40)).astype(float))
+                    S_acc.append(grids[ti])
+                    # Vote weight for the descriptor regression: the SAME token
+                    # weights the model pools with, so background patches get
+                    # no say -- previously this was an intensity percentile
+                    # stand-in, which let the excluded region shape the story.
+                    F_acc.append(b if b is not None
+                                 else np.full((gh, gw), 1.0 / (gh * gw)))
                     if gctrl is not None:
-                        S_ctrl_acc.append(
-                            gctrl[ti][:d["intensity"].shape[0],
-                                      :d["intensity"].shape[1]])
-                    g = grids[ti]
-                    flat = g.ravel()
-                    for idx in np.argsort(flat)[-4:]:
-                        i0, j0 = divmod(int(idx), g.shape[1])
+                        S_ctrl_acc.append(gctrl[ti])
+                    # Rank patches the model actually pooled. An unweighted
+                    # argsort surfaces the most extreme BACKGROUND patches,
+                    # which is exactly the artifact under investigation.
+                    g_ = np.where((b if b is not None else 1.0) > 0,
+                                  grids[ti], np.nan)
+                    flat = g_.ravel()
+                    order = np.argsort(np.where(np.isnan(flat), -np.inf, flat))
+                    valid = int(np.isfinite(flat).sum())
+                    for idx in order[max(0, valid - 4):valid]:
+                        i0, j0 = divmod(int(idx), g_.shape[1])
                         banks["top"].append({
                             "score": float(flat[idx]),
                             "patch": tile[i0 * ctx["patch"]:(i0 + 1) * ctx["patch"],
                                           j0 * ctx["patch"]:(j0 + 1) * ctx["patch"]]})
-                    for idx in np.argsort(flat)[:4]:
-                        i0, j0 = divmod(int(idx), g.shape[1])
+                    for idx in order[:min(4, valid)]:
+                        i0, j0 = divmod(int(idx), g_.shape[1])
                         banks["bot"].append({
                             "score": float(flat[idx]),
                             "patch": tile[i0 * ctx["patch"]:(i0 + 1) * ctx["patch"],
                                           j0 * ctx["patch"]:(j0 + 1) * ctx["patch"]]})
+        mask_projs[stem] = mproj
         items.append({"stem": stem, "pred": vc["total"], "image": proj,
-                      "attr": amap})
+                      "attr": amap, "mask": mproj})
 
     tag = os.path.basename(args.readout).replace(".readout.npz", "")
     if args.level == "view":
         # Exact: these values sum to the prediction.
         unit = "contribution per tile-sized region"
         sub = "tile-level contributions -- these add up to the prediction"
+    elif args.mask_mode == "none":
+        unit = "unweighted readout response"
+        sub = ("patch-level response with NO token weighting -- shows regions "
+               "the model never pooled")
     else:
-        # The within-view foreground weighting the probe applies to tokens is
-        # not reconstructable at patch resolution from the feature cache, so
-        # the dense map is the readout's per-patch response scaled by how much
-        # its view was pooled -- exact up to that within-view weighting.
-        unit = "readout response x view weight"
-        sub = ("patch-level readout response, scaled by how much each view "
-               "was pooled")
+        # Exact: a_v * b_p * (u . t_p) sums to the prediction, same as the
+        # view-level map, because b_p is the actual pooling weight.
+        unit = "contribution per pixel"
+        sub = (f"patch-level contributions ({args.mask_mode} mask) -- these "
+               f"add up to the prediction")
     fig_overlays(items, os.path.join(args.out, f"attr_{tag}_{args.level}.png"),
                  f"{target}: {sub}", unit=unit)
 

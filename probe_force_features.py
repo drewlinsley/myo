@@ -886,6 +886,13 @@ def main():
     vol_group = [stem_group[s] for s in stems]
     vol_force = [float(forces[s]) for s in stems]
 
+    # How many FOV volumes back each replicate. Recorded here because
+    # --aggregate label collapses them a few lines below and the count is then
+    # unrecoverable; the figures use it to show what one point is made of.
+    _fov_count = {}
+    for _g in vol_group:
+        _fov_count[_g] = _fov_count.get(_g, 0) + 1
+
     if args.aggregate == "label":
         # Collapse every volume that shares a force value into ONE row before
         # fitting. Those are exactly the FOVs of one tissue: build_force_groups
@@ -1141,6 +1148,7 @@ def main():
                 "feature_names": names[:32],
                 "per_replicate": [
                     {"group": g, "plate": plate_of(g),
+                     "n_fov": int(_fov_count.get(g, 0)),
                      "true_force": float(t), "pred_score": float(s),
                      "true_bin": int(a), "pred_bin": int(b)}
                     for g, t, s, a, b in zip(

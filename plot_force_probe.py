@@ -134,7 +134,15 @@ def short_plate_labels(plates):
     return {p: "-".join(x[i] for i in keep) for p, x in zip(plates, parts)}
 
 
-def panel_scatter(ax, best, label):
+def panel_scatter(ax, best, label, standalone=False, obs_key=None,
+                  p_key=None, mde_key=None):
+    """Held-out prediction vs measurement, one point per replicate.
+
+    A replicate is one (plate, Tissue) pair -- one tissue. Its R001/R002/R003
+    fields of view share a single force value, so they are not independent
+    units and are averaged into the one point drawn here. Point area is
+    proportional to how many FOVs went into it.
+    """
     pr = best.get("per_replicate") or []
     if not pr:
         ax.text(0.5, 0.5, "no per-replicate predictions saved\n"
@@ -144,30 +152,54 @@ def panel_scatter(ax, best, label):
         return
     t = np.array([r["true_force"] for r in pr])
     s = np.array([r["pred_score"] for r in pr])
+    nfov = np.array([int(r.get("n_fov", 0) or 0) for r in pr])
+    sizes = (48 + 34 * (nfov - 1)) if nfov.max() > 0 else np.full(len(t), 48)
     plates = [str(r.get("plate", "?")) for r in pr]
     uniq = sorted(set(plates))
     short = short_plate_labels(uniq)
     cmap = plt.get_cmap("tab10")
     for i, u in enumerate(uniq):
         m = np.array([p == u for p in plates])
-        ax.scatter(t[m], s[m], s=48, color=cmap(i % 10), edgecolor="k",
-                   linewidth=0.5, label=short[u], zorder=3)
+        ax.scatter(t[m], s[m], s=sizes[m], color=cmap(i % 10), edgecolor="k",
+                   linewidth=0.5, label=short[u], zorder=3,
+                   alpha=0.9 if standalone else 1.0)
     if len(t) > 2 and np.ptp(t) > 0:
+        # Fit to ALL points, so it is descriptive only. The held-out evidence
+        # is the rank correlation and its permutation p, not this line.
         b, a = np.polyfit(t, s, 1)
         xs = np.linspace(t.min(), t.max(), 2)
-        ax.plot(xs, a + b * xs, "k--", lw=1.2, zorder=2)
+        ax.plot(xs, a + b * xs, "k--", lw=1.2, zorder=2,
+                label="least squares (descriptive)" if standalone else None)
 
     dc = best.get("deconfound", "none")
     unit = ("within-plate centered" if dc == "plate" else "raw")
-    ax.set_xlabel(f"true {best.get('target_col','force')}  ({unit})")
-    ax.set_ylabel("LOO predicted (held-out)")
-    ax.set_title(f"A. one point per replicate (n={len(t)})", loc="left",
-                 fontsize=10, fontweight="bold")
-    ax.legend(title="plate", fontsize=7, title_fontsize=7, loc="best",
-              framealpha=0.9)
+    ax.set_xlabel(f"measured {best.get('target_col','force')}  ({unit})")
+    ax.set_ylabel("predicted, leave-one-replicate-out")
     ax.grid(alpha=0.25)
-    # The line is fit to ALL points, so it is descriptive, not held-out
-    # evidence; the held-out evidence is the rank correlation in panel B.
+    ax.legend(title="plate (batch)", fontsize=7.5, title_fontsize=7.5,
+              loc="best", framealpha=0.9)
+
+    if not standalone:
+        ax.set_title(f"A. one point per replicate (n={len(t)})", loc="left",
+                     fontsize=10, fontweight="bold")
+        return
+
+    obs, pp = best.get(obs_key), best.get(p_key)
+    mde = best.get(mde_key)
+    box = [f"{label:<12}{_fmt(obs)}",
+           f"{'p (permutation)':<12}{_fmt(pp)}",
+           f"{'detectable >':<12}{_fmt(mde)}"]
+    ax.text(0.02, 0.98, "\n".join(box), transform=ax.transAxes, va="top",
+            ha="left", family="monospace", fontsize=8.5,
+            bbox=dict(boxstyle="round,pad=0.45", fc="white", ec="0.6",
+                      alpha=0.92))
+    nfovs = f"{nfov.min()}-{nfov.max()}" if nfov.max() else "?"
+    ax.set_title(
+        f"Held-out force prediction: one point per replicate\n"
+        f"{len(t)} tissues on {best.get('n_plates','?')} plates  -  "
+        f"{best.get('n_volumes','?')} FOV volumes ({nfovs} per tissue, "
+        f"averaged)  -  point area proportional to FOVs",
+        fontsize=10.5, fontweight="bold", loc="left")
 
 
 def panel_null(ax, best, obs_key, null_key, p_key, mde_key, label):
