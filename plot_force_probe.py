@@ -186,9 +186,9 @@ def panel_scatter(ax, best, label, standalone=False, obs_key=None,
 
     obs, pp = best.get(obs_key), best.get(p_key)
     mde = best.get(mde_key)
-    box = [f"{label:<12}{_fmt(obs)}",
-           f"{'p (permutation)':<12}{_fmt(pp)}",
-           f"{'detectable >':<12}{_fmt(mde)}"]
+    box = [f"{label:<17} {_fmt(obs)}",
+           f"{'p (permutation)':<17} {_fmt(pp)}",
+           f"{'detectable only >':<17} {_fmt(mde)}"]
     ax.text(0.02, 0.98, "\n".join(box), transform=ax.transAxes, va="top",
             ha="left", family="monospace", fontsize=8.5,
             bbox=dict(boxstyle="round,pad=0.45", fc="white", ec="0.6",
@@ -328,6 +328,9 @@ def main():
     ap.add_argument("--out", default="results/figures")
     ap.add_argument("--tag", default=None,
                     help="filename stem (default: the results dir name)")
+    ap.add_argument("--panels", choices=["combined", "split", "both"],
+                    default="both",
+                    help="'split' also writes each panel as its own figure")
     ap.add_argument("--select", default=None,
                     help="plot this config in panels A/B instead of the "
                          "top-ranked one (substring match on the file stem)")
@@ -356,26 +359,59 @@ def main():
 
     fw = family_wise_p(real, obs_key, null_key)
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9.5))
-    panel_scatter(axes[0][0], best, label)
-    panel_null(axes[0][1], best, obs_key, null_key, p_key, mde_key, label)
-    panel_forest(axes[1][0], real, obs_key, null_key, mde_key, label)
-    panel_facts(axes[1][1], best, real, ctrl, fw, obs_key, p_key, mde_key,
-                label)
-
+    os.makedirs(args.out, exist_ok=True)
+    tag = args.tag or os.path.basename(os.path.normpath(args.results_dir))
     tgt = best.get("target_col", "force")
     verdict = ("NOT distinguishable from chance"
                if not fw or fw[0] >= 0.05 else "survives family-wise correction")
-    fig.suptitle(f"Frozen DINOv2 -> {tgt}:  {verdict}",
-                 fontsize=13, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.965))
 
-    os.makedirs(args.out, exist_ok=True)
-    tag = args.tag or os.path.basename(os.path.normpath(args.results_dir))
-    for ext in ("png", "pdf"):
-        p = os.path.join(args.out, f"probe_{tag}.{ext}")
-        fig.savefig(p, dpi=180)
-        print(f"  saved {p}")
+    def _save(fig, name):
+        for ext in ("png", "pdf"):
+            fp = os.path.join(args.out, f"{name}.{ext}")
+            fig.savefig(fp, dpi=180, bbox_inches="tight")
+            print(f"  saved {fp}")
+        plt.close(fig)
+
+    if args.panels in ("combined", "both"):
+        fig, axes = plt.subplots(2, 2, figsize=(13, 9.5))
+        panel_scatter(axes[0][0], best, label)
+        panel_null(axes[0][1], best, obs_key, null_key, p_key, mde_key, label)
+        panel_forest(axes[1][0], real, obs_key, null_key, mde_key, label)
+        panel_facts(axes[1][1], best, real, ctrl, fw, obs_key, p_key, mde_key,
+                    label)
+        fig.suptitle(f"Frozen DINOv2 -> {tgt}:  {verdict}",
+                     fontsize=13, fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, 0.965))
+        _save(fig, f"probe_{tag}")
+
+    if args.panels in ("split", "both"):
+        # Each panel standalone, for slides. The scatter gets its own
+        # treatment rather than being the combined panel blown up: on its own
+        # it has to carry the sample structure and the significance that
+        # panels B-D would otherwise supply, or it reads as a clean result.
+        f1, a1 = plt.subplots(figsize=(7.6, 6.4))
+        panel_scatter(a1, best, label, standalone=True, obs_key=obs_key,
+                      p_key=p_key, mde_key=mde_key)
+        _save(f1, f"probe_{tag}_scatter")
+
+        f2, a2 = plt.subplots(figsize=(7.6, 5.0))
+        panel_null(a2, best, obs_key, null_key, p_key, mde_key, label)
+        a2.set_title(f"{tgt}: observed vs the permutation null", loc="left",
+                     fontsize=10.5, fontweight="bold")
+        _save(f2, f"probe_{tag}_null")
+
+        n_cfg = sum(1 for d in real if d.get(obs_key) is not None)
+        f3, a3 = plt.subplots(figsize=(8.6, 1.1 + 0.5 * max(3, n_cfg)))
+        panel_forest(a3, real, obs_key, null_key, mde_key, label)
+        a3.set_title(f"{tgt}: every config against its own null", loc="left",
+                     fontsize=10.5, fontweight="bold")
+        _save(f3, f"probe_{tag}_configs")
+
+        f4, a4 = plt.subplots(figsize=(8.0, 5.2))
+        panel_facts(a4, best, real, ctrl, fw, obs_key, p_key, mde_key, label)
+        a4.set_title(f"{tgt}: what this design could and could not see",
+                     loc="left", fontsize=10.5, fontweight="bold")
+        _save(f4, f"probe_{tag}_design")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,18 @@ FIG_DIR="${FIG_DIR:-results/figures}"
 XAI_DIR="${XAI_DIR:-results/xai}"
 N_VOLUMES="${N_VOLUMES:-6}"
 DENSE="${DENSE:-1}"          # 0 to skip the GPU pass
+# Which foreground mask weights the patch tokens in the dense pass.
+#   bf   rebuild the brightfield mask the features were extracted with. This
+#        is the only mode faithful to the model that was actually fit, and its
+#        map integrates to the prediction.
+#   dino foreground from PC1 of the patch tokens, thresholded by Otsu with the
+#        sign fixed by mean pixel intensity. Same representation the probe
+#        reads, so it cannot be misaligned to the tiles -- but it is NOT the
+#        mask the cached features were pooled with, so it answers "what would
+#        it draw from", not "what did it draw from".
+#   none no token weighting at all. Paints background the model never pooled;
+#        useful only for showing what that artifact looks like.
+MASK_MODE="${MASK_MODE:-bf}"
 
 # ── 1. results ──
 if [ "${SKIP_SWEEP:-0}" != "1" ]; then
@@ -123,7 +135,8 @@ if [ "$DENSE" = "1" ]; then
   echo ""; echo "▶ 4. patch-level attribution (re-runs DINOv2 on $N_VOLUMES volumes)"
   python explain_dino_probe.py --readout "$READOUT" \
     --feature_dir "$fdir" --data_dir "$DATA_DIR" --modality "$MODALITY" \
-    --level patch --n_volumes "$N_VOLUMES" --out "$XAI_DIR" \
+    --level patch --n_volumes "$N_VOLUMES" --mask_mode "$MASK_MODE" \
+    --out "$XAI_DIR" \
     "${ctrl_arg[@]+"${ctrl_arg[@]}"}"
 else
   echo ""; echo "▶ 4. skipped (DENSE=0)"

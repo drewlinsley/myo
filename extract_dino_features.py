@@ -409,6 +409,10 @@ def main():
         manifest.update({"dim": ctx["dim"], "patch": ctx["patch"],
                          "img_size": ctx["img_size"],
                          "n_prefix": ctx["n_prefix"]})
+    # Record the actual cutoff. Without it, anything that wants to rebuild
+    # these masks later (explain_dino_probe.py) has to recompute the median
+    # over a sample and hope it lands on the same number.
+    manifest["mask_threshold"] = (None if g_thresh is None else float(g_thresh))
 
     for si, stem in enumerate(stems):
         with open(os.path.join(stats_dir, f"{stem}.json")) as f:

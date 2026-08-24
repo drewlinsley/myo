@@ -77,6 +77,7 @@ def _by_path(mod_file, name):
 _dv = _by_path("dino_views.py", "dino_views")
 _zb = _by_path("zband.py", "zband")
 _nm = _by_path("normalization.py", "normalization")
+_fg = _by_path("foreground_mask.py", "foreground_mask")
 plan_views, make_view = _dv.plan_views, _dv.make_view
 area_resize = _dv.area_resize
 resolve_z_range = _zb.resolve_z_range
@@ -290,17 +291,36 @@ def resolve_mask_threshold(man, data_dir, stems, feature_dir):
         return float(json.load(open(cache))["threshold"]), cfg
     if cfg.get("mask_scope") != "global":
         return None, cfg          # per-volume thresholds: recomputed below
-    from extract_dino_features import global_mask_threshold
+    # Mirrors extract_dino_features.global_mask_threshold -- median of the
+    # per-volume thresholds over a sample, giving ONE physical cutoff. Kept
+    # here rather than imported because that module pulls in torch through
+    # src.data, and everything except the DINOv2 forward pass in this script
+    # runs without it. If that function changes, change this with it.
     src = cfg.get("mask_source", man.get("mask_source", "bf"))
+    method = cfg.get("mask_method", man.get("mask_method", "li"))
     zr = man.get("z_range", "auto")
     zr = None if zr in (None, "none", "") else zr
     if zr not in (None, "auto"):
         zr = [int(v) for v in str(zr).split(",")]
-    thr = global_mask_threshold(
-        sorted(stems), os.path.join(data_dir, src),
-        os.path.join(data_dir, "stats"), zr,
-        int(man.get("z_stride", 1)),
-        cfg.get("mask_method", man.get("mask_method", "li")))
+    z_stride = int(man.get("z_stride", 1))
+    ordered = sorted(stems)
+    picks = ordered[::max(1, len(ordered) // 12)][:12]
+    vals = []
+    for stem in picks:
+        mpath = os.path.join(data_dir, src, f"{stem}.npy")
+        spath = os.path.join(data_dir, "stats", f"{stem}.json")
+        if not (os.path.exists(mpath) and os.path.exists(spath)):
+            continue
+        st = json.load(open(spath))
+        mv = np.load(mpath, mmap_mode="r")
+        z_lo, z_hi = ((0, mv.shape[0]) if zr is None
+                      else resolve_z_range(zr, st, mv.shape[0]))
+        try:
+            vals.append(_fg._threshold(
+                np.asarray(mv[z_lo:z_hi][::max(1, z_stride)]), method))
+        except Exception:
+            continue
+    thr = float(np.median(vals)) if vals else None
     if thr is not None:
         try:
             json.dump({"threshold": float(thr), "note":
@@ -314,7 +334,6 @@ def resolve_mask_threshold(man, data_dir, stems, feature_dir):
 def load_mask_band(data_dir, cfg, man, stem, z_lo, z_hi, z_stride, threshold,
                    expect_shape):
     """The foreground mask over the same z-band the features used."""
-    from extract_dino_features import foreground_mask
     src = cfg.get("mask_source", man.get("mask_source", "bf"))
     if src in (None, "none"):
         return None
@@ -328,11 +347,17 @@ def load_mask_band(data_dir, cfg, man, stem, z_lo, z_hi, z_stride, threshold,
             f"volume has {tuple(expect_shape)}. The tile geometry comes from "
             f"the input, so a mismatch silently misaligns every mask.")
     raw = np.asarray(mv[z_lo:z_hi][::max(1, z_stride)])
-    band, _warn = foreground_mask(
-        raw, cfg.get("mask_method", man.get("mask_method", "li")),
-        int(cfg.get("mask_dilate", 0) or 0),
-        float(cfg.get("mask_min_frac", 0.0) or 0.0), threshold=threshold)
-    return band
+    dilate = int(cfg.get("mask_dilate", 0) or 0)
+    min_frac = float(cfg.get("mask_min_frac", 0.0) or 0.0)
+    # Same two branches as extract_dino_features.foreground_mask.
+    if threshold is not None:
+        band = raw > threshold
+        if dilate or min_frac > 0:
+            band = _fg._cleanup_per_slice(band, dilate, min_frac)
+        return band
+    return _fg.compute_bf_foreground_mask(
+        raw, method=cfg.get("mask_method", man.get("mask_method", "li")),
+        dilate=dilate, min_component_frac=min_frac)
 
 
 def token_weights(mask_tile, g):
@@ -498,6 +523,71 @@ def fig_extremes(top, bot, out_path, title, k=24):
                  "and lowest (bottom)", fontsize=10, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     fig.savefig(out_path, dpi=190)
+    plt.close(fig)
+    print(f"  saved {out_path}")
+
+
+def fig_masks(items, out_path, mask_mode, fg_min):
+    """What the model was actually allowed to look at.
+
+    Four columns per volume, because "the background is driving it" and "the
+    mask is broken" are different claims and only this separates them:
+
+      GFP / BF     the two channels, so a region that is dark in GFP but real
+                   tissue in brightfield is visible as such. The mask is built
+                   from BF; judging it against the GFP projection alone will
+                   call correct foreground "background".
+      mask         the actual weights, projected over z
+      tiles        the 4x3 grid, each tile labeled with how many of its
+                   z-slices cleared --fg_min. A tile at 0 contributed nothing
+                   to the prediction at all.
+    """
+    from matplotlib.patches import Rectangle
+    n = len(items)
+    fig, axes = plt.subplots(n, 4, figsize=(15.5, 3.3 * n), squeeze=False)
+    for i, it in enumerate(items):
+        img, msk = it["image"], it.get("mask")
+        lo, hi = np.percentile(img, [1, 99.5])
+        axes[i][0].imshow(img, cmap="gray", vmin=lo, vmax=hi)
+        axes[i][0].set_ylabel(f"{it['stem']}\npred {it['pred']:+.3f}",
+                              fontsize=7)
+        if it.get("bf") is not None:
+            b = it["bf"]
+            blo, bhi = np.percentile(b, [1, 99.5])
+            axes[i][1].imshow(b, cmap="gray", vmin=blo, vmax=bhi)
+        else:
+            axes[i][1].text(0.5, 0.5, "no brightfield volume", ha="center",
+                            va="center", transform=axes[i][1].transAxes,
+                            fontsize=8)
+        if msk is not None:
+            frac = float((msk > 0.5).mean())
+            axes[i][2].imshow(msk, cmap="viridis", vmin=0, vmax=1)
+            axes[i][2].set_xlabel(f"foreground {frac:.0%} of field", fontsize=7)
+        axes[i][3].imshow(img, cmap="gray", vmin=lo, vmax=hi)
+        if msk is not None:
+            axes[i][3].contour(msk, levels=[0.5], colors="lime",
+                               linewidths=0.7)
+        nz = max(1, it.get("n_z", 1))
+        for (y, x, kept) in it.get("tiles", []):
+            r = kept / nz
+            axes[i][3].add_patch(Rectangle(
+                (x, y), TILE, TILE, fill=False, lw=1.1,
+                edgecolor=("tab:red" if r == 0 else
+                           "tab:orange" if r < 0.5 else "white"),
+                linestyle="--" if r == 0 else "-"))
+            axes[i][3].text(x + 12, y + 46, f"{kept}/{nz}", fontsize=6,
+                            color=("tab:red" if r == 0 else "white"))
+        for j, t in enumerate([
+                "GFP (max projection)",
+                "brightfield -- the mask is built from THIS",
+                f"foreground mask ({mask_mode})",
+                f"mask outline + tiles clearing fg_min={fg_min}"]):
+            axes[i][j].set_xticks([]); axes[i][j].set_yticks([])
+            if i == 0:
+                axes[i][j].set_title(t, fontsize=9)
+    fig.suptitle("What the model was allowed to look at", fontsize=11,
+                 fontweight="bold")
+    fig.savefig(out_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {out_path}")
 
@@ -771,8 +861,23 @@ def main():
                             "patch": tile[i0 * ctx["patch"]:(i0 + 1) * ctx["patch"],
                                           j0 * ctx["patch"]:(j0 + 1) * ctx["patch"]]})
         mask_projs[stem] = mproj
+        kept_by_tile = {}
+        for zz, (yy, xx) in zip(vc["z"], vc["yx"]):
+            kept_by_tile[(int(yy), int(xx))] = \
+                kept_by_tile.get((int(yy), int(xx)), 0) + 1
+        bf_path = os.path.join(args.data_dir,
+                               mcfg.get("mask_source", "bf"), f"{stem}.npy")
+        bf_proj = None
+        if os.path.exists(bf_path):
+            _bv = np.load(bf_path, mmap_mode="r")
+            if tuple(_bv.shape) == tuple(vol.shape):
+                bf_proj = np.asarray(_bv[z_lo:z_hi:max(1, z_stride)]).max(axis=0)
         items.append({"stem": stem, "pred": vc["total"], "image": proj,
-                      "attr": amap, "mask": mproj})
+                      "attr": amap, "mask": mproj, "bf": bf_proj,
+                      "tiles": [(sp["y"], sp["x"],
+                                 kept_by_tile.get((sp["y"], sp["x"]), 0))
+                                for sp in specs],
+                      "n_z": len(zs)})
 
     tag = os.path.basename(args.readout).replace(".readout.npz", "")
     if args.level == "view":
@@ -783,12 +888,21 @@ def main():
         unit = "unweighted readout response"
         sub = ("patch-level response with NO token weighting -- shows regions "
                "the model never pooled")
-    else:
+    elif args.mask_mode == "bf":
         # Exact: a_v * b_p * (u . t_p) sums to the prediction, same as the
-        # view-level map, because b_p is the actual pooling weight.
+        # view-level map, because b_p is the weight the features were built
+        # with.
         unit = "contribution per pixel"
-        sub = (f"patch-level contributions ({args.mask_mode} mask) -- these "
-               f"add up to the prediction")
+        sub = ("patch-level contributions (brightfield mask, as fitted) -- "
+               "these add up to the prediction")
+    else:
+        # A DIFFERENT mask from the one the features were pooled with, so the
+        # map answers "what would this readout draw from under a token-derived
+        # mask", not "what did it draw from". It does not sum to the fitted
+        # prediction and must not be presented as if it did.
+        unit = "contribution per pixel (DINO mask)"
+        sub = ("patch-level contributions under a token-derived mask -- NOT "
+               "the mask the features were pooled with")
     fig_overlays(items, os.path.join(args.out, f"attr_{tag}_{args.level}.png"),
                  f"{target}: {sub}", unit=unit)
 
@@ -796,6 +910,17 @@ def main():
                "level": args.level, "attributable_norm_fraction": frac,
                "fold_cosine": (float(fc) if fc is not None else None),
                "volumes": [{"stem": s, "pred": v["total"]} for s, v in scored]}
+
+    if args.level == "patch":
+        fig_masks(items, os.path.join(args.out, f"masks_{tag}.png"),
+                  args.mask_mode, fg_min)
+        summary["mask_mode"] = args.mask_mode
+        summary["mask_foreground_fraction"] = {
+            it["stem"]: float((it["mask"] > 0.5).mean())
+            for it in items if it.get("mask") is not None}
+        summary["tiles_clearing_fg_min"] = {
+            it["stem"]: [int(k) for _y, _x, k in it.get("tiles", [])]
+            for it in items}
 
     if args.level == "patch" and D_acc:
         keys = list(D_acc[0].keys())
