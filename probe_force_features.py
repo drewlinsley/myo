@@ -343,6 +343,62 @@ def load_dino_features(feature_dir, stems, token, agg, fg_min, struct=()):
 
 
 # --------------------------------------------------------------------------
+# the readout direction (what the model actually reads off the features)
+# --------------------------------------------------------------------------
+def _readout_direction(m, comp, sd):
+    """Map a fitted linear readout back into ORIGINAL feature space.
+
+    The probe is a chain of affine maps: standardize by (mu, sd), rotate into
+    the top-`n_comp` weighted-PCA subspace, then a linear model. So the whole
+    thing is linear in the raw feature vector and collapses to a single
+    direction `u` with
+
+        prediction = u . x  +  const
+
+    That matters for explanation: because pooling over views is itself a
+    weighted mean, `u . x` distributes EXACTLY over views (and, one level
+    down, over patch tokens). No gradient approximation is involved -- the
+    per-view contributions literally sum to the prediction. See
+    explain_dino_probe.py, which consumes this.
+
+    Returns None for a model with no `coef_` (xgboost), and for multiclass
+    logistic, where "the" direction is not one vector.
+    """
+    coef = getattr(m, "coef_", None)
+    if coef is None:
+        return None
+    cf = np.asarray(coef, dtype=np.float64)
+    if cf.ndim > 1:
+        if cf.shape[0] != 1:
+            return None            # multiclass: no single direction
+        cf = cf[0]
+    cf = cf.ravel()
+    if comp is not None:
+        cf = comp.T @ cf           # PCA space -> standardized feature space
+    return cf / sd                 # -> raw feature space
+
+
+def direction_stability(dirs):
+    """Mean pairwise cosine between per-fold readout directions.
+
+    This is the honesty check on any "here is what the model looks at" claim.
+    Each LOO fold refits on 21 of 22 replicates, so the folds SHOULD agree
+    almost perfectly if the direction is driven by the data. If they do not,
+    the attribution maps are a property of the particular resample, not of the
+    biology, and no feature story should be told from them.
+    """
+    if len(dirs) < 2:
+        return None
+    D = np.asarray(dirs, dtype=np.float64)
+    n = np.linalg.norm(D, axis=1, keepdims=True)
+    n[n < 1e-12] = 1.0
+    D = D / n
+    G = D @ D.T
+    iu = np.triu_indices(len(D), k=1)
+    return float(G[iu].mean())
+
+
+# --------------------------------------------------------------------------
 # the LOO probe
 # --------------------------------------------------------------------------
 def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
@@ -372,6 +428,7 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
     grid = [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]
 
     pred_force, true_force, pred_bin, true_bin, held_reps = [], [], [], [], []
+    fold_dirs = []
 
     for held in folds:
         te = np.array([g == held for g in cv_groups])
@@ -424,6 +481,7 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
         n_comp = int(min(pca_dim, Xtr.shape[0] - 1, Xtr.shape[1]))
         if model_class != "ridge":
             n_comp = 0
+        comp = None
         if n_comp >= 1 and Xtr.shape[1] > n_comp:
             # weighted PCA == SVD of the sqrt(w)-scaled, weighted-centered data
             Z = Xtr * np.sqrt(w)[:, None]
@@ -469,6 +527,7 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
                                       _hp_grid(model_class), make, "r2", seed)
             m = make(alpha).fit(Xtr, ytr, sample_weight=w)
             p = m.predict(Xte)
+            fold_dirs.append(_readout_direction(m, comp, sd))
         else:
             if len(set(ytr_bin)) < 2:
                 continue
@@ -491,6 +550,7 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
             m = LogisticRegression(C=C, max_iter=2000).fit(
                 Xtr, ytr_bin, sample_weight=wb)
             p = m.predict_proba(Xte)
+            fold_dirs.append(_readout_direction(m, comp, sd))
 
         # collapse held-out VOLUMES to one prediction per replicate
         te_groups = np.asarray(vol_group)[te]
@@ -528,7 +588,8 @@ def run_loo(X, vol_group, vol_force, cv_groups, task, n_bins, pca_dim,
             "true_force": np.asarray(true_force),
             "pred_score": np.asarray(pred_force),
             "true_bin": np.asarray(true_bin),
-            "pred_bin": np.asarray(pred_bin)}
+            "pred_bin": np.asarray(pred_bin),
+            "fold_dirs": [d for d in fold_dirs if d is not None]}
 
 
 def _hp_grid(model_class):
@@ -1079,11 +1140,44 @@ def main():
                 "n_volumes": len(stems), "feature_dim": int(X.shape[1]),
                 "feature_names": names[:32],
                 "per_replicate": [
-                    {"group": g, "true_force": float(t), "pred_score": float(s),
+                    {"group": g, "plate": plate_of(g),
+                     "true_force": float(t), "pred_score": float(s),
                      "true_bin": int(a), "pred_bin": int(b)}
                     for g, t, s, a, b in zip(
                         res["replicates"], res["true_force"], res["pred_score"],
                         res["true_bin"], res["pred_bin"])]})
+
+    # ---- the readout direction, for explanation ----
+    #
+    # Saved as a sidecar .npz rather than inline, because it is one float per
+    # feature dimension (768-1536) and would swamp the JSON. `mean_direction`
+    # is the average of the per-fold directions; `fold_cosine` says whether
+    # averaging them was meaningful in the first place.
+    fdirs = res.get("fold_dirs") or []
+    out["readout_fold_cosine"] = direction_stability(fdirs)
+    out["readout_n_folds"] = len(fdirs)
+    if fdirs and args.output:
+        _dir_path = os.path.splitext(args.output)[0] + ".readout.npz"
+        os.makedirs(os.path.dirname(_dir_path) or ".", exist_ok=True)
+        _D = np.asarray(fdirs, dtype=np.float64)
+        np.savez_compressed(
+            _dir_path, mean_direction=_D.mean(axis=0), fold_directions=_D,
+            feature_names=np.asarray(names, dtype=object),
+            token=args.token, agg=args.agg, fg_min=float(args.fg_min),
+            struct=args.struct, deconfound=args.deconfound,
+            target_col=args.target_col, task=args.task,
+            model_class=args.model_class,
+            fold_cosine=(np.nan if out["readout_fold_cosine"] is None
+                         else out["readout_fold_cosine"]))
+        out["readout_path"] = _dir_path
+    if out["readout_fold_cosine"] is not None:
+        _fc = out["readout_fold_cosine"]
+        print(f"  readout direction: mean pairwise cosine across "
+              f"{len(fdirs)} folds = {_fc:+.3f}"
+              + ("" if _fc >= 0.9 else
+                 "  <-- UNSTABLE: the folds disagree about which feature "
+                 "direction predicts force, so any saliency map from this "
+                 "model describes one resample, not the biology"))
 
     print(f"\n  LOO n={out['n_replicates']}  "
           f"acc={out['replicate_accuracy']:.3f} (chance {out['chance']:.3f}, "
