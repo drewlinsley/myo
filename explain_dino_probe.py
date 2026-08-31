@@ -480,39 +480,59 @@ def _sym(a):
 def fig_overlays(items, out_path, title, unit="contribution"):
     """Image + attribution, one row per volume, ordered by predicted force.
 
-    Two color scales, deliberately:
+    Calibration rules, learned the hard way (the patch montage had the same
+    diseases):
 
+      grayscale       normalized with the volume's OWN model-input percentiles
+                      (vol "pp"), not display autoscale, so brightness
+                      differences between rows are the ones the model saw.
       "contribution"  ONE scale shared by every row. Volumes differ mostly by
                       an overall offset -- that offset IS the prediction -- and
                       a per-row scale would renormalize it away, making a
                       weakly-scoring volume look as emphatic as a strong one.
-      "within volume" each row's contribution minus its own mean, on its own
-                      scale. This is the part that answers "which regions",
-                      and it is only readable once the offset is removed.
-
-    Showing only one of the two misleads in one direction or the other.
+      "within volume" the row's contribution minus its own mean, but on ONE
+                      deviation scale shared across rows. A per-row scale
+                      stretched an essentially flat map to look as structured
+                      as a strong one.
+      overlay         color opacity is PROPORTIONAL to |value|. A constant
+                      alpha painted coolwarm's near-white midpoint over the
+                      whole field, so zero attribution over dark background
+                      rendered as a pale pink haze -- which reads as "the
+                      background is red" when the background carries nothing.
+                      Zero is now transparent by construction.
     """
     n = len(items)
     allmaps = np.concatenate([it["attr"].ravel() for it in items])
     gvmin, gvmax = _sym(allmaps)
+    devs = [it["attr"] - float(np.nanmean(it["attr"])) for it in items]
+    _, dvmax = _sym(np.concatenate([d.ravel() for d in devs]))
+    dvmax = dvmax or 1.0
+    cmap = plt.get_cmap("coolwarm")
     fig, axes = plt.subplots(n, 4, figsize=(15.5, 3.3 * n), squeeze=False)
     for i, it in enumerate(items):
-        img, amap = it["image"], it["attr"]
-        lo, hi = np.percentile(img, [1, 99.5])
-        dev = amap - float(np.nanmean(amap))
-        dmin, dmax = _sym(dev)
-        axes[i][0].imshow(img, cmap="gray", vmin=lo, vmax=hi)
+        img, dev = it["image"], devs[i]
+        pp = it.get("pp")
+        if pp is not None:
+            gimg = np.clip((np.asarray(img, np.float64) - pp[0])
+                           / max(pp[1] - pp[0], 1e-9), 0, 1)
+        else:
+            lo, hi = np.percentile(img, [1, 99.5])
+            gimg = np.clip((np.asarray(img, np.float64) - lo)
+                           / max(hi - lo, 1e-9), 0, 1)
+        axes[i][0].imshow(gimg, cmap="gray", vmin=0, vmax=1)
         axes[i][0].set_ylabel(f"{it['stem']}\npred {it['pred']:+.3f}",
                               fontsize=7)
-        axes[i][1].imshow(amap, cmap="coolwarm", vmin=gvmin, vmax=gvmax)
-        axes[i][2].imshow(dev, cmap="coolwarm", vmin=dmin, vmax=dmax)
-        axes[i][3].imshow(img, cmap="gray", vmin=lo, vmax=hi)
-        axes[i][3].imshow(dev, cmap="coolwarm", vmin=dmin, vmax=dmax,
-                          alpha=0.55)
-        for j, t in enumerate(["signal (max projection)",
-                               f"{unit} (shared scale +/-{gvmax:.2g})",
-                               "within volume (own scale)",
-                               "overlay of within-volume"]):
+        axes[i][1].imshow(it["attr"], cmap="coolwarm", vmin=gvmin, vmax=gvmax)
+        axes[i][2].imshow(dev, cmap="coolwarm", vmin=-dvmax, vmax=dvmax)
+        nd = np.clip(dev / dvmax, -1, 1)
+        rgba = cmap((nd + 1) / 2)
+        rgba[..., 3] = np.abs(nd) ** 0.7 * 0.85
+        axes[i][3].imshow(gimg, cmap="gray", vmin=0, vmax=1)
+        axes[i][3].imshow(rgba)
+        for j, t in enumerate(["signal (model-input scale)",
+                               f"{unit} (shared +/-{gvmax:.2g})",
+                               f"within volume (shared +/-{dvmax:.2g})",
+                               "overlay (opacity = |value|)"]):
             axes[i][j].set_xticks([]); axes[i][j].set_yticks([])
             if i == 0:
                 axes[i][j].set_title(t, fontsize=9)
@@ -848,7 +868,8 @@ def main():
 
         if args.level == "view":
             items.append({"stem": stem, "pred": vc["total"],
-                          "image": proj, "attr": paint_view_map(vc, H, W)})
+                          "image": proj, "pp": (p_low, p_high),
+                          "attr": paint_view_map(vc, H, W)})
             continue
 
         # ---- dense ----
@@ -980,6 +1001,7 @@ def main():
             if tuple(_bv.shape) == tuple(vol.shape):
                 bf_proj = np.asarray(_bv[z_lo:z_hi:max(1, z_stride)]).max(axis=0)
         items.append({"stem": stem, "pred": vc["total"], "image": proj,
+                      "pp": (p_low, p_high),
                       "attr": amap, "mask": mproj, "bf": bf_proj,
                       "tiles": [(sp["y"], sp["x"],
                                  kept_by_tile.get((sp["y"], sp["x"]), 0))
