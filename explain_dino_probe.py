@@ -166,10 +166,12 @@ def paint_view_map(vc, H, W):
     z-slice of a tile is a separate view and all of them are pooled.
     """
     acc = np.zeros((H, W), np.float64)
+    cnt = np.zeros((H, W), np.float64)
     for c, (y, x) in zip(vc["contrib"], vc["yx"]):
         y, x = int(y), int(x)
         acc[y:min(y + TILE, H), x:min(x + TILE, W)] += c
-    return acc
+        cnt[y:min(y + TILE, H), x:min(x + TILE, W)] += 1
+    return acc, cnt
 
 
 # --------------------------------------------------------------------------
@@ -270,6 +272,53 @@ def _otsu(v, bins=256):
     var = w0 * w1 * (mu0 - mu1) ** 2
     var[~ok] = -1.0
     return float(mids[int(np.argmax(var))])
+
+
+def upsample_bilinear(grid, out_h, out_w):
+    """Token grid -> pixels, bilinear, token values at cell centers."""
+    gh, gw = grid.shape
+    ys = np.clip((np.arange(out_h) + 0.5) * gh / out_h - 0.5, 0, gh - 1)
+    xs = np.clip((np.arange(out_w) + 0.5) * gw / out_w - 0.5, 0, gw - 1)
+    y0 = np.floor(ys).astype(int); y1 = np.minimum(y0 + 1, gh - 1)
+    x0 = np.floor(xs).astype(int); x1 = np.minimum(x0 + 1, gw - 1)
+    fy = (ys - y0)[:, None]
+    fx = (xs - x0)[None, :]
+    a = grid[np.ix_(y0, x0)]; b = grid[np.ix_(y0, x1)]
+    c = grid[np.ix_(y1, x0)]; d = grid[np.ix_(y1, x1)]
+    return (a * (1 - fy) * (1 - fx) + b * (1 - fy) * fx
+            + c * fy * (1 - fx) + d * fy * fx)
+
+
+def _box1d(a, r, axis):
+    """Mean over a clamped window of radius r along one axis, via cumsum."""
+    n = a.shape[axis]
+    if r <= 0 or n <= 1:
+        return a
+    c = np.cumsum(a, axis=axis, dtype=np.float64)
+    zero = np.zeros_like(np.take(c, [0], axis=axis))
+    c = np.concatenate([zero, c], axis=axis)          # c[i] = sum of a[:i]
+    hi = np.minimum(np.arange(n) + r + 1, n)
+    lo = np.maximum(np.arange(n) - r, 0)
+    tot = np.take(c, hi, axis=axis) - np.take(c, lo, axis=axis)
+    return tot / (hi - lo).reshape([-1 if ax == axis else 1
+                                    for ax in range(a.ndim)])
+
+
+def smooth2d(a, sigma):
+    """Approximate Gaussian blur: three box passes, numpy-only, O(n).
+
+    Display smoothing for attribution maps. The clamped-edge box preserves
+    the local mean, and the caller adds back any drift in the global mean, so
+    the map's total -- the prediction -- survives smoothing.
+    """
+    if sigma is None or sigma <= 0:
+        return a
+    r = max(1, int(round(float(sigma) * 0.6)))
+    out = np.asarray(a, np.float64)
+    mu = out.mean()
+    for _ in range(3):
+        out = _box1d(_box1d(out, r, 0), r, 1)
+    return out + (mu - out.mean())
 
 
 def resolve_mask_threshold(man, data_dir, stems, feature_dir):
@@ -477,7 +526,8 @@ def _sym(a):
     return -v, v
 
 
-def fig_overlays(items, out_path, title, unit="contribution"):
+def fig_overlays(items, out_path, title, unit="contribution",
+                 smooth_px=0):
     """Image + attribution, one row per volume, ordered by predicted force.
 
     Calibration rules, learned the hard way (the patch montage had the same
@@ -494,6 +544,14 @@ def fig_overlays(items, out_path, title, unit="contribution"):
                       deviation scale shared across rows. A per-row scale
                       stretched an essentially flat map to look as structured
                       as a strong one.
+      display         maps are drawn as MEAN CONTRIBUTION PER POOLED VIEW
+                      with never-pooled pixels a flat light gray. The raw sum
+                      (which is what integrates to the prediction) double-
+                      counts tile-overlap bands and paints dropped tiles as
+                      fake zero; the exact sums stay in the data and the
+                      verification, only the rendering is density. Optional
+                      smoothing blurs values and coverage separately, so it
+                      cannot bleed attribution into never-pooled regions.
       overlay         color opacity is PROPORTIONAL to |value|. A constant
                       alpha painted coolwarm's near-white midpoint over the
                       whole field, so zero attribution over dark background
@@ -502,12 +560,26 @@ def fig_overlays(items, out_path, title, unit="contribution"):
                       Zero is now transparent by construction.
     """
     n = len(items)
-    allmaps = np.concatenate([it["attr"].ravel() for it in items])
+    disp = []
+    for it in items:
+        d = np.asarray(it.get("attr_disp", it["attr"]), np.float64)
+        if smooth_px:
+            # Smooth VALUES and COVERAGE separately and renormalize, so the
+            # blur cannot bleed attribution into never-pooled (NaN) regions
+            # or dilute edge tiles against the holes next to them.
+            cov = np.isfinite(d).astype(np.float64)
+            sv = smooth2d(np.where(cov > 0, d, 0.0), smooth_px)
+            sc = smooth2d(cov, smooth_px)
+            d = np.where(cov > 0, sv / np.maximum(sc, 1e-9), np.nan)
+        disp.append(d)
+    allmaps = np.concatenate([d.ravel() for d in disp])
     gvmin, gvmax = _sym(allmaps)
-    devs = [it["attr"] - float(np.nanmean(it["attr"])) for it in items]
+    devs = [d - float(np.nanmean(d)) for d in disp]
     _, dvmax = _sym(np.concatenate([d.ravel() for d in devs]))
     dvmax = dvmax or 1.0
-    cmap = plt.get_cmap("coolwarm")
+    cmap = plt.get_cmap("coolwarm").copy()
+    cmap.set_bad("0.85")            # never-pooled: flat light gray, not the
+                                    # colormap midpoint pretending to be zero
     fig, axes = plt.subplots(n, 4, figsize=(15.5, 3.3 * n), squeeze=False)
     for i, it in enumerate(items):
         img, dev = it["image"], devs[i]
@@ -522,15 +594,19 @@ def fig_overlays(items, out_path, title, unit="contribution"):
         axes[i][0].imshow(gimg, cmap="gray", vmin=0, vmax=1)
         axes[i][0].set_ylabel(f"{it['stem']}\npred {it['pred']:+.3f}",
                               fontsize=7)
-        axes[i][1].imshow(it["attr"], cmap="coolwarm", vmin=gvmin, vmax=gvmax)
-        axes[i][2].imshow(dev, cmap="coolwarm", vmin=-dvmax, vmax=dvmax)
+        axes[i][1].imshow(np.ma.masked_invalid(disp[i]), cmap=cmap,
+                          vmin=gvmin, vmax=gvmax)
+        axes[i][2].imshow(np.ma.masked_invalid(dev), cmap=cmap,
+                          vmin=-dvmax, vmax=dvmax)
         nd = np.clip(dev / dvmax, -1, 1)
-        rgba = cmap((nd + 1) / 2)
-        rgba[..., 3] = np.abs(nd) ** 0.7 * 0.85
+        rgba = cmap((np.nan_to_num(nd) + 1) / 2)
+        rgba[..., 3] = np.where(np.isfinite(nd),
+                                np.abs(np.nan_to_num(nd)) ** 0.7 * 0.85, 0.0)
         axes[i][3].imshow(gimg, cmap="gray", vmin=0, vmax=1)
         axes[i][3].imshow(rgba)
         for j, t in enumerate(["signal (model-input scale)",
-                               f"{unit} (shared +/-{gvmax:.2g})",
+                               f"{unit} (shared +/-{gvmax:.2g}; "
+                               f"gray = never pooled)",
                                f"within volume (shared +/-{dvmax:.2g})",
                                "overlay (opacity = |value|)"]):
             axes[i][j].set_xticks([]); axes[i][j].set_yticks([])
@@ -754,6 +830,15 @@ def main():
                     help="how many volumes to render (half highest-predicted, "
                          "half lowest)")
     ap.add_argument("--n_patch_examples", type=int, default=24)
+    ap.add_argument("--smooth_px", type=float, default=None,
+                    help="display smoothing sigma in px for the attribution "
+                         "maps (values and coverage smoothed separately; "
+                         "totals preserved). Default: 24 at --level view, "
+                         "6 at --level patch. 0 disables.")
+    ap.add_argument("--checkpoint", default=None,
+                    help="load finetuned backbone weights before the dense "
+                         "pass, so the attribution runs through the model "
+                         "the readout was trained on")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--out", default="results/xai")
     args = ap.parse_args()
@@ -843,6 +928,15 @@ def main():
             print("WARNING: no CUDA -- --level patch will be very slow")
         ctx = build_dino(str(man.get("model", meta.get("model", ""))) or
                          "vit_base_patch14_reg4_dinov2.lvd142m", device)
+        if args.checkpoint:
+            try:
+                sd = torch.load(args.checkpoint, map_location=device,
+                                weights_only=False)
+            except TypeError:
+                sd = torch.load(args.checkpoint, map_location=device)
+            ctx["model"].load_state_dict(sd.get("backbone", sd), strict=True)
+            ctx["model"].eval()
+            print(f"  loaded finetuned backbone from {args.checkpoint}")
 
     items, items_ctrl = [], []
     banks = {"top": [], "bot": []}
@@ -867,15 +961,20 @@ def main():
         proj = band.max(axis=0)
 
         if args.level == "view":
+            acc, cnt = paint_view_map(vc, H, W)
             items.append({"stem": stem, "pred": vc["total"],
                           "image": proj, "pp": (p_low, p_high),
-                          "attr": paint_view_map(vc, H, W)})
+                          "attr": acc,
+                          "attr_disp": np.where(cnt > 0, acc
+                                                / np.maximum(cnt, 1),
+                                                np.nan)})
             continue
 
         # ---- dense ----
         gx, gy = man.get("tile_grid", [4, 3])
         specs = plan_views(H, W, "tiled", tile_size=TILE, tile_grid=(gx, gy))
         amap = np.zeros((H, W), np.float64)
+        acov = np.zeros((H, W), np.float64)
         mproj = np.zeros((H, W), np.float32)
         # How much each view was actually pooled, straight from the cached
         # features. A view below --fg_min contributed NOTHING to the
@@ -934,11 +1033,19 @@ def main():
                     # Summed over patches this is a_v * (u . patch_mean_fg),
                     # i.e. the view's contribution, so the whole map integrates
                     # to the prediction the same way the view-level one does.
+                    # Bilinear upsampling instead of nearest (np.kron) kills
+                    # the 14px block artifacts; the additive correction pins
+                    # the tile's TOTAL back to the exact value, so the
+                    # integrates-to-the-prediction identity survives the
+                    # smoother rendering.
                     contrib = grids[ti] * (b if b is not None
                                            else 1.0 / (gh * gw)) * a_v
-                    up = np.kron(contrib, np.ones((ctx["patch"], ctx["patch"])))
+                    up = upsample_bilinear(contrib, TILE, TILE)
+                    up += (contrib.sum() * ctx["patch"] ** 2
+                           - up.sum()) / up.size
                     hh = min(up.shape[0], H - y); ww = min(up.shape[1], W - x)
                     amap[y:y + hh, x:x + ww] += up[:hh, :ww]
+                    acov[y:y + hh, x:x + ww] += 1
 
                 # descriptors, middle slice only: the gradient fields are
                 # the expensive part and one slice per tile is plenty for the
@@ -1002,7 +1109,11 @@ def main():
                 bf_proj = np.asarray(_bv[z_lo:z_hi:max(1, z_stride)]).max(axis=0)
         items.append({"stem": stem, "pred": vc["total"], "image": proj,
                       "pp": (p_low, p_high),
-                      "attr": amap, "mask": mproj, "bf": bf_proj,
+                      "attr": amap,
+                      "attr_disp": np.where(acov > 0,
+                                            amap / np.maximum(acov, 1),
+                                            np.nan),
+                      "mask": mproj, "bf": bf_proj,
                       "tiles": [(sp["y"], sp["x"],
                                  kept_by_tile.get((sp["y"], sp["x"]), 0))
                                 for sp in specs],
@@ -1032,8 +1143,10 @@ def main():
         unit = "contribution per pixel (DINO mask)"
         sub = ("patch-level contributions under a token-derived mask -- NOT "
                "the mask the features were pooled with")
+    smooth_px = (args.smooth_px if args.smooth_px is not None
+                 else (24.0 if args.level == "view" else 6.0))
     fig_overlays(items, os.path.join(args.out, f"attr_{tag}_{args.level}.png"),
-                 f"{target}: {sub}", unit=unit)
+                 f"{target}: {sub}", unit=unit, smooth_px=smooth_px)
 
     summary = {"readout": args.readout, "target": target, "token": token,
                "level": args.level, "attributable_norm_fraction": frac,

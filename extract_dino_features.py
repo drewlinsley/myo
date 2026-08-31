@@ -337,6 +337,12 @@ def main():
                    help="Also store an NxN average-pooled patch-token grid per "
                         "view (0 = off), for probes that need spatial layout "
                         "rather than a single pooled vector.")
+    p.add_argument("--checkpoint", default=None,
+                   help="load finetuned backbone weights (train_dino_e2e.py "
+                        "--final_fit) before encoding. WARNING: a checkpoint "
+                        "finetuned on ALL labels makes every downstream "
+                        "statistic on these features LEAKY -- probe them for "
+                        "XAI/inspection only, never for a reported number.")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--stems", nargs="*", default=None)
     p.add_argument("--limit", type=int, default=None)
@@ -396,6 +402,19 @@ def main():
             print("WARNING: no CUDA — this will be very slow. "
                   "Run scripts/check_gpu.py.")
         ctx = build_dino(args.model, device)
+        if args.checkpoint:
+            try:
+                sd = torch.load(args.checkpoint, map_location=device,
+                                weights_only=False)
+            except TypeError:      # torch too old for the kwarg
+                sd = torch.load(args.checkpoint, map_location=device)
+            state = sd.get("backbone", sd)
+            ctx["model"].load_state_dict(state, strict=True)
+            ctx["model"].eval()
+            print(f"loaded finetuned backbone from {args.checkpoint}")
+            print("  *** these features come from a model that saw every "
+                  "label.\n  *** any statistic computed from them is LEAKY; "
+                  "XAI only.")
         print(f"model={ctx['name']} dim={ctx['dim']} patch={ctx['patch']} "
               f"img_size={ctx['img_size']} n_prefix={ctx['n_prefix']}")
 
@@ -409,6 +428,11 @@ def main():
         "mask_method": args.mask_method, "mask_dilate": args.mask_dilate,
         "mask_min_frac": args.mask_min_frac, "mask_scope": args.mask_scope,
     }
+    if args.checkpoint:
+        # Finetuned weights change every feature; hash the FILE so a
+        # re-trained checkpoint at the same path cannot reuse the cache.
+        with open(args.checkpoint, "rb") as _f:
+            cfg_key["checkpoint"] = hashlib.sha1(_f.read()).hexdigest()[:12]
     if args.mask_projection != "none":
         # Projection changes the mask, hence every fg-weighted feature.
         cfg_key["mask_projection"] = args.mask_projection
