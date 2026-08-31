@@ -26,7 +26,20 @@ cd "$ROOT"
 DATA_DIR="${DATA_DIR:-data_phalloidin_mhc_051826_staged}"
 METADATA="${METADATA:-phalloidin_mhc_mapping_051426_SS edit.xlsx}"
 TARGET_COL="${TARGET_COL:-peak_amplitude_week1}"
-DECONFOUND="${DECONFOUND:-plate}"
+TARGET_TYPE="${TARGET_TYPE:-numeric}"
+# Stimulation (the Exercise column) is PLATE-DETERMINED: every plate is
+# entirely one class. The defensible protocol is leave-one-plate-out with no
+# deconfounding (centering would remove the very variation the label lives
+# in), and the ceiling is low with 4 plates regardless:
+#   TARGET_COL=Exercise TARGET_TYPE=categorical CV_GROUP=plate \
+#     bash scripts/e2e_force.sh
+if [ "$TARGET_TYPE" = "categorical" ]; then
+  DECONFOUND="${DECONFOUND:-none}"
+  CV_GROUP="${CV_GROUP:-plate}"
+else
+  DECONFOUND="${DECONFOUND:-plate}"
+  CV_GROUP="${CV_GROUP:-replicate}"
+fi
 TUNE="${TUNE:-lora}"
 TUNE_BLOCKS="${TUNE_BLOCKS:-2}"
 EPOCHS="${EPOCHS:-10}"
@@ -39,19 +52,21 @@ FINAL="${FINAL:-1}"
 FIG_DIR="${FIG_DIR:-results/figures}"
 XAI_DIR="${XAI_DIR:-results/xai_e2e}"
 
-RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
            "$TARGET_COL" "$DECONFOUND" "$TUNE" "$TUNE_BLOCKS" "$EPOCHS" \
-           "$FG_MIN" "$Z_STRIDE" "$SEED" "$N_PERM" | cksum | cut -d' ' -f1)"
+           "$FG_MIN" "$Z_STRIDE" "$SEED" "$N_PERM" "$TARGET_TYPE" \
+           "$CV_GROUP" | cksum | cut -d' ' -f1)"
 OUT="results/e2e_force/${TARGET_COL}_dc-${DECONFOUND}_${TUNE}${TUNE_BLOCKS}_${RUN_KEY}"
 mkdir -p "$OUT"
 
 common=(--data_dir "$DATA_DIR" --metadata "$METADATA"
         --target_col "$TARGET_COL" --deconfound "$DECONFOUND"
+        --target_type "$TARGET_TYPE" --cv_group "$CV_GROUP"
         --tune "$TUNE" --tune_blocks "$TUNE_BLOCKS" --epochs "$EPOCHS"
         --fg_min "$FG_MIN" --z_stride "$Z_STRIDE" --seed "$SEED")
 
 echo "════════════════════════════════════════════════════════════════"
-echo " e2e DINOv2 -> $TARGET_COL   dc=$DECONFOUND  tune=$TUNE x$TUNE_BLOCKS"
+echo " e2e DINOv2 -> $TARGET_COL ($TARGET_TYPE)  dc=$DECONFOUND  cv=$CV_GROUP  tune=$TUNE x$TUNE_BLOCKS"
 echo " results -> $OUT"
 echo " ~22 finetunings per run; this is the slow, honest version"
 echo "════════════════════════════════════════════════════════════════"

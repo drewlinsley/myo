@@ -81,7 +81,7 @@ def prepare_volumes(args):
                               file_col=args.file_col,
                               group_cols=tuple(args.group_cols.split(",")),
                               modality=args.modality, staged_stems=avail,
-                              target_type="numeric")
+                              target_type=args.target_type)
     if data["n_matched"] == 0:
         raise SystemExit("no metadata force rows matched any volume")
     forces, groups = data["forces"], data["groups"]
@@ -151,7 +151,7 @@ def prepare_volumes(args):
           f"median {int(np.median(n_views))} "
           f"(tiles at fg>={args.fg_min}: "
           f"median {int(np.median([len(v['specs']) for v in vols]))})")
-    return vols
+    return vols, data.get("classes")
 
 
 def sample_views(v, K, rng, ctx, augment):
@@ -225,7 +225,7 @@ def build_trainable(args, device):
             backbone.blocks[i].requires_grad_(True)
         backbone.norm.requires_grad_(True)
 
-    head = nn.Linear(ctx["dim"], 1).to(device)
+    head = nn.Linear(ctx["dim"], getattr(args, "n_out", 1)).to(device)
     nn.init.zeros_(head.weight)
     nn.init.zeros_(head.bias)
     adapt_params = [p for p in backbone.parameters() if p.requires_grad]
@@ -266,7 +266,7 @@ def predict_volume(backbone, head, ctx, v, device, batch_size, use_amp):
     e = torch.cat(es)
     w = torch.tensor(ws, dtype=e.dtype, device=e.device).unsqueeze(1)
     vol_e = (e * w).sum(dim=0) / w.sum()
-    return float(head(vol_e)[0])
+    return head(vol_e).detach().cpu().numpy()
 
 
 # --------------------------------------------------------------------------
@@ -287,6 +287,16 @@ def train_fold(vols_tr, args, device, seed):
         cnt[v["group"]] = cnt.get(v["group"], 0) + 1
     for v in vols_tr:
         v["_w"] = 1.0 / cnt[v["group"]]
+    if getattr(args, "n_out", 1) > 1:
+        # Class balance computed on the WEIGHTED totals, mirroring the probe:
+        # balancing on raw volume counts would ignore the FOV weighting and
+        # then multiply on top of it.
+        tot = sum(v["_w"] for v in vols_tr)
+        by_c = {}
+        for v in vols_tr:
+            by_c[int(v["_target"])] = by_c.get(int(v["_target"]), 0.0) + v["_w"]
+        for v in vols_tr:
+            v["_w"] *= tot / (len(by_c) * by_c[int(v["_target"])])
 
     opt = torch.optim.AdamW(
         [{"params": adapt_params, "lr": args.lr_backbone},
@@ -326,8 +336,13 @@ def train_fold(vols_tr, args, device, seed):
                 w = torch.from_numpy(fg).to(e.device,
                                             e.dtype).unsqueeze(1)
                 vol_e = (e * w).sum(dim=0) / w.sum()
-                pred = head(vol_e)[0]
-                loss = loss + v["_w"] * (pred - v["_target"]) ** 2
+                out_v = head(vol_e)
+                if getattr(args, "n_out", 1) > 1:
+                    tgt = torch.tensor(int(v["_target"]), device=out_v.device)
+                    loss = loss + v["_w"] * torch.nn.functional.cross_entropy(
+                        out_v[None], tgt[None])
+                else:
+                    loss = loss + v["_w"] * (out_v[0] - v["_target"]) ** 2
             loss = loss / len(batch)
             loss.backward()
             if step == 0:
@@ -351,70 +366,106 @@ def train_fold(vols_tr, args, device, seed):
 
 
 def run_loo(vols, vol_force, args, device, seed, quiet=False):
-    """The full LOO. `vol_force` is passed in so permutations reuse this."""
+    """The full LOO. `vol_force` is passed in so permutations reuse this.
+
+    The FOLD unit is args.cv_group (replicate, or plate for a
+    plate-determined label); the SCORING unit is always the replicate --
+    every held-out replicate contributes one prediction, averaged over its
+    FOVs, exactly as in the probe.
+    """
     import torch
-    by_group = {}
+    categorical = args.target_type == "categorical"
+    cvkey = (lambda v: v["group"]) if args.cv_group == "replicate" \
+        else (lambda v: v["plate"])
+    by_cv = {}
     for v, f in zip(vols, vol_force):
-        by_group.setdefault(v["group"], []).append((v, float(f)))
-    folds = sorted(by_group)
+        by_cv.setdefault(cvkey(v), []).append((v, float(f)))
+    folds = sorted(by_cv)
 
     pred_force, true_force, pred_bin, true_bin, held = [], [], [], [], []
     t0 = time.time()
-    for fi, g in enumerate(folds):
-        te = [v for v, _f in by_group[g]]
-        tr = [(v, f) for gg in folds if gg != g for v, f in by_group[gg]]
+    for fi, k in enumerate(folds):
+        te = by_cv[k]
+        tr = [(v, f) for kk in folds if kk != k for v, f in by_cv[kk]]
         tr_vols = [v for v, _f in tr]
         tr_f = np.asarray([f for _v, f in tr], np.float64)
 
-        # deconfound / scale the TARGET, train stats only (mirrors the probe)
-        if args.deconfound == "plate":
+        # target construction, train stats only (mirrors the probe)
+        if categorical:
+            if len({int(f) for _v, f in tr}) < 2:
+                print(f"  fold [{k}]: training set has ONE class -- the "
+                      f"held-out {args.cv_group} carries the only other "
+                      f"class. Skipped; this design cannot test it.")
+                continue
+            for v, f in tr:
+                v["_target"] = int(f)
+        elif args.deconfound == "plate":
             mu_all = float(tr_f.mean())
             mus = {}
             for (v, f) in tr:
                 mus.setdefault(v["plate"], []).append(f)
-            mus = {k: float(np.mean(x)) for k, x in mus.items()}
+            mus = {kk: float(np.mean(x)) for kk, x in mus.items()}
             for v, f in tr:
                 v["_target"] = f - mus.get(v["plate"], mu_all)
-            te_center = mus.get(te[0]["plate"], mu_all)
-            y_te = float(by_group[g][0][1]) - te_center
         else:
             if np.any(tr_f <= 0):
                 raise SystemExit("non-positive force cannot be log-scaled; "
                                  "use --deconfound plate")
             for v, f in tr:
                 v["_target"] = math.log10(f)
-            y_te = float(by_group[g][0][1])
 
         ctx, backbone, head, mode, n_adapt, use_amp = train_fold(
             tr_vols, args, device, seed + 7919 * fi)
 
-        preds = [predict_volume(backbone, head, ctx, v, device,
-                                args.batch_size, use_amp) for v in te]
-        mp = float(np.mean(preds))
+        # bins from TRAIN replicate values, same scale as the binned quantity
+        if not categorical:
+            rep_f = {}
+            for v, f in tr:
+                rep_f.setdefault(v["group"],
+                                 v["_target"] if args.deconfound == "plate"
+                                 else f)
+            edges = compute_bin_edges(sorted(rep_f.values()), args.n_bins)
+            if args.deconfound == "plate":
+                mus_te = mus  # defined above in the dc-plate branch
+                mu_all_te = mu_all
 
-        # binning identical to the probe: edges from TRAIN replicate values,
-        # on the SAME scale the binned quantities live on -- centered targets
-        # under dc-plate, raw force under dc-none (where the model predicts
-        # log10 and the prediction is exponentiated back before binning).
-        rep_f = {}
-        for v, f in tr:
-            rep_f.setdefault(v["group"],
-                             v["_target"] if args.deconfound == "plate"
-                             else f)
-        edges = compute_bin_edges(sorted(rep_f.values()), args.n_bins)
-        if args.deconfound == "plate":
-            pb, tb = assign_bin(mp, edges), assign_bin(y_te, edges)
-        else:
-            pb, tb = assign_bin(10 ** mp, edges), assign_bin(y_te, edges)
-        pred_force.append(mp); true_force.append(y_te)
-        pred_bin.append(pb); true_bin.append(tb); held.append(g)
+        # score per held-out REPLICATE
+        by_rep = {}
+        for v, f in te:
+            by_rep.setdefault(v["group"], []).append((v, f))
+        for g in sorted(by_rep):
+            outs = np.stack([predict_volume(backbone, head, ctx, v, device,
+                                            args.batch_size, use_amp)
+                             for v, _f in by_rep[g]])
+            f_raw = float(by_rep[g][0][1])
+            if categorical:
+                z = outs - outs.max(axis=1, keepdims=True)
+                pr = (np.exp(z) / np.exp(z).sum(axis=1, keepdims=True)
+                      ).mean(axis=0)
+                pb, tb = int(np.argmax(pr)), int(f_raw)
+                # binary: P(class 1) is a usable continuous score; else code
+                sc = float(pr[1]) if len(pr) == 2 else float(pb)
+                pred_force.append(sc); true_force.append(float(tb))
+            else:
+                mp = float(outs[:, 0].mean())
+                if args.deconfound == "plate":
+                    y_te = f_raw - mus_te.get(by_rep[g][0][0]["plate"],
+                                              mu_all_te)
+                    pb, tb = assign_bin(mp, edges), assign_bin(y_te, edges)
+                else:
+                    y_te = f_raw
+                    pb = assign_bin(10 ** mp, edges)
+                    tb = assign_bin(y_te, edges)
+                pred_force.append(mp); true_force.append(y_te)
+            pred_bin.append(pb); true_bin.append(tb); held.append(g)
 
         del backbone, head
         if device.type == "cuda":
             torch.cuda.empty_cache()
         if not quiet:
             el = time.time() - t0
-            print(f"  fold {fi+1}/{len(folds)} [{g}] pred={mp:+.3f} "
+            print(f"  fold {fi+1}/{len(folds)} [{k}] "
+                  f"{len(by_rep)} replicate(s)  last pred={pred_force[-1]:+.3f} "
                   f"true={true_force[-1]:+.3f}  ({mode}, {n_adapt/1e6:.2f}M "
                   f"trainable; {el/(fi+1):.0f}s/fold, "
                   f"~{el/(fi+1)*(len(folds)-fi-1)/60:.0f} min left)")
@@ -437,6 +488,15 @@ def main():
     p.add_argument("--modality", default="gfp")
     p.add_argument("--model", default="vit_base_patch14_reg4_dinov2.lvd142m")
     p.add_argument("--deconfound", choices=["none", "plate"], default="plate")
+    p.add_argument("--target_type", choices=["numeric", "categorical"],
+                   default="numeric")
+    p.add_argument("--cv_group", choices=["replicate", "plate"],
+                   default="replicate",
+                   help="the held-out unit. For a PLATE-DETERMINED label "
+                        "(Exercise) use 'plate': batch artifacts cannot "
+                        "transfer to an unseen plate, which is the only "
+                        "defensible test for such a label -- but 4 plates "
+                        "caps the certainty regardless.")
     p.add_argument("--n_bins", type=int, default=4)
     p.add_argument("--norm_scope", choices=["volume", "global"],
                    default="volume")
@@ -484,32 +544,59 @@ def main():
         print("WARNING: no CUDA. One fold on CPU is hours; this is not "
               "realistically runnable without a GPU.")
 
-    vols = prepare_volumes(args)
+    vols, classes = prepare_volumes(args)
+    categorical = args.target_type == "categorical"
+    if categorical:
+        if args.deconfound != "none":
+            raise SystemExit(
+                "--deconfound plate with a categorical target: centering a "
+                "class code destroys the classes, and for a plate-determined "
+                "label it would subtract the very variation the label lives "
+                "in. Use --deconfound none --cv_group plate.")
+        args.n_bins = len(classes)
+        args.n_out = len(classes)
+        print(f"classes: {', '.join(classes)}  (chance "
+              f"{1.0/len(classes):.2f})")
+        if args.cv_group == "replicate":
+            print("WARNING: cv_group=replicate with a plate-determined label "
+                  "lets plate batch artifacts predict the class perfectly. "
+                  "Use --cv_group plate for the defensible test.")
+    else:
+        args.n_out = 1
     vol_group = [v["group"] for v in vols]
     vol_force = [v["force"] for v in vols]
     rng = np.random.default_rng(args.seed)
 
-    if args.shuffle:
-        vol_force = _permute_replicate_force(
-            vol_group, vol_force, rng,
-            strata=[v["plate"] for v in vols])
-        print("labels SHUFFLED (within plate): this run must land at chance")
+    # Permutation strata: within-plate for a numeric target (the nested
+    # design's null), but FREE for a categorical one -- a label constant
+    # within every plate makes within-plate permutation the identity.
+    strata = (None if categorical else [v["plate"] for v in vols])
 
-    print(f"\nLOO over {len(set(vol_group))} replicates "
+    if args.shuffle:
+        vol_force = _permute_replicate_force(vol_group, vol_force, rng,
+                                             strata=strata)
+        print("labels SHUFFLED: this run must land at chance")
+
+    print(f"\nLOO over {len(set(cvu for cvu in (v['group'] if args.cv_group == 'replicate' else v['plate'] for v in vols)))} "
+          f"{args.cv_group} fold(s), {len(set(vol_group))} replicates "
           f"({len(vols)} volumes)  tune={args.tune} "
           f"blocks={args.tune_blocks} epochs={args.epochs}")
+    task = "classification" if categorical else "regression"
     res = run_loo(vols, vol_force, args, device, args.seed)
-    out = score(res, args.n_bins, task="regression")
+    out = score(res, args.n_bins, task=task)
 
-    null_rho = []
+    null_rho, null_acc = [], []
     for pi in range(args.n_perm):
         pf = _permute_replicate_force(vol_group, [v["force"] for v in vols],
-                                      rng, strata=[v["plate"] for v in vols])
+                                      rng, strata=strata)
         print(f"\npermutation {pi+1}/{args.n_perm}")
         r = run_loo(vols, pf, args, device, args.seed + 1000 * (pi + 1),
                     quiet=True)
         null_rho.append(spearman(r["pred_score"], r["true_force"]))
-        print(f"  null spearman {null_rho[-1]:+.3f}")
+        null_acc.append(float(np.mean(r["true_bin"] == r["pred_bin"]))
+                        if len(r["true_bin"]) else float("nan"))
+        print(f"  null spearman {null_rho[-1]:+.3f}  "
+              f"null acc {null_acc[-1]:.3f}")
 
     obs = out["spearman_pred_vs_force"]
     if null_rho:
@@ -521,6 +608,13 @@ def main():
         out["null_spearman_ci"] = [float(np.percentile(nr, 2.5)),
                                    float(np.percentile(nr, 97.5))]
         out["mde_spearman_95"] = float(np.percentile(nr, 95))
+        na = np.asarray([a for a in null_acc if np.isfinite(a)])
+        if len(na):
+            out["permutation_p_accuracy"] = float(
+                (1 + (na >= out["replicate_accuracy"]).sum()) / (1 + len(na)))
+            out["null_accuracy"] = [float(x) for x in na]
+            out["null_accuracy_mean"] = float(na.mean())
+            out["mde_accuracy_95"] = float(np.percentile(na, 95))
         out["n_permutations"] = len(nr)
 
     _fov = {}
@@ -536,8 +630,9 @@ def main():
     out.update({
         "features": "dino_e2e", "modality": args.modality,
         "model_class": f"e2e_{args.tune}{args.tune_blocks}",
-        "target_col": args.target_col, "target_type": "numeric",
-        "cv_group": "replicate", "deconfound": args.deconfound,
+        "target_col": args.target_col, "target_type": args.target_type,
+        "classes": classes, "cv_group": args.cv_group,
+        "deconfound": args.deconfound,
         "aggregate": "volume", "fg_min": args.fg_min, "struct": "none",
         "canary": "none", "shuffled": bool(args.shuffle),
         "n_volumes": len(vols), "feature_dim": 768,
@@ -552,13 +647,23 @@ def main():
                                      res["pred_score"], res["true_bin"],
                                      res["pred_bin"])]})
 
-    print(f"\nLOO n={out['n_replicates']}  "
-          f"spearman(pred, true) = {obs:+.3f}"
-          + (f"  perm_p={out['permutation_p_spearman']:.3f} "
-             f"({len(null_rho)} permutations -- resolution "
-             f"{1.0/(1+len(null_rho)):.2f})" if null_rho else
-             "  (no permutation null: run with --n_perm for a p-value; "
-             "the frozen probe's null is NOT transferable)"))
+    if categorical:
+        print(f"\nLOO n={out['n_replicates']}  "
+              f"acc={out['replicate_accuracy']:.3f} "
+              f"(chance {out['chance']:.3f}, "
+              f"{out['n_correct']}/{out['n_replicates']})"
+              + (f"  perm_p={out.get('permutation_p_accuracy', float('nan')):.3f} "
+                 f"({len(null_acc)} permutations -- resolution "
+                 f"{1.0/(1+len(null_acc)):.2f})" if null_acc else
+                 "  (no permutation null: run with --n_perm for a p-value)"))
+    else:
+        print(f"\nLOO n={out['n_replicates']}  "
+              f"spearman(pred, true) = {obs:+.3f}"
+              + (f"  perm_p={out['permutation_p_spearman']:.3f} "
+                 f"({len(null_rho)} permutations -- resolution "
+                 f"{1.0/(1+len(null_rho)):.2f})" if null_rho else
+                 "  (no permutation null: run with --n_perm for a p-value; "
+                 "the frozen probe's null is NOT transferable)"))
     if args.shuffle:
         print("^ labels were SHUFFLED: this must be at chance. If not, the "
               "fold logic leaks and every other number is void.")
@@ -574,7 +679,10 @@ def main():
               "label; do not report statistics computed from it)")
         tr = list(zip(vols, [v["force"] for v in vols]))
         tr_f = np.asarray([f for _v, f in tr])
-        if args.deconfound == "plate":
+        if categorical:
+            for v, f in tr:
+                v["_target"] = int(f)
+        elif args.deconfound == "plate":
             mus = {}
             for v, f in tr:
                 mus.setdefault(v["plate"], []).append(f)
@@ -603,7 +711,19 @@ def main():
                              "deconfound": args.deconfound,
                              "leaky_for_statistics": True}},
                    args.final_fit)
-        w = head.weight.detach().cpu().numpy().ravel().astype(np.float64)
+        hw = head.weight.detach().cpu().numpy().astype(np.float64)
+        if categorical and len(hw) == 2:
+            # Binary classifier: the decision is the LOGIT MARGIN, a single
+            # direction w1 - w0 -- exactly the linear readout the attribution
+            # machinery decomposes. Red = toward class 1.
+            w = (hw[1] - hw[0]).ravel()
+        elif categorical:
+            print(f"  {len(hw)}-class head has no single readout direction; "
+                  f"skipping the sidecar (dense XAI unavailable)")
+            print(f"saved {args.final_fit}")
+            return
+        else:
+            w = hw.ravel()
         sidecar = os.path.splitext(args.final_fit)[0] + ".readout.npz"
         np.savez_compressed(
             sidecar, mean_direction=w, fold_directions=w[None],
@@ -611,7 +731,9 @@ def main():
                 [f"e2e[{i}]" for i in range(len(w))], dtype=object),
             token="patch_mean_fg", agg="fgmean", fg_min=float(args.fg_min),
             struct="none", deconfound=args.deconfound,
-            target_col=args.target_col, task="regression",
+            target_col=args.target_col,
+            task=("classification" if categorical else "regression"),
+            classes=("|".join(classes) if categorical else ""),
             model_class=f"e2e_{mode}", fold_cosine=np.nan)
         print(f"saved {args.final_fit}\nsaved {sidecar}")
 

@@ -527,7 +527,7 @@ def _sym(a):
 
 
 def fig_overlays(items, out_path, title, unit="contribution",
-                 smooth_px=0):
+                 smooth_px=0, polarity_note=None):
     """Image + attribution, one row per volume, ordered by predicted force.
 
     Calibration rules, learned the hard way (the patch montage had the same
@@ -612,7 +612,8 @@ def fig_overlays(items, out_path, title, unit="contribution",
             axes[i][j].set_xticks([]); axes[i][j].set_yticks([])
             if i == 0:
                 axes[i][j].set_title(t, fontsize=9)
-    fig.suptitle(title + "   (red = pushes prediction up, blue = down)",
+    fig.suptitle(title + "   " + (polarity_note or
+                                  "(red = pushes prediction up, blue = down)"),
                  fontsize=11, fontweight="bold")
     fig.savefig(out_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
@@ -1145,8 +1146,17 @@ def main():
                "the mask the features were pooled with")
     smooth_px = (args.smooth_px if args.smooth_px is not None
                  else (24.0 if args.level == "view" else 6.0))
+    # For a classifier the readout is a logit, and "up" means "toward the
+    # positive class" -- name the classes so the colors are readable.
+    note = None
+    if str(meta.get("task", "")) == "classification":
+        cls = [c for c in str(meta.get("classes", "")).split("|") if c]
+        note = (f"(red = toward '{cls[1]}', blue = toward '{cls[0]}')"
+                if len(cls) == 2 else
+                "(red = pushes the positive-class logit up)")
     fig_overlays(items, os.path.join(args.out, f"attr_{tag}_{args.level}.png"),
-                 f"{target}: {sub}", unit=unit, smooth_px=smooth_px)
+                 f"{target}: {sub}", unit=unit, smooth_px=smooth_px,
+                 polarity_note=note)
 
     summary = {"readout": args.readout, "target": target, "token": token,
                "level": args.level, "attributable_norm_fraction": frac,

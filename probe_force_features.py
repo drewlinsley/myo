@@ -1175,6 +1175,7 @@ def main():
             struct=args.struct, deconfound=args.deconfound,
             target_col=args.target_col, task=args.task,
             model_class=args.model_class,
+            classes=("|".join(data["classes"]) if _cat else ""),
             fold_cosine=(np.nan if out["readout_fold_cosine"] is None
                          else out["readout_fold_cosine"]))
         out["readout_path"] = _dir_path

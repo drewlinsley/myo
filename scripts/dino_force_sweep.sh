@@ -121,6 +121,18 @@ MASK_SOURCE="${MASK_SOURCE:-gfp}"
 MASK_PROJECTION="${MASK_PROJECTION:-max}"
 MASK_POLARITY="${MASK_POLARITY:-bright}"
 MODEL_CLASS="${MODEL_CLASS:-ridge}"   # ridge|lasso|elasticnet|xgboost
+# For a PLATE-DETERMINED label (Exercise / stimulation: every plate is
+# entirely one class) the only defensible protocol is:
+#   TARGET_COL=Exercise TARGET_TYPE=categorical DECONFOUND=none \
+#   CV_GROUP=plate PERM_SCOPE=free bash scripts/dino_force_sweep.sh
+# cv_group=plate holds out whole plates (batch artifacts cannot transfer to
+# an unseen plate); within-plate permutation is the IDENTITY for such a label
+# (the probe detects this and refuses), so the null must be perm_scope=free.
+# Deconfound=plate would subtract the very between-plate variation the label
+# lives in and force chance. And with 4 plates the ceiling on certainty is
+# low regardless -- read the MDE line, not just the accuracy.
+CV_GROUP="${CV_GROUP:-replicate}"
+PERM_SCOPE="${PERM_SCOPE:-within_plate}"
 SEED="${SEED:-42}"
 SKIP_EXTRACT="${SKIP_EXTRACT:-0}"
 FORCE="${FORCE:-0}"
@@ -137,11 +149,11 @@ FORCE="${FORCE:-0}"
 # directory, so a stale JSON from the old settings was silently pooled into the
 # ranking AND into the max-statistic null. DECONFOUND is deliberately absent:
 # it is swept within a run (dc-none and dc-plate are both configs).
-RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
            "$TARGET_COL" "$TASK" "$N_BINS" "$MODEL" "$NORM_SCOPE" "$SEED" \
            "$TARGET_TYPE" "$FG_MIN" "$AGGREGATE" "$TOKENS" "$AGGS" \
            "$FRAMINGS" "$STRUCTS" "$MODEL_CLASS" "$Z_STRIDE" "$MASK_POLARITY" \
-           "$MASK_SOURCE" "$MASK_PROJECTION" \
+           "$MASK_SOURCE" "$MASK_PROJECTION" "$CV_GROUP" "$PERM_SCOPE" \
            | cksum | cut -d' ' -f1)"
 OUT_DIR="$OUT_DIR/${TARGET_COL}_${TASK}_b${N_BINS}_s${SEED}_${RUN_KEY}"
 mkdir -p "$OUT_DIR"
@@ -255,6 +267,7 @@ print(' '.join(np.load(f[0]).files) if f else '')
           --agg "$agg" --fg_min "$FG_MIN" --aggregate "$AGGREGATE" \
           --target_type "$TARGET_TYPE" --struct "$st" \
           --model_class "$MODEL_CLASS" \
+          --cv_group "$CV_GROUP" --perm_scope "$PERM_SCOPE" \
           --deconfound "$dc" --n_perm "$N_PERM" --seed "$SEED" --quiet \
           --output "$out" || echo "    (failed — continuing)"
         n_cfg=$((n_cfg+1))
@@ -281,6 +294,7 @@ if [ -n "$ctrl_dir" ] && [ -d "$ctrl_dir" ]; then
     --agg "$(echo $AGGS | cut -d' ' -f1)" --fg_min "$FG_MIN" \
     --aggregate "$AGGREGATE" --target_type "$TARGET_TYPE" \
     --struct "$(echo $STRUCTS | cut -d' ' -f1)" --model_class "$MODEL_CLASS" \
+    --cv_group "$CV_GROUP" --perm_scope "$PERM_SCOPE" \
     --shuffle --n_perm "$N_PERM" --seed "$SEED" --quiet \
     --output "$OUT_DIR/_control_shuffled.json" || ctrl_failed=1
   if [ "${ctrl_failed:-0}" = "1" ]; then

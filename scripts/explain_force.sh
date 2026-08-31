@@ -78,7 +78,12 @@ for f in sorted(glob.glob(os.path.join(d, "*.json"))):
         r = json.load(open(f))
     except Exception:
         continue
-    rho = r.get("spearman_pred_vs_force")
+    # Rank by the statistic the target is actually scored on: accuracy for a
+    # categorical label, rank correlation for a numeric one.
+    stat = ("replicate_accuracy"
+            if r.get("target_type") == "categorical"
+            else "spearman_pred_vs_force")
+    rho = r.get(stat)
     if rho is None or rho != rho:
         continue
     name = os.path.basename(f)[:-5]
