@@ -523,23 +523,94 @@ def fig_overlays(items, out_path, title, unit="contribution"):
     print(f"  saved {out_path}")
 
 
-def fig_extremes(top, bot, out_path, title, k=24):
-    """Montage of the highest- and lowest-scoring image patches."""
-    fig, axes = plt.subplots(2, k // 2, figsize=(k // 2 * 1.05, 2.6),
+def select_diverse(cands, want, reverse, cell=112, per_vol_cap=None):
+    """Greedy pick down the score ranking with two diversity constraints.
+
+    Without them the montage is the same bright blob 12 times: the most
+    extreme tokens cluster on one structure, and every z-slice of it is a
+    separate candidate. Deduping on a (volume, 112px-cell) key collapses
+    same-spot-different-z repeats and near-neighbours; the per-volume cap
+    stops one field from filling the row.
+    """
+    per_vol_cap = per_vol_cap or max(2, want // 3)
+    out, seen, nvol = [], set(), {}
+    for c in sorted(cands, key=lambda d: d["score"], reverse=reverse):
+        key = (c["stem"], c["cy"] // cell, c["cx"] // cell)
+        if key in seen or nvol.get(c["stem"], 0) >= per_vol_cap:
+            continue
+        seen.add(key)
+        nvol[c["stem"]] = nvol.get(c["stem"], 0) + 1
+        out.append(c)
+        if len(out) >= want:
+            break
+    return out
+
+
+def resolve_patch_crops(cands, mod_dir, vol_pp, patch, half=64):
+    """Cut a context window around each selected token, from the volume.
+
+    Normalized with the SAME per-volume percentile clip the model's input
+    got, so every crop sits on one [0, 1] scale: bright-vs-dim differences
+    between cells are the differences the model saw, not per-cell autoscale.
+    """
+    by_stem = {}
+    for c in cands:
+        by_stem.setdefault(c["stem"], []).append(c)
+    out = []
+    for stem, cs in by_stem.items():
+        vol = np.load(os.path.join(mod_dir, f"{stem}.npy"), mmap_mode="r")
+        p_low, p_high = vol_pp[stem]
+        H, W = vol.shape[1], vol.shape[2]
+        side = 2 * half + 1
+        for c in cs:
+            y0 = max(0, min(H - side, c["cy"] - half))
+            x0 = max(0, min(W - side, c["cx"] - half))
+            crop = np.asarray(vol[c["z"], y0:y0 + side, x0:x0 + side],
+                              np.float64)
+            crop = np.clip((crop - p_low) / max(p_high - p_low, 1e-9), 0, 1)
+            out.append({**c, "ctx": crop,
+                        "fy": c["cy"] - patch // 2 - y0,
+                        "fx": c["cx"] - patch // 2 - x0})
+    return out
+
+
+def fig_extremes(top, bot, out_path, title, patch, k=24):
+    """Context windows around the extreme-scoring tokens.
+
+    Two lessons are baked in from the version that showed bare 14x14 token
+    footprints. First, a 14px crop at 20X is an unreadable postage stamp, and
+    per-cell autoscale turned near-uniform background into dramatic texture
+    while erasing the bright-vs-dim differences that plausibly carry the
+    signal -- so each cell is now a 129px context window on one shared
+    model-input scale. Second, the footprint alone was misleading in
+    principle: ViT attention is global, so a token encodes its neighbourhood,
+    not just its own pixels. The box marks the token's INPUT footprint; the
+    context around it is legitimately part of what that token represents.
+    """
+    from matplotlib.patches import Rectangle
+    cols = max(1, k // 2)
+    fig, axes = plt.subplots(2, cols, figsize=(cols * 1.55, 4.0),
                              squeeze=False)
-    for row, (bank, name) in enumerate(((top, "highest"), (bot, "lowest"))):
-        for j in range(k // 2):
+    for row, (bank, name, edge) in enumerate(
+            ((top, "highest", "tab:red"), (bot, "lowest", "tab:blue"))):
+        for j in range(cols):
             ax = axes[row][j]
             ax.set_xticks([]); ax.set_yticks([])
             if j < len(bank):
-                ax.imshow(bank[j]["patch"], cmap="gray")
-                ax.set_xlabel(f"{bank[j]['score']:+.1f}", fontsize=5.5)
+                c = bank[j]
+                ax.imshow(c["ctx"], cmap="gray", vmin=0, vmax=1)
+                ax.add_patch(Rectangle((c["fx"], c["fy"]), patch, patch,
+                                       fill=False, lw=1.1, edgecolor=edge))
+                ax.set_xlabel(f"{c['score']:+.1f}", fontsize=6)
             else:
                 ax.set_axis_off()
-        axes[row][0].set_ylabel(name, fontsize=8)
-    fig.suptitle(title + ":  patches the readout scores highest (top) "
-                 "and lowest (bottom)", fontsize=10, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
+        axes[row][0].set_ylabel(name, fontsize=9)
+    fig.suptitle(
+        title + ":  tokens the readout scores highest (top) and lowest "
+        "(bottom)\nbox = token input footprint; context shown because ViT "
+        "attention is global; one shared intensity scale (as the model saw "
+        "it)", fontsize=9.5, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.88))
     fig.savefig(out_path, dpi=190)
     plt.close(fig)
     print(f"  saved {out_path}")
@@ -755,6 +826,7 @@ def main():
 
     items, items_ctrl = [], []
     banks = {"top": [], "bot": []}
+    vol_pp = {}
     D_acc, S_acc, F_acc = [], [], []
     S_ctrl_acc = []
 
@@ -770,6 +842,7 @@ def main():
         p_low, p_high = (gpct if gpct else
                          (float(st[args.modality]["p_low"]),
                           float(st[args.modality]["p_high"])))
+        vol_pp[stem] = (p_low, p_high)
         band = np.asarray(vol[z_lo:z_hi:max(1, z_stride)])
         proj = band.max(axis=0)
 
@@ -846,9 +919,9 @@ def main():
                     hh = min(up.shape[0], H - y); ww = min(up.shape[1], W - x)
                     amap[y:y + hh, x:x + ww] += up[:hh, :ww]
 
-                # descriptors + extreme-patch reservoir, middle slice only:
-                # every slice would multiply the work for a montage that only
-                # needs a few dozen tiles.
+                # descriptors, middle slice only: the gradient fields are
+                # the expensive part and one slice per tile is plenty for the
+                # summary regression.
                 if zi == len(zs) // 2:
                     d = patch_descriptors(tile, ctx["patch"])
                     D_acc.append(d)
@@ -861,26 +934,38 @@ def main():
                                  else np.full((gh, gw), 1.0 / (gh * gw)))
                     if gctrl is not None:
                         S_ctrl_acc.append(gctrl[ti])
-                    # Rank patches the model actually pooled. An unweighted
-                    # argsort surfaces the most extreme BACKGROUND patches,
-                    # which is exactly the artifact under investigation.
-                    g_ = np.where((b if b is not None else 1.0) > 0,
-                                  grids[ti], np.nan)
-                    flat = g_.ravel()
-                    order = np.argsort(np.where(np.isnan(flat), -np.inf, flat))
-                    valid = int(np.isfinite(flat).sum())
-                    for idx in order[max(0, valid - 4):valid]:
-                        i0, j0 = divmod(int(idx), g_.shape[1])
-                        banks["top"].append({
-                            "score": float(flat[idx]),
-                            "patch": tile[i0 * ctx["patch"]:(i0 + 1) * ctx["patch"],
-                                          j0 * ctx["patch"]:(j0 + 1) * ctx["patch"]]})
-                    for idx in order[:min(4, valid)]:
-                        i0, j0 = divmod(int(idx), g_.shape[1])
-                        banks["bot"].append({
-                            "score": float(flat[idx]),
-                            "patch": tile[i0 * ctx["patch"]:(i0 + 1) * ctx["patch"],
-                                          j0 * ctx["patch"]:(j0 + 1) * ctx["patch"]]})
+
+                # Extreme-token candidates, EVERY slice -- the tokens are
+                # already in hand, and only coordinates + scores are stored;
+                # the image crops are cut from the volume after selection, so
+                # memory stays flat. Eligibility asks for a token footprint
+                # that is at least half tissue: b > 0 alone let mask-edge
+                # slivers into the montage, and a 14x14 crop that is 95%
+                # background "scores" on its background.
+                tfrac = (area_resize(np.asarray(mtile, np.float32), gh, gw)
+                         if mtile is not None
+                         else np.ones((gh, gw), np.float32))
+                g_ = np.where(tfrac >= 0.5, grids[ti], np.nan)
+                flat = g_.ravel()
+                finite = np.isfinite(flat)
+                if finite.any():
+                    # Ineligible tokens are pushed to -inf, so they occupy the
+                    # FRONT of the sort: the largest eligible value is at the
+                    # end, and the smallest eligible one sits just after the
+                    # -inf block -- order[0] would hand the "lowest" bank a
+                    # masked-out NaN token.
+                    order = np.argsort(np.where(finite, flat, -np.inf))
+                    valid = int(finite.sum())
+                    for idx, bank in ((int(order[-1]), "top"),
+                                      (int(order[len(flat) - valid]), "bot")):
+                        i0, j0 = divmod(idx, g_.shape[1])
+                        banks[bank].append({
+                            "score": float(flat[idx]), "stem": stem,
+                            "z": int(_z),
+                            "cy": int(y + i0 * ctx["patch"]
+                                      + ctx["patch"] // 2),
+                            "cx": int(x + j0 * ctx["patch"]
+                                      + ctx["patch"] // 2)})
         mask_projs[stem] = mproj
         kept_by_tile = {}
         for zz, (yy, xx) in zip(vc["z"], vc["yx"]):
@@ -965,11 +1050,17 @@ def main():
                   f"R2 = {desc['joint_r2']:.3f}"
                   + (f"   (shuffled-label control: "
                      f"{desc_ctrl['joint_r2']:.3f})" if desc_ctrl else ""))
-        banks["top"].sort(key=lambda d: -d["score"])
-        banks["bot"].sort(key=lambda d: d["score"])
-        fig_extremes(banks["top"], banks["bot"],
+        top = select_diverse(banks["top"], args.n_patch_examples // 2,
+                             reverse=True)
+        bot = select_diverse(banks["bot"], args.n_patch_examples // 2,
+                             reverse=False)
+        top = resolve_patch_crops(top, mod_dir, vol_pp, ctx["patch"])
+        bot = resolve_patch_crops(bot, mod_dir, vol_pp, ctx["patch"])
+        top.sort(key=lambda d: -d["score"])
+        bot.sort(key=lambda d: d["score"])
+        fig_extremes(top, bot,
                      os.path.join(args.out, f"patches_{tag}.png"), target,
-                     k=args.n_patch_examples)
+                     ctx["patch"], k=args.n_patch_examples)
 
     with open(os.path.join(args.out, f"xai_{tag}_{args.level}.json"), "w") as f:
         json.dump(summary, f, indent=2)
