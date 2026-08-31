@@ -29,9 +29,10 @@ XAI_DIR="${XAI_DIR:-results/xai}"
 N_VOLUMES="${N_VOLUMES:-6}"
 DENSE="${DENSE:-1}"          # 0 to skip the GPU pass
 # Which foreground mask weights the patch tokens in the dense pass.
-#   bf   rebuild the brightfield mask the features were extracted with. This
-#        is the only mode faithful to the model that was actually fit, and its
-#        map integrates to the prediction.
+#   fitted  rebuild the mask the features were extracted with (source,
+#           projection, polarity all read from the manifest). The only mode
+#           faithful to the model that was actually fit, and its map
+#           integrates to the prediction.
 #   dino foreground from PC1 of the patch tokens, thresholded by Otsu with the
 #        sign fixed by mean pixel intensity. Same representation the probe
 #        reads, so it cannot be misaligned to the tiles -- but it is NOT the
@@ -39,7 +40,7 @@ DENSE="${DENSE:-1}"          # 0 to skip the GPU pass
 #        it draw from", not "what did it draw from".
 #   none no token weighting at all. Paints background the model never pooled;
 #        useful only for showing what that artifact looks like.
-MASK_MODE="${MASK_MODE:-bf}"
+MASK_MODE="${MASK_MODE:-fitted}"
 
 # ── 1. results ──
 if [ "${SKIP_SWEEP:-0}" != "1" ]; then

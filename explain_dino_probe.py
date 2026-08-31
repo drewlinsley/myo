@@ -315,9 +315,12 @@ def resolve_mask_threshold(man, data_dir, stems, feature_dir):
         mv = np.load(mpath, mmap_mode="r")
         z_lo, z_hi = ((0, mv.shape[0]) if zr is None
                       else resolve_z_range(zr, st, mv.shape[0]))
+        _band = np.asarray(mv[z_lo:z_hi][::max(1, z_stride)])
+        if cfg.get("mask_projection",
+                   man.get("mask_projection", "none")) == "max":
+            _band = _band.max(axis=0, keepdims=True)
         try:
-            vals.append(_fg._threshold(
-                np.asarray(mv[z_lo:z_hi][::max(1, z_stride)]), method))
+            vals.append(_fg._threshold(_band, method))
         except Exception:
             continue
     thr = float(np.median(vals)) if vals else None
@@ -347,6 +350,11 @@ def load_mask_band(data_dir, cfg, man, stem, z_lo, z_hi, z_stride, threshold,
             f"volume has {tuple(expect_shape)}. The tile geometry comes from "
             f"the input, so a mismatch silently misaligns every mask.")
     raw = np.asarray(mv[z_lo:z_hi][::max(1, z_stride)])
+    n_band = raw.shape[0]
+    projection = cfg.get("mask_projection",
+                         man.get("mask_projection", "none"))
+    if projection == "max":
+        raw = raw.max(axis=0, keepdims=True)
     dilate = int(cfg.get("mask_dilate", 0) or 0)
     min_frac = float(cfg.get("mask_min_frac", 0.0) or 0.0)
     # The polarity the FEATURES were extracted with, from the manifest -- not
@@ -359,10 +367,15 @@ def load_mask_band(data_dir, cfg, man, stem, z_lo, z_hi, z_stride, threshold,
         band = raw > threshold if polarity == "bright" else raw < threshold
         if dilate or min_frac > 0:
             band = _fg._cleanup_per_slice(band, dilate, min_frac)
-        return band
-    return _fg.compute_bf_foreground_mask(
-        raw, method=cfg.get("mask_method", man.get("mask_method", "li")),
-        dilate=dilate, min_component_frac=min_frac, polarity=polarity)
+    else:
+        band = _fg.compute_bf_foreground_mask(
+            raw,
+            method=cfg.get("mask_method", man.get("mask_method", "li")),
+            dilate=dilate, min_component_frac=min_frac,
+            polarity=polarity)
+    if projection == "max":
+        band = np.broadcast_to(band, (n_band,) + band.shape[1:])
+    return band
 
 
 def token_weights(mask_tile, g):
@@ -532,7 +545,7 @@ def fig_extremes(top, bot, out_path, title, k=24):
     print(f"  saved {out_path}")
 
 
-def fig_masks(items, out_path, mask_mode, fg_min):
+def fig_masks(items, out_path, mask_mode, fg_min, mask_src="bf"):
     """What the model was actually allowed to look at.
 
     Four columns per volume, because "the background is driving it" and "the
@@ -584,8 +597,9 @@ def fig_masks(items, out_path, mask_mode, fg_min):
                             color=("tab:red" if r == 0 else "white"))
         for j, t in enumerate([
                 "GFP (max projection)",
-                "brightfield -- the mask is built from THIS",
-                f"foreground mask ({mask_mode})",
+                ("brightfield (context)" if mask_src != "bf" else
+                 "brightfield -- the mask is built from THIS"),
+                f"foreground mask ({mask_mode}, source={mask_src})",
                 f"mask outline + tiles clearing fg_min={fg_min}"]):
             axes[i][j].set_xticks([]); axes[i][j].set_yticks([])
             if i == 0:
@@ -634,15 +648,17 @@ def main():
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--modality", default="gfp")
     ap.add_argument("--level", choices=["view", "patch"], default="view")
-    ap.add_argument("--mask_mode", choices=["bf", "dino", "none"],
-                    default="bf",
+    ap.add_argument("--mask_mode", choices=["fitted", "dino", "none"],
+                    default="fitted",
                     help="which foreground mask weights the patch "
-                         "tokens in --level patch. 'bf' rebuilds the "
-                         "brightfield mask the features were extracted "
-                         "with (faithful to the fitted model). 'dino' "
-                         "derives it from PC1 of the patch tokens. "
-                         "'none' shows the unweighted response and "
-                         "WILL paint background the model never pooled.")
+                         "tokens in --level patch. 'fitted' rebuilds "
+                         "the mask the features were extracted with — "
+                         "source, projection, and polarity read from "
+                         "the manifest (faithful to the fitted model). "
+                         "'dino' derives it from PC1 of the patch "
+                         "tokens. 'none' shows the unweighted response "
+                         "and WILL paint background the model never "
+                         "pooled.")
     ap.add_argument("--n_volumes", type=int, default=6,
                     help="how many volumes to render (half highest-predicted, "
                          "half lowest)")
@@ -717,7 +733,7 @@ def main():
             if man.get("norm_scope") == "global" else None)
 
     mask_thr, mcfg, mask_projs = None, {}, {}
-    if args.level == "patch" and args.mask_mode == "bf":
+    if args.level == "patch" and args.mask_mode == "fitted":
         mask_thr, mcfg = resolve_mask_threshold(man, args.data_dir, stems,
                                                 args.feature_dir)
         print(f"  mask: {mcfg.get('mask_source','bf')}/"
@@ -777,7 +793,7 @@ def main():
         # The mask that decides which tokens the prediction is built from.
         bf_band = None
         pc1 = pc_thr = pc_sign = None
-        if args.mask_mode == "bf":
+        if args.mask_mode == "fitted":
             bf_band = load_mask_band(args.data_dir, mcfg, man, stem, z_lo,
                                      z_hi, z_stride, mask_thr, vol.shape)
             if bf_band is None:
@@ -870,8 +886,9 @@ def main():
         for zz, (yy, xx) in zip(vc["z"], vc["yx"]):
             kept_by_tile[(int(yy), int(xx))] = \
                 kept_by_tile.get((int(yy), int(xx)), 0) + 1
-        bf_path = os.path.join(args.data_dir,
-                               mcfg.get("mask_source", "bf"), f"{stem}.npy")
+        _msrc = mcfg.get("mask_source", man.get("mask_source", "bf"))
+        _ctx_src = "bf" if _msrc == args.modality else _msrc
+        bf_path = os.path.join(args.data_dir, _ctx_src, f"{stem}.npy")
         bf_proj = None
         if os.path.exists(bf_path):
             _bv = np.load(bf_path, mmap_mode="r")
@@ -893,12 +910,12 @@ def main():
         unit = "unweighted readout response"
         sub = ("patch-level response with NO token weighting -- shows regions "
                "the model never pooled")
-    elif args.mask_mode == "bf":
+    elif args.mask_mode == "fitted":
         # Exact: a_v * b_p * (u . t_p) sums to the prediction, same as the
         # view-level map, because b_p is the weight the features were built
         # with.
         unit = "contribution per pixel"
-        sub = ("patch-level contributions (brightfield mask, as fitted) -- "
+        sub = ("patch-level contributions (mask as fitted) -- "
                "these add up to the prediction")
     else:
         # A DIFFERENT mask from the one the features were pooled with, so the
@@ -918,7 +935,9 @@ def main():
 
     if args.level == "patch":
         fig_masks(items, os.path.join(args.out, f"masks_{tag}.png"),
-                  args.mask_mode, fg_min)
+                  args.mask_mode, fg_min,
+                  mask_src=mcfg.get("mask_source",
+                                    man.get("mask_source", "bf")))
         summary["mask_mode"] = args.mask_mode
         summary["mask_foreground_fraction"] = {
             it["stem"]: float((it["mask"] > 0.5).mean())

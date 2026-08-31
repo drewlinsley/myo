@@ -193,7 +193,7 @@ def encode_views(ctx, views, view_masks, device, batch_size, amp=True,
 
 
 def global_mask_threshold(stems, mask_dir, stats_dir, z_range, z_stride,
-                          method, sample=12):
+                          method, sample=12, projection="none"):
     """One foreground threshold for the whole dataset.
 
     compute_bf_foreground_mask thresholds PER VOLUME, which makes
@@ -219,6 +219,12 @@ def global_mask_threshold(stems, mask_dir, stats_dir, z_range, z_stride,
         z_lo, z_hi = ((0, n_z) if z_range is None
                       else resolve_z_range(z_range, st, n_z))
         band = np.asarray(mv[z_lo:z_hi][::max(1, z_stride)])
+        if projection == "max":
+            # The threshold must be computed on the same object it will
+            # cut. A max projection is much brighter than any single
+            # slice, so a per-slice threshold applied to it would call
+            # most of the field foreground.
+            band = band.max(axis=0, keepdims=True)
         try:
             vals.append(_threshold(band, method))
         except Exception:
@@ -310,6 +316,14 @@ def main():
                         "first — it judges the mask against GFP.")
     p.add_argument("--mask_method", default="li",
                    choices=["minimum", "otsu", "li", "triangle"])
+    p.add_argument("--mask_projection", choices=["none", "max"],
+                   default="none",
+                   help="'max' thresholds the MAX PROJECTION of the mask "
+                        "source over the z-band and applies that one 2D mask "
+                        "to every slice. For a GFP mask source this is the "
+                        "robust choice: fluorescence marks tissue by "
+                        "construction, and the projection keeps tissue that "
+                        "any single slice renders out-of-focus dim.")
     p.add_argument("--mask_scope", choices=["global", "volume"], default="global",
                    help="'global' (default) uses ONE dataset-wide intensity "
                         "threshold, so view_fg_frac means the same thing in "
@@ -368,7 +382,7 @@ def main():
     if mask_dir and args.mask_scope == "global" and not args.dry_run:
         g_thresh = global_mask_threshold(
             stems, mask_dir, stats_dir, z_range, args.z_stride,
-            args.mask_method)
+            args.mask_method, projection=args.mask_projection)
         print(f"global foreground threshold ({args.mask_source}/"
               f"{args.mask_method}): {g_thresh}"
               + ("  — falling back to per-volume" if g_thresh is None else ""))
@@ -395,6 +409,9 @@ def main():
         "mask_method": args.mask_method, "mask_dilate": args.mask_dilate,
         "mask_min_frac": args.mask_min_frac, "mask_scope": args.mask_scope,
     }
+    if args.mask_projection != "none":
+        # Projection changes the mask, hence every fg-weighted feature.
+        cfg_key["mask_projection"] = args.mask_projection
     if args.mask_polarity != "bright":
         # Polarity changes every fg-weighted feature. Conditional so existing
         # caches (all extracted under the historical 'bright') keep their hash.
@@ -428,6 +445,7 @@ def main():
     # over a sample and hope it lands on the same number.
     manifest["mask_threshold"] = (None if g_thresh is None else float(g_thresh))
     manifest["mask_polarity"] = args.mask_polarity
+    manifest["mask_projection"] = args.mask_projection
 
     for si, stem in enumerate(stems):
         with open(os.path.join(stats_dir, f"{stem}.json")) as f:
@@ -471,10 +489,19 @@ def main():
                             f"from the input volume, so a mismatch silently "
                             f"misaligns every mask.")
                     mraw = np.asarray(mv[z_lo:z_hi][::max(1, args.z_stride)])
+                    if args.mask_projection == "max":
+                        mraw = mraw.max(axis=0, keepdims=True)
                     mask_band, warn = foreground_mask(
                         mraw, args.mask_method, args.mask_dilate,
                         args.mask_min_frac, threshold=g_thresh,
                         polarity=args.mask_polarity)
+                    if (mask_band is not None
+                            and args.mask_projection == "max"):
+                        # One 2D mask for every slice of the band. A view is
+                        # a broadcast, not a copy; it is only ever read.
+                        _nzs = len(range(z_lo, z_hi, max(1, args.z_stride)))
+                        mask_band = np.broadcast_to(
+                            mask_band, (_nzs,) + mask_band.shape[1:])
                     if warn:
                         manifest["warnings"].append(f"{stem}: {warn}")
 

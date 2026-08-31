@@ -106,10 +106,19 @@ Z_STRIDE="${Z_STRIDE:-1}"
 # have nothing to encode and a 3D-over-z aggregator is unmotivated. All the
 # view-to-view structure is across the field.
 STRUCTS="${STRUCTS:-none}"
-# Which side of the BF threshold is tissue. The historical default 'bright'
-# assumed tissue is the bright side of brightfield; run check_mask_polarity.py
-# BEFORE trusting a sweep on a new dataset -- if it says INVERTED, re-extract
-# with MASK_POLARITY=dark (features get a new cache hash automatically).
+# The foreground mask. Default: threshold the GFP MAX PROJECTION and apply
+# that one 2D mask to every slice. GFP marks tissue by construction (the
+# phalloidin/MHC stain), so its polarity is unambiguous ('bright'), and the
+# projection keeps tissue that any single slice renders out-of-focus dim.
+#
+# History, so nobody resurrects the old settings blind: the original mask was
+# brightfield with tissue assumed BRIGHT -- inverted on this drop (tissue is
+# the dark side; check_mask_polarity.py, 2026-08-31, 63/63 volumes). The
+# corrected BF mask (MASK_POLARITY=dark) was then judged visually worse than
+# GFP-projection masks. BF masking remains available:
+#   MASK_SOURCE=bf MASK_PROJECTION=none MASK_POLARITY=dark
+MASK_SOURCE="${MASK_SOURCE:-gfp}"
+MASK_PROJECTION="${MASK_PROJECTION:-max}"
 MASK_POLARITY="${MASK_POLARITY:-bright}"
 MODEL_CLASS="${MODEL_CLASS:-ridge}"   # ridge|lasso|elasticnet|xgboost
 SEED="${SEED:-42}"
@@ -128,10 +137,11 @@ FORCE="${FORCE:-0}"
 # directory, so a stale JSON from the old settings was silently pooled into the
 # ranking AND into the max-statistic null. DECONFOUND is deliberately absent:
 # it is swept within a run (dc-none and dc-plate are both configs).
-RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
            "$TARGET_COL" "$TASK" "$N_BINS" "$MODEL" "$NORM_SCOPE" "$SEED" \
            "$TARGET_TYPE" "$FG_MIN" "$AGGREGATE" "$TOKENS" "$AGGS" \
            "$FRAMINGS" "$STRUCTS" "$MODEL_CLASS" "$Z_STRIDE" "$MASK_POLARITY" \
+           "$MASK_SOURCE" "$MASK_PROJECTION" \
            | cksum | cut -d' ' -f1)"
 OUT_DIR="$OUT_DIR/${TARGET_COL}_${TASK}_b${N_BINS}_s${SEED}_${RUN_KEY}"
 mkdir -p "$OUT_DIR"
@@ -183,6 +193,7 @@ if [ "$SKIP_EXTRACT" != "1" ]; then
     python extract_dino_features.py --data_dir "$DATA_DIR" --input "$mod" \
       --output_dir "$FEAT_DIR" --model "$MODEL" --framing "$FRAMINGS" \
       --norm_scope "$NORM_SCOPE" --z_stride "$Z_STRIDE" \
+      --mask_source "$MASK_SOURCE" --mask_projection "$MASK_PROJECTION" \
       --mask_polarity "$MASK_POLARITY" \
       "${xf[@]+"${xf[@]}"}"
   done
