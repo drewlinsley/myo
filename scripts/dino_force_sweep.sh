@@ -55,11 +55,18 @@ N_BINS="${N_BINS:-4}"
 # fgmean weights whole views by their foreground fraction, on top of the
 # token-level weighting above.
 AGGS="${AGGS:-fgmean fgmean+std}"
-# Tiles must be mostly TISSUE. 0.75 = at most 25% background. The old 0.02
-# let a 98%-background tile into the average; fgmean discounted it, but it was
-# still there, and the fgmean+std arm folded it into the dispersion term at
-# full weight.
-FG_MIN="${FG_MIN:-0.75}"
+# Drop views with less than this fraction of tissue; surviving views are
+# still weighted by their fraction (fgmean), so this is only the floor.
+#
+# 0.2 is calibrated to the TRUE mask polarity (check_mask_polarity.py,
+# 2026-08-31): tissue covers ~13-26% of these fields, so a tile at >=20%
+# tissue is solidly tissue-bearing. The old default of 0.75 dates from the
+# INVERTED mask, when "foreground fraction" was actually background fraction
+# and the median view scored 0.764 -- under a correct mask 0.75 would drop
+# nearly every view. The probe prints the view fg distribution before
+# filtering and refuses an impossible value; check that printout on the first
+# corrected run and adjust.
+FG_MIN="${FG_MIN:-0.2}"
 # 'label' averages the encodings of every FOV sharing a force value into one
 # row BEFORE fitting. Those FOVs are one tissue (build_force_groups hard-fails
 # on a group with two force values), so this is one row per level of the
