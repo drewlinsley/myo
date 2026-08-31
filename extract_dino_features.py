@@ -228,7 +228,8 @@ def global_mask_threshold(stems, mask_dir, stats_dir, z_range, z_stride,
     return float(np.median(vals))
 
 
-def foreground_mask(raw, method, dilate, min_frac, threshold=None):
+def foreground_mask(raw, method, dilate, min_frac, threshold=None,
+                    polarity="bright"):
     """BF/GFP foreground mask, tolerant of threshold failures.
 
     threshold_minimum raises RuntimeError when it cannot find two histogram
@@ -238,17 +239,19 @@ def foreground_mask(raw, method, dilate, min_frac, threshold=None):
     from src.data.foreground_mask import (compute_bf_foreground_mask,
                                           _cleanup_per_slice)
     if threshold is not None:
-        mask = raw > threshold
+        mask = raw > threshold if polarity == "bright" else raw < threshold
         if dilate or min_frac > 0:
             mask = _cleanup_per_slice(mask, dilate, min_frac)
         return mask, None
     try:
         return compute_bf_foreground_mask(raw, method=method, dilate=dilate,
-                                          min_component_frac=min_frac), None
+                                          min_component_frac=min_frac,
+                                          polarity=polarity), None
     except Exception as e:
         try:
             return compute_bf_foreground_mask(raw, method="li", dilate=dilate,
-                                              min_component_frac=min_frac), \
+                                              min_component_frac=min_frac,
+                                              polarity=polarity), \
                 f"{method} failed ({type(e).__name__}), used li"
         except Exception as e2:
             return None, f"{method} and li both failed ({type(e2).__name__})"
@@ -298,6 +301,13 @@ def main():
                    help="Foreground mask modality. 'bf' even for a GFP run: a "
                         "BF-derived tissue mask is independent of the GFP "
                         "intensity being measured.")
+    p.add_argument("--mask_polarity", choices=["bright", "dark"],
+                   default="bright",
+                   help="which side of the BF threshold is TISSUE. 'bright' "
+                        "is the historical assumption; in transmitted-light "
+                        "BF the tissue is often the DARK side and 'bright' "
+                        "inverts every fg quantity. Run check_mask_polarity.py "
+                        "first — it judges the mask against GFP.")
     p.add_argument("--mask_method", default="li",
                    choices=["minimum", "otsu", "li", "triangle"])
     p.add_argument("--mask_scope", choices=["global", "volume"], default="global",
@@ -385,6 +395,10 @@ def main():
         "mask_method": args.mask_method, "mask_dilate": args.mask_dilate,
         "mask_min_frac": args.mask_min_frac, "mask_scope": args.mask_scope,
     }
+    if args.mask_polarity != "bright":
+        # Polarity changes every fg-weighted feature. Conditional so existing
+        # caches (all extracted under the historical 'bright') keep their hash.
+        cfg_key["mask_polarity"] = args.mask_polarity
     if any(f == "tiled_fg" for f in framings):
         # These change WHERE tiles land, so they change the features. Omitting
         # them would let two different placements share one cache directory.
@@ -413,6 +427,7 @@ def main():
     # these masks later (explain_dino_probe.py) has to recompute the median
     # over a sample and hope it lands on the same number.
     manifest["mask_threshold"] = (None if g_thresh is None else float(g_thresh))
+    manifest["mask_polarity"] = args.mask_polarity
 
     for si, stem in enumerate(stems):
         with open(os.path.join(stats_dir, f"{stem}.json")) as f:
@@ -458,7 +473,8 @@ def main():
                     mraw = np.asarray(mv[z_lo:z_hi][::max(1, args.z_stride)])
                     mask_band, warn = foreground_mask(
                         mraw, args.mask_method, args.mask_dilate,
-                        args.mask_min_frac, threshold=g_thresh)
+                        args.mask_min_frac, threshold=g_thresh,
+                        polarity=args.mask_polarity)
                     if warn:
                         manifest["warnings"].append(f"{stem}: {warn}")
 

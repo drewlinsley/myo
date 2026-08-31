@@ -120,11 +120,22 @@ else
 fi
 
 # ── 4. explain ──
-fdir="$(ls -d "$FEAT_DIR/${MODALITY}_${FRAMING}_${NORM_SCOPE}"_* 2>/dev/null | head -1 || true)"
-if [ -z "$fdir" ]; then
+fmatches="$(ls -d "$FEAT_DIR/${MODALITY}_${FRAMING}_${NORM_SCOPE}"_* 2>/dev/null || true)"
+fcount="$(printf '%s' "$fmatches" | grep -c . || true)"
+if [ "$fcount" -eq 0 ]; then
   echo "  ERROR: no feature dir $FEAT_DIR/${MODALITY}_${FRAMING}_${NORM_SCOPE}_*" >&2
   exit 1
 fi
+if [ "$fcount" -gt 1 ]; then
+  # After a re-extraction (e.g. MASK_POLARITY=dark) the old cache is still on
+  # disk under its old hash. Explaining features from the wrong one would
+  # silently attribute a model that was never fit on them.
+  echo "  ERROR: $fcount feature dirs match:" >&2
+  echo "$fmatches" >&2
+  echo "         Delete the stale one (rm -rf <dir>) or pass FEAT_DIR." >&2
+  exit 1
+fi
+fdir="$fmatches"
 echo ""; echo "▶ 3. view-level attribution (no GPU)  cfg=$CFG"
 python explain_dino_probe.py --readout "$READOUT" \
   --feature_dir "$fdir" --data_dir "$DATA_DIR" --modality "$MODALITY" \

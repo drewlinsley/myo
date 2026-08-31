@@ -349,15 +349,20 @@ def load_mask_band(data_dir, cfg, man, stem, z_lo, z_hi, z_stride, threshold,
     raw = np.asarray(mv[z_lo:z_hi][::max(1, z_stride)])
     dilate = int(cfg.get("mask_dilate", 0) or 0)
     min_frac = float(cfg.get("mask_min_frac", 0.0) or 0.0)
+    # The polarity the FEATURES were extracted with, from the manifest -- not
+    # a fresh assumption. Attribution must reproduce the fitted pooling even
+    # if that polarity later turns out to be wrong; check_mask_polarity.py is
+    # the tool that judges it.
+    polarity = cfg.get("mask_polarity", man.get("mask_polarity", "bright"))
     # Same two branches as extract_dino_features.foreground_mask.
     if threshold is not None:
-        band = raw > threshold
+        band = raw > threshold if polarity == "bright" else raw < threshold
         if dilate or min_frac > 0:
             band = _fg._cleanup_per_slice(band, dilate, min_frac)
         return band
     return _fg.compute_bf_foreground_mask(
         raw, method=cfg.get("mask_method", man.get("mask_method", "li")),
-        dilate=dilate, min_component_frac=min_frac)
+        dilate=dilate, min_component_frac=min_frac, polarity=polarity)
 
 
 def token_weights(mask_tile, g):

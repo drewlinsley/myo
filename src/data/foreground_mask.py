@@ -41,7 +41,8 @@ def _cleanup_per_slice(mask3d, dilate, min_frac):
 
 
 def compute_bf_foreground_mask(bf_raw, method="minimum",
-                               dilate=0, min_component_frac=0.0):
+                               dilate=0, min_component_frac=0.0,
+                               polarity="bright"):
     """Threshold raw BF to a (Z, H, W) bool mask, with optional cleanup.
 
     Args:
@@ -50,12 +51,23 @@ def compute_bf_foreground_mask(bf_raw, method="minimum",
         dilate: number of 2D dilation iterations (per Z-slice).
         min_component_frac: drop connected components smaller than this
             fraction of the foreground pixels (per Z-slice). 0 disables.
+        polarity: which side of the threshold is TISSUE. "bright" is the
+            historical assumption (tissue above threshold). In
+            transmitted-light brightfield the empty background is often the
+            bright side — the unobstructed illumination — and the tissue the
+            darker, scattering side, in which case "bright" silently inverts
+            the mask and every downstream "foreground" quantity selects
+            background. Run check_mask_polarity.py on a new dataset before
+            trusting either setting: it judges the mask against GFP, which
+            marks tissue by construction.
 
     Returns:
         (Z, H, W) bool mask. True = foreground (keep predictions).
     """
+    if polarity not in ("bright", "dark"):
+        raise ValueError(f"polarity must be 'bright' or 'dark', got {polarity!r}")
     thresh = _threshold(bf_raw, method)
-    mask = bf_raw > thresh
+    mask = bf_raw > thresh if polarity == "bright" else bf_raw < thresh
     if dilate or min_component_frac > 0:
         mask = _cleanup_per_slice(mask, dilate, min_component_frac)
     return mask
