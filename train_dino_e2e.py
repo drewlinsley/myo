@@ -821,6 +821,17 @@ def main():
                                      res["pred_bin"])]})
     # (perm_only: the post-hoc null and its n_permutations stay as stored)
 
+    if categorical and res is not None and len(set(res["true_bin"])) < 2:
+        _cls = (classes[int(res["true_bin"][0])] if classes and len(res["true_bin"])
+                else "?")
+        out["degenerate"] = ("every held-out replicate is the same class; "
+                             "accuracy is not a test of anything")
+        print(f"\n  DEGENERATE: all {len(res['true_bin'])} held-out "
+              f"replicates are '{_cls}' (the fold holding out the other "
+              f"class was skipped for lack of a second class in training). "
+              f"A model that always answers '{_cls}' scores 1.00 here, and "
+              f"the permutation null can only be 1.00 too. This design "
+              f"cannot test the label; the numbers below are not a result.")
     _np = out.get("n_permutations", 0)
     _kind = ("exact, all labelings enumerated" if out.get("null_exact")
              else "Monte Carlo") if _np else "none"

@@ -1029,6 +1029,15 @@ def main():
                   categorical=_cat, model_class=args.model_class,
                   fixed_alpha=(None if args.tune_alpha else args.alpha))
     out = score(res, args.n_bins, args.task)
+    if _cat and len(set(res["true_bin"].tolist())) < 2 and len(res["true_bin"]):
+        _cls = data["classes"][int(res["true_bin"][0])]
+        out["degenerate"] = ("every held-out replicate is the same class; "
+                             "accuracy is not a test of anything")
+        print(f"  DEGENERATE: all {len(res['true_bin'])} held-out replicates "
+              f"are '{_cls}' -- the fold holding out the other class was "
+              f"skipped (single-class training set). A constant '{_cls}' "
+              f"answer scores 1.00 here. This design cannot test the label; "
+              f"do not read the accuracy below as a result.")
 
     # ---- permutation null: RE-RUN the whole LOO under permuted labels ----
     #
