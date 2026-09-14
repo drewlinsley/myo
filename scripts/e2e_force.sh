@@ -54,10 +54,14 @@ EPOCHS="${EPOCHS:-10}"
 FG_MIN="${FG_MIN:-0.2}"
 Z_STRIDE="${Z_STRIDE:-1}"
 SEED="${SEED:-42}"
-# Permutation null: this many FULL LOO runs on permuted labels. 19 gives
-# p-resolution 0.05. Grown INCREMENTALLY on top of the cached observed run,
-# so raising N_PERM later only pays for the extra permutations.
-N_PERM="${N_PERM:-19}"
+# The p-value comes from a FREE post-hoc null: labels permuted against the
+# fixed held-out predictions (exact enumeration when n is small), computed
+# in the observed run. N_PERM is the optional CALIBRATION check -- this many
+# full-LOO refits on permuted labels, grown incrementally on the cached run.
+# If they land inside the post-hoc null the cheap p is trustworthy; if they
+# sit off-centre the LOO carries structural bias and the refit p is the one
+# to quote. 5 is plenty. Each is a full LOO.
+N_PERM="${N_PERM:-0}"
 SHUFFLE="${SHUFFLE:-1}"
 FINAL="${FINAL:-1}"
 FIG_DIR="${FIG_DIR:-results/figures}"
@@ -94,14 +98,14 @@ else
   echo "▶ 1. cached: $obs"
 fi
 
-# ── 1b. permutation null, grown incrementally to N_PERM ──
-have="$(python -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('null_spearman', [])))" "$obs")"
+# ── 1b. optional refit calibration of the post-hoc null ──
+have="$(python -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('refit_null_spearman', [])))" "$obs")"
 need=$(( N_PERM - have ))
 if [ "$need" -gt 0 ]; then
-  echo ""; echo "▶ 1b. permutation null: $have stored, adding $need (each is a full LOO)"
+  echo ""; echo "▶ 1b. refit calibration: $have stored, adding $need full-LOO permutation(s)"
   python train_dino_e2e.py "${common[@]}" --perm_only --n_perm "$need" --output "$obs"
-else
-  echo "▶ 1b. permutation null: $have stored (>= N_PERM=$N_PERM)"
+elif [ "$N_PERM" -gt 0 ]; then
+  echo "▶ 1b. refit calibration: $have stored (>= N_PERM=$N_PERM)"
 fi
 
 # ── 2. shuffled-label control: the leak canary ──

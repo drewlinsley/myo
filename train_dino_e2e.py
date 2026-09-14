@@ -499,6 +499,90 @@ def run_loo(vols, vol_force, args, device, seed, quiet=False):
             "pred_bin": np.asarray(pred_bin)}
 
 
+def posthoc_null(res, strata, categorical, n_draws=10000, seed=0,
+                 exact_cap=20000):
+    """Permute the LABELS against the FIXED held-out predictions.
+
+    The standard permutation test, and free: the LOO is fit once. Labels
+    are permuted within `strata` (plate) for a numeric target so the null
+    respects the nested design, freely for a categorical one. When the
+    number of distinct permutations is small (4 tissues -> 24, or 6 under
+    label ties) every one is enumerated and the p-value is exact.
+
+    What it assumes -- and the reason the refit null still exists as a
+    check: that under no association the held-out predictions carry no
+    structural bias. Leave-one-out models can be anti-correlated with truth
+    by construction (the held-out label is missing from the training mean).
+    For the frozen probe under plate-deconfounding the refit null sat at
+    ~0, so this is a fair approximation there; --n_perm runs a few full
+    refits to verify the same for a finetuned model.
+    """
+    import itertools
+    from math import factorial
+    true = np.asarray(res["true_force"], float)
+    pred = np.asarray(res["pred_score"], float)
+    tb = np.asarray(res["true_bin"]); pb = np.asarray(res["pred_bin"])
+    n = len(true)
+    if n < 3:
+        return None
+    groups = {}
+    for i, s_ in enumerate(strata if strata is not None else [0] * n):
+        groups.setdefault(s_, []).append(i)
+    blocks = list(groups.values())
+    n_distinct = 1
+    for b in blocks:
+        n_distinct *= factorial(len(b))
+
+    def stats(idx):
+        rho = spearman(pred, true[idx])
+        acc = float(np.mean(pb == tb[idx]))
+        return rho, acc
+
+    rng = np.random.default_rng(seed)
+    rhos, accs = [], []
+    exact = n_distinct <= exact_cap
+    if exact:
+        for combo in itertools.product(*[itertools.permutations(b)
+                                         for b in blocks]):
+            idx = np.empty(n, int)
+            for b, perm in zip(blocks, combo):
+                idx[b] = perm
+            r, a = stats(idx)
+            rhos.append(r); accs.append(a)
+    else:
+        for _ in range(n_draws):
+            idx = np.empty(n, int)
+            for b in blocks:
+                idx[b] = rng.permutation(b)
+            r, a = stats(idx)
+            rhos.append(r); accs.append(a)
+    rhos = np.asarray(rhos, float); accs = np.asarray(accs, float)
+    obs_rho, obs_acc = spearman(pred, true), float(np.mean(pb == tb))
+    fin = np.isfinite(rhos)
+
+    def pval(null, obs):
+        if not np.isfinite(obs) or not len(null):
+            return None
+        ge = float((null >= obs).sum())
+        # exact: the observed labelling is one of the enumerated ones
+        return float(ge / len(null)) if exact else float((1 + ge) / (1 + len(null)))
+
+    return {"null_type": "posthoc_label_permutation",
+            "null_exact": bool(exact), "n_permutations": int(len(rhos)),
+            "permutation_p_spearman": pval(rhos[fin], obs_rho),
+            "null_spearman": [float(x) for x in rhos[fin]],
+            "null_spearman_mean": float(rhos[fin].mean()) if fin.any() else None,
+            "null_spearman_ci": ([float(np.percentile(rhos[fin], 2.5)),
+                                  float(np.percentile(rhos[fin], 97.5))]
+                                 if fin.any() else None),
+            "mde_spearman_95": (float(np.percentile(rhos[fin], 95))
+                                if fin.any() else None),
+            "permutation_p_accuracy": pval(accs, obs_acc),
+            "null_accuracy": [float(x) for x in accs],
+            "null_accuracy_mean": float(accs.mean()),
+            "mde_accuracy_95": float(np.percentile(accs, 95))}
+
+
 # --------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
@@ -554,9 +638,13 @@ def main():
                    help="permute labels once and run the FULL LOO: the leak "
                         "canary. Must land at chance.")
     p.add_argument("--n_perm", type=int, default=0,
-                   help="permutation null = this many additional FULL LOO "
-                        "runs on within-plate-permuted labels. 19 gives "
-                        "p-resolution 0.05 and is an overnight job.")
+                   help="REFIT permutations: this many additional FULL LOO "
+                        "runs on permuted labels. Not the p-value (that "
+                        "comes from the free post-hoc null) but its "
+                        "calibration check: if these land inside the "
+                        "post-hoc null, the cheap p is trustworthy; if they "
+                        "sit off-centre, the LOO carries structural bias. "
+                        "5 is plenty; each is a full LOO.")
     p.add_argument("--perm_only", action="store_true",
                    help="do not refit the observed LOO: load --output, run "
                         "--n_perm MORE permutations than it already holds "
@@ -624,13 +712,18 @@ def main():
             raise SystemExit("--perm_only and --shuffle do not combine")
         out = json.load(open(args.output))
         res = None
-        null_rho = list(out.get("null_spearman", []))
-        null_acc = list(out.get("null_accuracy", []))
-        print(f"perm_only: {args.output} holds {len(null_rho)} "
+        null_rho = list(out.get("refit_null_spearman", []))
+        null_acc = list(out.get("refit_null_accuracy", []))
+        print(f"perm_only: {args.output} holds {len(null_rho)} refit "
               f"permutation(s); adding {args.n_perm}")
     else:
         res = run_loo(vols, vol_force, args, device, args.seed)
         out = score(res, args.n_bins, task=task)
+        ph = posthoc_null(res, strata=[plate_of(g) for g in res["replicates"]]
+                          if strata is not None else None,
+                          categorical=categorical, seed=args.seed)
+        if ph:
+            out.update(ph)
         null_rho, null_acc = [], []
 
     start = len(null_rho)
@@ -652,22 +745,31 @@ def main():
 
     obs = out["spearman_pred_vs_force"]
     if null_rho:
-        nr = np.asarray(null_rho)
-        out["permutation_p_spearman"] = float(
-            (1 + (nr >= obs).sum()) / (1 + len(nr)))
-        out["null_spearman"] = [float(x) for x in nr]
-        out["null_spearman_mean"] = float(nr.mean())
-        out["null_spearman_ci"] = [float(np.percentile(nr, 2.5)),
-                                   float(np.percentile(nr, 97.5))]
-        out["mde_spearman_95"] = float(np.percentile(nr, 95))
-        na = np.asarray([a for a in null_acc if np.isfinite(a)])
-        if len(na):
-            out["permutation_p_accuracy"] = float(
-                (1 + (na >= out["replicate_accuracy"]).sum()) / (1 + len(na)))
-            out["null_accuracy"] = [float(x) for x in na]
-            out["null_accuracy_mean"] = float(na.mean())
-            out["mde_accuracy_95"] = float(np.percentile(na, 95))
-        out["n_permutations"] = len(nr)
+        # Refit nulls: stored separately, used to CALIBRATE the post-hoc one.
+        nr = np.asarray(null_rho, float)
+        na = np.asarray(null_acc, float)
+        out["refit_null_spearman"] = [float(x) for x in nr]
+        out["refit_null_accuracy"] = [float(x) for x in na]
+        out["refit_n_permutations"] = int(len(nr))
+        fin = np.isfinite(nr)
+        out["refit_permutation_p_spearman"] = (
+            float((1 + (nr[fin] >= obs).sum()) / (1 + fin.sum()))
+            if fin.any() and np.isfinite(obs) else None)
+        out["refit_permutation_p_accuracy"] = float(
+            (1 + (na >= out["replicate_accuracy"]).sum()) / (1 + len(na)))
+        ci = out.get("null_spearman_ci")
+        stat_null = out.get("null_accuracy") if categorical else out.get("null_spearman")
+        refit = na if categorical else nr[fin]
+        if stat_null and len(refit):
+            lo, hi = np.percentile(stat_null, [2.5, 97.5])
+            inside = float(np.mean((refit >= lo) & (refit <= hi)))
+            out["refit_inside_posthoc_ci"] = inside
+            print(f"\ncalibration: {len(refit)} refit-null value(s), "
+                  f"mean {refit.mean():+.3f}; post-hoc null 95% band "
+                  f"[{lo:+.3f}, {hi:+.3f}]; {inside:.0%} of refits inside"
+                  + ("" if inside >= 0.8 else
+                     "  <-- the LOO carries structural bias here: quote the "
+                     "refit p, not the post-hoc one"))
 
     _fov = {}
     for g in vol_group:
@@ -699,26 +801,38 @@ def main():
             for g, t, s, a, b in zip(res["replicates"], res["true_force"],
                                      res["pred_score"], res["true_bin"],
                                      res["pred_bin"])]})
-    else:
-        out["n_permutations"] = len(null_rho)
+    # (perm_only: the post-hoc null and its n_permutations stay as stored)
 
+    _np = out.get("n_permutations", 0)
+    _kind = ("exact, all labelings enumerated" if out.get("null_exact")
+             else "Monte Carlo") if _np else "none"
     if categorical:
+        _p = out.get("permutation_p_accuracy")
         print(f"\nLOO n={out['n_replicates']}  "
               f"acc={out['replicate_accuracy']:.3f} "
               f"(chance {out['chance']:.3f}, "
               f"{out['n_correct']}/{out['n_replicates']})"
-              + (f"  perm_p={out.get('permutation_p_accuracy', float('nan')):.3f} "
-                 f"({len(null_acc)} permutations -- resolution "
-                 f"{1.0/(1+len(null_acc)):.2f})" if null_acc else
-                 "  (no permutation null: run with --n_perm for a p-value)"))
+              + (f"  perm_p={_p:.3f}  [{_np} label permutations vs the "
+                 f"held-out predictions; {_kind}]" if _p is not None else ""))
+        if out.get("null_accuracy_mean") is not None:
+            print(f"  null accuracy mean {out['null_accuracy_mean']:.3f}; "
+                  f"detectable only if accuracy > "
+                  f"{out['mde_accuracy_95']:.3f}")
     else:
+        _p = out.get("permutation_p_spearman")
         print(f"\nLOO n={out['n_replicates']}  "
               f"spearman(pred, true) = {obs:+.3f}"
-              + (f"  perm_p={out['permutation_p_spearman']:.3f} "
-                 f"({len(null_rho)} permutations -- resolution "
-                 f"{1.0/(1+len(null_rho)):.2f})" if null_rho else
-                 "  (no permutation null: run with --n_perm for a p-value; "
-                 "the frozen probe's null is NOT transferable)"))
+              + (f"  perm_p={_p:.3f}  [{_np} label permutations vs the "
+                 f"held-out predictions; {_kind}]" if _p is not None else ""))
+        if out.get("null_spearman_ci"):
+            print(f"  null mean {out['null_spearman_mean']:+.3f}, 95% "
+                  f"[{out['null_spearman_ci'][0]:+.3f}, "
+                  f"{out['null_spearman_ci'][1]:+.3f}]; detectable only if "
+                  f"spearman > {out['mde_spearman_95']:+.3f}")
+    if out.get("refit_n_permutations"):
+        print(f"  refit check: {out['refit_n_permutations']} full-LOO "
+              f"permutation(s), refit p="
+              f"{out.get('refit_permutation_p_accuracy' if categorical else 'refit_permutation_p_spearman')}")
     if args.shuffle:
         print("^ labels were SHUFFLED: this must be at chance. If not, the "
               "fold logic leaks and every other number is void.")
