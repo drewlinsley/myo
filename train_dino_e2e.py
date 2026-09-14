@@ -557,6 +557,13 @@ def main():
                    help="permutation null = this many additional FULL LOO "
                         "runs on within-plate-permuted labels. 19 gives "
                         "p-resolution 0.05 and is an overnight job.")
+    p.add_argument("--perm_only", action="store_true",
+                   help="do not refit the observed LOO: load --output, run "
+                        "--n_perm MORE permutations than it already holds "
+                        "(seeds continue where the stored ones stopped), "
+                        "merge, recompute the p-values, save. Lets a null be "
+                        "grown incrementally without paying for the "
+                        "observed run again.")
     p.add_argument("--final_fit", default=None,
                    help="after the LOO, train on ALL volumes and save this "
                         "checkpoint (+ .readout.npz sidecar) for XAI. LEAKY "
@@ -609,14 +616,32 @@ def main():
           f"({len(vols)} volumes)  tune={args.tune} "
           f"blocks={args.tune_blocks} epochs={args.epochs}")
     task = "classification" if categorical else "regression"
-    res = run_loo(vols, vol_force, args, device, args.seed)
-    out = score(res, args.n_bins, task=task)
+    if args.perm_only:
+        if not (args.output and os.path.exists(args.output)):
+            raise SystemExit("--perm_only needs an existing --output JSON "
+                             "from the observed run")
+        if args.shuffle:
+            raise SystemExit("--perm_only and --shuffle do not combine")
+        out = json.load(open(args.output))
+        res = None
+        null_rho = list(out.get("null_spearman", []))
+        null_acc = list(out.get("null_accuracy", []))
+        print(f"perm_only: {args.output} holds {len(null_rho)} "
+              f"permutation(s); adding {args.n_perm}")
+    else:
+        res = run_loo(vols, vol_force, args, device, args.seed)
+        out = score(res, args.n_bins, task=task)
+        null_rho, null_acc = [], []
 
-    null_rho, null_acc = [], []
-    for pi in range(args.n_perm):
+    start = len(null_rho)
+    # Permutation seeds are a function of the permutation INDEX, so a null
+    # grown over several invocations is the same null one long run would
+    # have produced. The label draw itself is re-seeded per index too.
+    for pi in range(start, start + args.n_perm):
+        prng = np.random.default_rng(args.seed + 7 * (pi + 1))
         pf = _permute_replicate_force(vol_group, [v["force"] for v in vols],
-                                      rng, strata=strata)
-        print(f"\npermutation {pi+1}/{args.n_perm}")
+                                      prng, strata=strata)
+        print(f"\npermutation {pi+1}/{start + args.n_perm}")
         r = run_loo(vols, pf, args, device, args.seed + 1000 * (pi + 1),
                     quiet=True)
         null_rho.append(spearman(r["pred_score"], r["true_force"]))
@@ -654,7 +679,8 @@ def main():
     _sst = ((_allf - _allf.mean()) ** 2).sum()
     _ssb = sum(len(d) * (np.mean(list(d.values())) - _allf.mean()) ** 2
                for d in _bp.values())
-    out.update({
+    if res is not None:
+      out.update({
         "features": "dino_e2e", "modality": args.modality,
         "model_class": f"e2e_{args.tune}{args.tune_blocks}",
         "target_col": args.target_col, "target_type": args.target_type,
@@ -673,6 +699,8 @@ def main():
             for g, t, s, a, b in zip(res["replicates"], res["true_force"],
                                      res["pred_score"], res["true_bin"],
                                      res["pred_bin"])]})
+    else:
+        out["n_permutations"] = len(null_rho)
 
     if categorical:
         print(f"\nLOO n={out['n_replicates']}  "
@@ -701,7 +729,7 @@ def main():
         print(f"saved {args.output}")
 
     # ---- final fit for XAI (LEAKY for statistics, by construction) ----
-    if args.final_fit and not args.shuffle:
+    if args.final_fit and not args.shuffle and not args.perm_only:
         print("\nfinal fit on ALL volumes (XAI ONLY -- this model saw every "
               "label; do not report statistics computed from it)")
         tr = list(zip(vols, [v["force"] for v in vols]))

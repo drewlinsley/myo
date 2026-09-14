@@ -54,15 +54,18 @@ EPOCHS="${EPOCHS:-10}"
 FG_MIN="${FG_MIN:-0.2}"
 Z_STRIDE="${Z_STRIDE:-1}"
 SEED="${SEED:-42}"
-N_PERM="${N_PERM:-0}"
+# Permutation null: this many FULL LOO runs on permuted labels. 19 gives
+# p-resolution 0.05. Grown INCREMENTALLY on top of the cached observed run,
+# so raising N_PERM later only pays for the extra permutations.
+N_PERM="${N_PERM:-19}"
 SHUFFLE="${SHUFFLE:-1}"
 FINAL="${FINAL:-1}"
 FIG_DIR="${FIG_DIR:-results/figures}"
 XAI_DIR="${XAI_DIR:-results/xai_e2e}"
 
-RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
            "$TARGET_COL" "$DECONFOUND" "$TUNE" "$TUNE_BLOCKS" "$EPOCHS" \
-           "$FG_MIN" "$Z_STRIDE" "$SEED" "$N_PERM" "$TARGET_TYPE" \
+           "$FG_MIN" "$Z_STRIDE" "$SEED" "$TARGET_TYPE" \
            "$CV_GROUP" "$GROUP_COLS" "$DATA_DIR" | cksum | cut -d' ' -f1)"
 OUT="results/e2e_force/${TARGET_COL}_dc-${DECONFOUND}_${TUNE}${TUNE_BLOCKS}_${RUN_KEY}"
 mkdir -p "$OUT"
@@ -80,15 +83,25 @@ echo " results -> $OUT"
 echo " ~22 finetunings per run; this is the slow, honest version"
 echo "════════════════════════════════════════════════════════════════"
 
-# ── 1. observed LOO (+ optional permutation null, + XAI checkpoint) ──
+# ── 1. observed LOO (+ XAI checkpoint) ──
 obs="$OUT/e2e_${TUNE}${TUNE_BLOCKS}.json"
 if [ ! -f "$obs" ] || [ "${FORCE:-0}" = "1" ]; then
   final_arg=()
   [ "$FINAL" = "1" ] && final_arg=(--final_fit "$OUT/e2e_final.pt")
-  python train_dino_e2e.py "${common[@]}" --n_perm "$N_PERM" \
+  python train_dino_e2e.py "${common[@]}" --n_perm 0 \
     --output "$obs" "${final_arg[@]+"${final_arg[@]}"}"
 else
   echo "▶ 1. cached: $obs"
+fi
+
+# ── 1b. permutation null, grown incrementally to N_PERM ──
+have="$(python -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('null_spearman', [])))" "$obs")"
+need=$(( N_PERM - have ))
+if [ "$need" -gt 0 ]; then
+  echo ""; echo "▶ 1b. permutation null: $have stored, adding $need (each is a full LOO)"
+  python train_dino_e2e.py "${common[@]}" --perm_only --n_perm "$need" --output "$obs"
+else
+  echo "▶ 1b. permutation null: $have stored (>= N_PERM=$N_PERM)"
 fi
 
 # ── 2. shuffled-label control: the leak canary ──
