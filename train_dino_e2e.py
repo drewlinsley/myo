@@ -47,6 +47,13 @@ import math
 import os
 import time
 
+# peft imports transformers, which imports TensorFlow if one is installed --
+# a wall of cuDNN/cuBLAS "already registered" noise and slower startup for
+# nothing. Torch only.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_TORCH", "1")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
 import numpy as np
 
 from probe_force_features import (build_force_groups, compute_bin_edges,
@@ -331,6 +338,11 @@ def train_fold(vols_tr, args, device, seed):
                 imgs, tws, fg = sample_views(v, args.views_per_step, rng,
                                              ctx, augment=True)
                 x = torch.from_numpy(imgs).to(device)
+                if args.grad_checkpoint:
+                    # Reentrant checkpointing only backpropagates through a
+                    # block if some INPUT requires grad; without this the
+                    # adapters inside checkpointed blocks get no gradient.
+                    x.requires_grad_(True)
                 t = torch.from_numpy(tws).to(device)
                 e = pooled_embedding(backbone, ctx, x, t, device, use_amp)
                 w = torch.from_numpy(fg).to(e.device,
@@ -350,13 +362,19 @@ def train_fold(vols_tr, args, device, seed):
                 # silently produce NO grads for params inside checkpointed
                 # blocks when no input requires grad. Catch it on step 0
                 # instead of training 22 folds of a frozen model.
+                n_none = sum(p.grad is None for p in adapt_params)
                 gsum = sum(float(p.grad.abs().sum())
                            for p in adapt_params if p.grad is not None)
                 if not (np.isfinite(gsum) and gsum > 0):
                     raise SystemExit(
-                        "no gradient reached the adapted backbone params "
-                        "(grad sum 0). Likely reentrant gradient "
-                        "checkpointing; rerun with --no_grad_checkpoint.")
+                        f"no gradient reached the adapted backbone params "
+                        f"(mode={mode}, {len(adapt_params)} tensors, "
+                        f"{n_none} with grad=None, |grad| sum={gsum}, "
+                        f"grad_checkpoint={args.grad_checkpoint}). If "
+                        f"grad_checkpoint is True this is reentrant "
+                        f"checkpointing -- drop the flag. If it is False, "
+                        f"the adapters are not on the forward path: "
+                        f"report this output.")
             torch.nn.utils.clip_grad_norm_(
                 adapt_params + list(head.parameters()), 1.0)
             opt.step()

@@ -22,6 +22,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+export USE_TF=0 USE_TORCH=1 TF_CPP_MIN_LOG_LEVEL=3   # peft->transformers: torch only
 
 DATA_DIR="${DATA_DIR:-data_phalloidin_mhc_051826_staged}"
 METADATA="${METADATA:-phalloidin_mhc_mapping_051426_SS edit.xlsx}"
