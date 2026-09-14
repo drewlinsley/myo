@@ -714,6 +714,24 @@ def main():
         res = None
         null_rho = list(out.get("refit_null_spearman", []))
         null_acc = list(out.get("refit_null_accuracy", []))
+        if not out.get("null_type") and out.get("per_replicate"):
+            # A result written before the post-hoc null existed. Everything
+            # it needs is stored per replicate, so build it without refitting.
+            pr = out["per_replicate"]
+            stored = {"replicates": [r["group"] for r in pr],
+                      "true_force": np.asarray([r["true_force"] for r in pr]),
+                      "pred_score": np.asarray([r["pred_score"] for r in pr]),
+                      "true_bin": np.asarray([r["true_bin"] for r in pr]),
+                      "pred_bin": np.asarray([r["pred_bin"] for r in pr])}
+            ph = posthoc_null(stored,
+                              strata=([r["plate"] for r in pr]
+                                      if strata is not None else None),
+                              categorical=categorical, seed=args.seed)
+            if ph:
+                out.update(ph)
+                print(f"perm_only: post-hoc null built from the stored "
+                      f"held-out predictions ({ph['n_permutations']} "
+                      f"labelings{', exact' if ph['null_exact'] else ''})")
         print(f"perm_only: {args.output} holds {len(null_rho)} refit "
               f"permutation(s); adding {args.n_perm}")
     else:

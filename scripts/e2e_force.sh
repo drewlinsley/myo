@@ -98,6 +98,12 @@ else
   echo "▶ 1. cached: $obs"
 fi
 
+# ── 1a. a cached result from before the post-hoc null: build it, no refit ──
+if ! python -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('null_type') else 1)" "$obs"; then
+  echo ""; echo "▶ 1a. cached result has no p-value yet; building the post-hoc null from its stored predictions"
+  python train_dino_e2e.py "${common[@]}" --perm_only --n_perm 0 --output "$obs"
+fi
+
 # ── 1b. optional refit calibration of the post-hoc null ──
 have="$(python -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('refit_null_spearman', [])))" "$obs")"
 need=$(( N_PERM - have ))
