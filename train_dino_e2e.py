@@ -233,7 +233,11 @@ def build_trainable(args, device):
         backbone.norm.requires_grad_(True)
 
     head = nn.Linear(ctx["dim"], getattr(args, "n_out", 1)).to(device)
-    nn.init.zeros_(head.weight)
+    # Default (non-zero) weight init on purpose. A zero-initialised readout
+    # sends an exactly-zero gradient into the backbone -- d(loss)/d(embedding)
+    # = d(loss)/d(pred) * W = 0 -- so the adapters cannot learn until the head
+    # has moved, and the step-0 gradient guard fired on every configuration.
+    # Reproduced locally in all four tune/checkpoint combinations.
     nn.init.zeros_(head.bias)
     adapt_params = [p for p in backbone.parameters() if p.requires_grad]
     n_adapt = sum(p.numel() for p in adapt_params)
