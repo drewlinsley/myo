@@ -4,7 +4,11 @@
 #   A. frozen DINOv2 probe on every target (nulls, shuffled control,
 #      family-wise correction)                        -> results/dino_sweep/
 #   B. figures + XAI for every target                  -> results/figures/, results/xai/
-#   C. end-to-end finetuning on every target (E2E=1)   -> results/e2e_force/, results/xai_e2e/
+#   C. end-to-end finetuning, OPT-IN with E2E=1         -> results/e2e_force/, results/xai_e2e/
+#
+# Default is A+B: results and pictures in minutes. Add the finetuning once
+# the probe numbers are in hand:   E2E=1 bash scripts/run_drew.sh
+# (A and B are cached, so that second invocation only pays for C.)
 #
 # Targets:
 #   regression      peak_amplitude_week_5, peak_amplitude_week_4   (12 tissues)
@@ -24,7 +28,8 @@
 #
 # Cost: A+B are minutes after one feature extraction. C is ~80 finetunings
 # (observed + shuffled control for four targets): budget 3-6 h on a GPU;
-# E2E=0 skips it, E2E_TARGETS="peak_amplitude_week_5 perturbed" trims it.
+# E2E_TARGETS="peak_amplitude_week_5 perturbed" trims it to the two that
+# matter most.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,7 +41,7 @@ export FEAT_DIR="${FEAT_DIR:-results/dino_features_drew}"
 export GROUP_COLS="${GROUP_COLS:-plate,Dataset,Exercise,Perturbation,Tissue}"
 FORCE_COLS="${FORCE_COLS:-peak_amplitude_week_5 peak_amplitude_week_4}"
 CATEGORICAL="${CATEGORICAL:-perturbed Exercise}"
-E2E="${E2E:-1}"
+E2E="${E2E:-0}"
 E2E_TARGETS="${E2E_TARGETS:-$FORCE_COLS $CATEGORICAL}"
 
 [ -d "$DATA_DIR/gfp" ] || { echo "ERROR: $DATA_DIR/gfp missing -- stage first (see header)" >&2; exit 1; }
@@ -78,7 +83,8 @@ if [ "$E2E" = "1" ]; then
     fi
   done
 else
-  echo ""; echo "# C. e2e skipped (E2E=0)"
+  echo ""; echo "# C. e2e not run. When the probe results are in hand:"
+  echo "#      E2E=1 bash scripts/run_drew.sh        (A+B are cached; only C runs)"
 fi
 
 echo ""
