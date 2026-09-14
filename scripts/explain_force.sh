@@ -71,6 +71,7 @@ import glob, json, os, sys
 d = sys.argv[1]
 best = (None, -1e9)
 best_ok = (None, -1e9)
+best_part = (None, -1e9)
 for f in sorted(glob.glob(os.path.join(d, "*.json"))):
     if os.path.basename(f).startswith("_"):
         continue
@@ -90,18 +91,30 @@ for f in sorted(glob.glob(os.path.join(d, "*.json"))):
     if rho > best[1]:
         best = (name, rho)
     tok = str(r.get("feature_names", [""])[0]).split("[")[0]
-    lead = tok.split("+")[0]
-    if lead in ("patch_mean", "patch_mean_fg", "cls") and \
-       "-std" not in name and rho > best_ok[1]:
+    parts = tok.split("+")
+    lead = parts[0]
+    mean_lead = lead in ("patch_mean", "patch_mean_fg", "cls")
+    no_std_agg = "-std" not in name
+    # Tier 1: a single mean token -- the WHOLE readout decomposes over
+    # patches. Tier 2: mean token concatenated with a dispersion block --
+    # only the mean block decomposes, and it can be a sliver of the readout.
+    if mean_lead and no_std_agg and len(parts) == 1 and rho > best_ok[1]:
         best_ok = (name, rho)
+    elif mean_lead and no_std_agg and len(parts) > 1 and rho > best_part[1]:
+        best_part = (name, rho)
+if best_ok[0] is None and best_part[0] is not None:
+    print(f"NOTE no fully decomposable config; explaining {best_part[0]} "
+          f"({best_part[1]:+.3f}), whose std block has no per-patch "
+          f"decomposition -- read the 'attributable share' line.",
+          file=sys.stderr)
+    best_ok = best_part
 if best_ok[0] is None:
     print("")
 else:
     if best_ok[0] != best[0]:
-        print(f"NOTE {best[0]} scored higher ({best[1]:+.3f}) but pools a "
-              f"dispersion term, which has no per-patch decomposition; "
-              f"explaining {best_ok[0]} ({best_ok[1]:+.3f}) instead.",
-              file=sys.stderr)
+        print(f"NOTE {best[0]} scored higher ({best[1]:+.3f}) but its readout "
+              f"does not fully decompose over patches; explaining "
+              f"{best_ok[0]} ({best_ok[1]:+.3f}) instead.", file=sys.stderr)
     print(best_ok[0])
 PY
 )"

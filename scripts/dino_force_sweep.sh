@@ -51,6 +51,7 @@ FRAMINGS="${FRAMINGS:-tiled}"
 TOKENS="${TOKENS:-patch_mean_fg patch_mean_fg,patch_std_fg}"
 NORM_SCOPE="${NORM_SCOPE:-volume}"
 TASK="${TASK:-regression}"
+[ "$TARGET_TYPE" = "categorical" ] && TASK="classification"
 N_BINS="${N_BINS:-4}"
 # fgmean weights whole views by their foreground fraction, on top of the
 # token-level weighting above.
@@ -393,7 +394,8 @@ ctrl = os.path.join(d, "_control_shuffled.json")
 if os.path.exists(ctrl):
     c = json.load(open(ctrl))
     cs = c.get(STAT)
-    print("\n  control (shuffled labels): spearman="
+    print(f"\n  control (shuffled labels): "
+          f"{'accuracy' if CAT else 'spearman'}="
           + ("n/a" if cs is None else f"{cs:.3f}")
           + f" perm_p={c.get(PK)}")
     if (c.get(PK) or 1) < 0.05:

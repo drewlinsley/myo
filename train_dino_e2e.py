@@ -520,7 +520,12 @@ def main():
     p.add_argument("--lr_backbone", type=float, default=1e-4)
     p.add_argument("--lr_head", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=0.01)
-    p.add_argument("--grad_checkpoint", action="store_true", default=True)
+    p.add_argument("--grad_checkpoint", action="store_true", default=False,
+                   help="activation checkpointing. OFF by default: with only "
+                        "the last blocks trainable, autograd already skips "
+                        "the frozen prefix, and timm's reentrant checkpoint "
+                        "silently yields NO gradients when no input requires "
+                        "grad (the step-0 guard catches that).")
     p.add_argument("--no_grad_checkpoint", dest="grad_checkpoint",
                    action="store_false")
     p.add_argument("--shuffle", action="store_true",
