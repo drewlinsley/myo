@@ -149,11 +149,12 @@ FORCE="${FORCE:-0}"
 # directory, so a stale JSON from the old settings was silently pooled into the
 # ranking AND into the max-statistic null. DECONFOUND is deliberately absent:
 # it is swept within a run (dc-none and dc-plate are both configs).
-RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
            "$TARGET_COL" "$TASK" "$N_BINS" "$MODEL" "$NORM_SCOPE" "$SEED" \
            "$TARGET_TYPE" "$FG_MIN" "$AGGREGATE" "$TOKENS" "$AGGS" \
            "$FRAMINGS" "$STRUCTS" "$MODEL_CLASS" "$Z_STRIDE" "$MASK_POLARITY" \
            "$MASK_SOURCE" "$MASK_PROJECTION" "$CV_GROUP" "$PERM_SCOPE" \
+           "$METADATA" "$DATA_DIR" "$GROUP_COLS" \
            | cksum | cut -d' ' -f1)"
 OUT_DIR="$OUT_DIR/${TARGET_COL}_${TASK}_b${N_BINS}_s${SEED}_${RUN_KEY}"
 mkdir -p "$OUT_DIR"
