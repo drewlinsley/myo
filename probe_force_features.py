@@ -931,7 +931,7 @@ def main():
     _plates = sorted({plate_of(g) for g in vol_group})
     if (args.deconfound == "plate" or args.canary == "plate"
             or args.cv_group == "plate" or args.perm_scope == "within_plate"):
-        if len(_plates) < 2 or _plates == ["NA"]:
+        if _plates == ["NA"]:
             raise SystemExit(
                 f"plate identity could not be parsed from the group ids "
                 f"(got {_plates[:5]}). Every confound control here depends on "
@@ -940,6 +940,22 @@ def main():
                 f"degenerate to a free one — all silently. Make sure "
                 f"--group_cols includes 'plate' (currently "
                 f"'{args.group_cols}').")
+        if len(_plates) < 2:
+            # One plate is a legitimate subset (the drew exercise arm is a
+            # single imaging day), and this used to hard-fail it with the
+            # unparsed-plate message. What the plate controls become with one
+            # level is well defined and harmless: deconfounding is a global
+            # centering (identical to --deconfound none), the plate canary is
+            # a constant, and the within-plate permutation IS the free
+            # permutation -- the correct null for one stratum. Only
+            # leave-one-plate-out is impossible.
+            if args.cv_group == "plate":
+                raise SystemExit(
+                    f"--cv_group plate needs at least 2 plates; this target "
+                    f"has one ({_plates[0]}). Use --cv_group replicate.")
+            print(f"  NOTE: all volumes are on one plate ({_plates[0]}). "
+                  f"deconfound=plate is a global no-op here, and the "
+                  f"within-plate permutation null is a free permutation.")
 
     if args.canary == "plate":
         plates = sorted({plate_of(g) for g in vol_group})
