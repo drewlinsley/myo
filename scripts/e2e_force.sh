@@ -25,6 +25,13 @@ cd "$ROOT"
 
 DATA_DIR="${DATA_DIR:-data_phalloidin_mhc_051826_staged}"
 METADATA="${METADATA:-phalloidin_mhc_mapping_051426_SS edit.xlsx}"
+# The replicate identity. For the drew perturbation/exercise CSV
+# (data_mapping_drew_aug.csv) the sheet has no physical plate column; the
+# derived 'plate' is the imaging day, and tissues are only unique within
+# their condition -- so pass the condition column too:
+#   perturbed runs:  GROUP_COLS=plate,Perturbation,Tissue
+#   Exercise runs:   GROUP_COLS=plate,Exercise,Tissue
+GROUP_COLS="${GROUP_COLS:-plate,Tissue}"
 TARGET_COL="${TARGET_COL:-peak_amplitude_week1}"
 TARGET_TYPE="${TARGET_TYPE:-numeric}"
 # Stimulation (the Exercise column) is PLATE-DETERMINED: every plate is
@@ -52,16 +59,17 @@ FINAL="${FINAL:-1}"
 FIG_DIR="${FIG_DIR:-results/figures}"
 XAI_DIR="${XAI_DIR:-results/xai_e2e}"
 
-RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+RUN_KEY="$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
            "$TARGET_COL" "$DECONFOUND" "$TUNE" "$TUNE_BLOCKS" "$EPOCHS" \
            "$FG_MIN" "$Z_STRIDE" "$SEED" "$N_PERM" "$TARGET_TYPE" \
-           "$CV_GROUP" | cksum | cut -d' ' -f1)"
+           "$CV_GROUP" "$GROUP_COLS" "$DATA_DIR" | cksum | cut -d' ' -f1)"
 OUT="results/e2e_force/${TARGET_COL}_dc-${DECONFOUND}_${TUNE}${TUNE_BLOCKS}_${RUN_KEY}"
 mkdir -p "$OUT"
 
 common=(--data_dir "$DATA_DIR" --metadata "$METADATA"
         --target_col "$TARGET_COL" --deconfound "$DECONFOUND"
         --target_type "$TARGET_TYPE" --cv_group "$CV_GROUP"
+        --group_cols "$GROUP_COLS"
         --tune "$TUNE" --tune_blocks "$TUNE_BLOCKS" --epochs "$EPOCHS"
         --fg_min "$FG_MIN" --z_stride "$Z_STRIDE" --seed "$SEED")
 
