@@ -45,6 +45,12 @@ E2E="${E2E:-0}"
 E2E_TARGETS="${E2E_TARGETS:-$FORCE_COLS $CATEGORICAL}"
 
 [ -d "$DATA_DIR/gfp" ] || { echo "ERROR: $DATA_DIR/gfp missing -- stage first (see header)" >&2; exit 1; }
+if [ ! -f "$METADATA" ] && [ -f data_mapping_drew.csv ]; then
+  # *.csv is gitignored, so the augmented sheet may not have travelled with
+  # the repo; it is a deterministic function of the source sheet, so build it.
+  echo "▶ $METADATA missing -- deriving it from data_mapping_drew.csv"
+  python scripts/augment_drew_mapping.py data_mapping_drew.csv
+fi
 [ -f "$METADATA" ] || { echo "ERROR: $METADATA missing -- run scripts/augment_drew_mapping.py" >&2; exit 1; }
 
 is_cat() { case " $CATEGORICAL " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
