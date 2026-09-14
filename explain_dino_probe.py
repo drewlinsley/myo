@@ -164,14 +164,20 @@ def paint_view_map(vc, H, W):
 
     Units: contribution per tile-sized region. Summed over z, because every
     z-slice of a tile is a separate view and all of them are pooled.
+
+    Also returns the summed POOLING WEIGHT per pixel, so a display can show
+    acc / wsum: the readout response averaged with the model's own weights.
+    That quantity is seamless across the tile grid (a tile's score enters
+    at its own weight instead of being multiplied by it) and its
+    weight-averaged value over the field IS the prediction.
     """
     acc = np.zeros((H, W), np.float64)
-    cnt = np.zeros((H, W), np.float64)
-    for c, (y, x) in zip(vc["contrib"], vc["yx"]):
+    wsum = np.zeros((H, W), np.float64)
+    for c, a, (y, x) in zip(vc["contrib"], vc["weight"], vc["yx"]):
         y, x = int(y), int(x)
         acc[y:min(y + TILE, H), x:min(x + TILE, W)] += c
-        cnt[y:min(y + TILE, H), x:min(x + TILE, W)] += 1
-    return acc, cnt
+        wsum[y:min(y + TILE, H), x:min(x + TILE, W)] += a
+    return acc, wsum
 
 
 # --------------------------------------------------------------------------
@@ -272,21 +278,6 @@ def _otsu(v, bins=256):
     var = w0 * w1 * (mu0 - mu1) ** 2
     var[~ok] = -1.0
     return float(mids[int(np.argmax(var))])
-
-
-def upsample_bilinear(grid, out_h, out_w):
-    """Token grid -> pixels, bilinear, token values at cell centers."""
-    gh, gw = grid.shape
-    ys = np.clip((np.arange(out_h) + 0.5) * gh / out_h - 0.5, 0, gh - 1)
-    xs = np.clip((np.arange(out_w) + 0.5) * gw / out_w - 0.5, 0, gw - 1)
-    y0 = np.floor(ys).astype(int); y1 = np.minimum(y0 + 1, gh - 1)
-    x0 = np.floor(xs).astype(int); x1 = np.minimum(x0 + 1, gw - 1)
-    fy = (ys - y0)[:, None]
-    fx = (xs - x0)[None, :]
-    a = grid[np.ix_(y0, x0)]; b = grid[np.ix_(y0, x1)]
-    c = grid[np.ix_(y1, x0)]; d = grid[np.ix_(y1, x1)]
-    return (a * (1 - fy) * (1 - fx) + b * (1 - fy) * fx
-            + c * fy * (1 - fx) + d * fy * fx)
 
 
 def _box1d(a, r, axis):
@@ -544,14 +535,20 @@ def fig_overlays(items, out_path, title, unit="contribution",
                       deviation scale shared across rows. A per-row scale
                       stretched an essentially flat map to look as structured
                       as a strong one.
-      display         maps are drawn as MEAN CONTRIBUTION PER POOLED VIEW
-                      with never-pooled pixels a flat light gray. The raw sum
-                      (which is what integrates to the prediction) double-
-                      counts tile-overlap bands and paints dropped tiles as
-                      fake zero; the exact sums stay in the data and the
-                      verification, only the rendering is density. Optional
+      display         maps are drawn as the READOUT RESPONSE AVERAGED WITH
+                      THE MODEL'S OWN POOLING WEIGHTS (sum of contributions /
+                      sum of weights per pixel), never-pooled pixels a flat
+                      light gray. The raw contribution sum -- the quantity
+                      that integrates to the prediction -- is kept in the
+                      data and the verification, but drawn directly it has
+                      seams: a token's contribution is scaled by 1/#fg-tokens
+                      of its tile and by the tile's weight, so the same
+                      physical pixel gets a different value depending on
+                      which tile counts it, and overlap bands double up. The
+                      weighted response is seamless, and its weight-averaged
+                      value over the field is still the prediction. Optional
                       smoothing blurs values and coverage separately, so it
-                      cannot bleed attribution into never-pooled regions.
+                      cannot bleed into never-pooled regions.
       overlay         color opacity is PROPORTIONAL to |value|. A constant
                       alpha painted coolwarm's near-white midpoint over the
                       whole field, so zero attribution over dark background
@@ -604,14 +601,14 @@ def fig_overlays(items, out_path, title, unit="contribution",
                                 np.abs(np.nan_to_num(nd)) ** 0.7 * 0.85, 0.0)
         axes[i][3].imshow(gimg, cmap="gray", vmin=0, vmax=1)
         axes[i][3].imshow(rgba)
-        for j, t in enumerate(["signal (model-input scale)",
-                               f"{unit} (shared +/-{gvmax:.2g}; "
+        for j, t in enumerate(["signal\n(model-input scale)",
+                               f"{unit}\n(shared +/-{gvmax:.2g}; "
                                f"gray = never pooled)",
-                               f"within volume (shared +/-{dvmax:.2g})",
-                               "overlay (opacity = |value|)"]):
+                               f"within volume\n(shared +/-{dvmax:.2g})",
+                               "overlay\n(opacity = |value|)"]):
             axes[i][j].set_xticks([]); axes[i][j].set_yticks([])
             if i == 0:
-                axes[i][j].set_title(t, fontsize=9)
+                axes[i][j].set_title(t, fontsize=8.5)
     fig.suptitle(title + "   " + (polarity_note or
                                   "(red = pushes prediction up, blue = down)"),
                  fontsize=11, fontweight="bold")
@@ -962,12 +959,12 @@ def main():
         proj = band.max(axis=0)
 
         if args.level == "view":
-            acc, cnt = paint_view_map(vc, H, W)
+            acc, wsum = paint_view_map(vc, H, W)
             items.append({"stem": stem, "pred": vc["total"],
                           "image": proj, "pp": (p_low, p_high),
                           "attr": acc,
-                          "attr_disp": np.where(cnt > 0, acc
-                                                / np.maximum(cnt, 1),
+                          "attr_disp": np.where(wsum > 0,
+                                                acc / np.maximum(wsum, 1e-12),
                                                 np.nan)})
             continue
 
@@ -975,7 +972,7 @@ def main():
         gx, gy = man.get("tile_grid", [4, 3])
         specs = plan_views(H, W, "tiled", tile_size=TILE, tile_grid=(gx, gy))
         amap = np.zeros((H, W), np.float64)
-        acov = np.zeros((H, W), np.float64)
+        wmap = np.zeros((H, W), np.float64)
         mproj = np.zeros((H, W), np.float32)
         # How much each view was actually pooled, straight from the cached
         # features. A view below --fg_min contributed NOTHING to the
@@ -1034,19 +1031,19 @@ def main():
                     # Summed over patches this is a_v * (u . patch_mean_fg),
                     # i.e. the view's contribution, so the whole map integrates
                     # to the prediction the same way the view-level one does.
-                    # Bilinear upsampling instead of nearest (np.kron) kills
-                    # the 14px block artifacts; the additive correction pins
-                    # the tile's TOTAL back to the exact value, so the
-                    # integrates-to-the-prediction identity survives the
-                    # smoother rendering.
-                    contrib = grids[ti] * (b if b is not None
-                                           else 1.0 / (gh * gw)) * a_v
-                    up = upsample_bilinear(contrib, TILE, TILE)
-                    up += (contrib.sum() * ctx["patch"] ** 2
-                           - up.sum()) / up.size
+                    # Nearest-neighbour (kron) on purpose: an earlier bilinear
+                    # version needed an additive per-tile correction to keep
+                    # the total exact, and that correction spread a constant
+                    # over the tile's masked-out pixels -- tile-shaped plateaus
+                    # that read as overlap seams. Data stays exact and blocky;
+                    # the figure smooths its own display copy.
+                    wt = (b if b is not None else 1.0 / (gh * gw)) * a_v
+                    ones = np.ones((ctx["patch"], ctx["patch"]))
+                    up = np.kron(grids[ti] * wt, ones)
+                    uw = np.kron(wt, ones)
                     hh = min(up.shape[0], H - y); ww = min(up.shape[1], W - x)
                     amap[y:y + hh, x:x + ww] += up[:hh, :ww]
-                    acov[y:y + hh, x:x + ww] += 1
+                    wmap[y:y + hh, x:x + ww] += uw[:hh, :ww]
 
                 # descriptors, middle slice only: the gradient fields are
                 # the expensive part and one slice per tile is plenty for the
@@ -1111,8 +1108,14 @@ def main():
         items.append({"stem": stem, "pred": vc["total"], "image": proj,
                       "pp": (p_low, p_high),
                       "attr": amap,
-                      "attr_disp": np.where(acov > 0,
-                                            amap / np.maximum(acov, 1),
+                      # Display: the readout response averaged with the
+                      # model's own pooling weights. Seamless across tiles
+                      # (a token's score no longer scales with 1/#fg-tokens
+                      # of whichever tile it sits in), gray where the weight
+                      # is zero -- background tokens and dropped tiles alike,
+                      # which is exactly the set the model never pooled.
+                      "attr_disp": np.where(wmap > 0,
+                                            amap / np.maximum(wmap, 1e-12),
                                             np.nan),
                       "mask": mproj, "bf": bf_proj,
                       "tiles": [(sp["y"], sp["x"],
@@ -1122,9 +1125,10 @@ def main():
 
     tag = os.path.basename(args.readout).replace(".readout.npz", "")
     if args.level == "view":
-        # Exact: these values sum to the prediction.
-        unit = "contribution per tile-sized region"
-        sub = "tile-level contributions -- these add up to the prediction"
+        # Exact in the data: the tile contributions sum to the prediction.
+        unit = "weighted tile response"
+        sub = ("tile-level attribution -- contributions add up to the "
+               "prediction; drawn as weighted response")
     elif args.mask_mode == "none":
         unit = "unweighted readout response"
         sub = ("patch-level response with NO token weighting -- shows regions "
@@ -1133,15 +1137,15 @@ def main():
         # Exact: a_v * b_p * (u . t_p) sums to the prediction, same as the
         # view-level map, because b_p is the weight the features were built
         # with.
-        unit = "contribution per pixel"
-        sub = ("patch-level contributions (mask as fitted) -- "
-               "these add up to the prediction")
+        unit = "weighted response per pixel"
+        sub = ("patch-level attribution (mask as fitted) -- contributions "
+               "add up to the prediction; drawn as weighted response")
     else:
         # A DIFFERENT mask from the one the features were pooled with, so the
         # map answers "what would this readout draw from under a token-derived
         # mask", not "what did it draw from". It does not sum to the fitted
         # prediction and must not be presented as if it did.
-        unit = "contribution per pixel (DINO mask)"
+        unit = "response per pixel (DINO mask)"
         sub = ("patch-level contributions under a token-derived mask -- NOT "
                "the mask the features were pooled with")
     smooth_px = (args.smooth_px if args.smooth_px is not None
